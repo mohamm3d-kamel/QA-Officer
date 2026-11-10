@@ -112,7 +112,7 @@ The system should behave according to user requirements and business documentati
 Discrepancy encountered as described in reproduction steps.
 
 ### 📸 Evidence
-Visual evidence captured by Journalist Agent attached to Jira ticket.
+Visual evidence captured by Coroner Agent attached to Jira ticket.
 """
 
     async def run(self, *args, **kwargs) -> Any:

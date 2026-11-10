@@ -1,4 +1,4 @@
-"""Journalist Agent - Captures visual evidence (screenshots, videos) during Detective second pass."""
+"""Coroner Agent - Captures visual evidence (screenshots, videos) during Detective second pass."""
 import logging
 import os
 import uuid
@@ -16,12 +16,12 @@ import config
 logger = logging.getLogger(__name__)
 
 
-class JournalistAgent(BaseAgent):
+class CoronerAgent(BaseAgent):
     """Evidence collection agent."""
 
     def __init__(self):
         super().__init__(
-            name="Journalist",
+            name="Coroner",
             role="Evidence Collector & Recorder",
             color="#f59e0b",
             icon="📸"
@@ -156,9 +156,9 @@ class JournalistAgent(BaseAgent):
             draw.text((60, y), f"• {step[:120]}", fill=(226, 232, 240))
             y += 26
 
-        draw.text((50, 640), "[STATUS: JOURNALIST VERIFIED CAPTURE]", fill=(34, 197, 94))
+        draw.text((50, 640), "[STATUS: CORONER VERIFIED CAPTURE]", fill=(34, 197, 94))
 
-        filename = f"journalist_evidence_{uuid.uuid4().hex[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        filename = f"coroner_evidence_{uuid.uuid4().hex[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         filepath = config.EVIDENCE_DIR / filename
         img.save(str(filepath))
         return str(filepath)

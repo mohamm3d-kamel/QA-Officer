@@ -39,7 +39,7 @@ async def watcher_background_worker():
     """Background polling loop for Watcher agent."""
     logger.info("Watcher Background Worker started.")
     from agents.detective import DetectiveAgent
-    from agents.journalist import JournalistAgent
+    from agents.coroner import CoronerAgent
     from agents.watcher import WatcherAgent
     from services.llm_router import LLMRouter
     from services.notification_service import NotificationService
@@ -60,9 +60,9 @@ async def watcher_background_worker():
                     model=settings_dict.get("llm_model", "gpt-4"),
                 )
                 detective = DetectiveAgent(llm)
-                journalist = JournalistAgent()
+                coroner = CoronerAgent()
                 notifier = NotificationService()
-                watcher = WatcherAgent(detective, journalist, notifier)
+                watcher = WatcherAgent(detective, coroner, notifier)
 
                 logger.info(f"Watcher polling active tickets (interval: {interval}m)...")
                 await watcher.poll_all_active_projects(settings_dict)

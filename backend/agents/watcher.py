@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from agents.base import BaseAgent
 from agents.detective import DetectiveAgent
-from agents.journalist import JournalistAgent
+from agents.coroner import CoronerAgent
 from services.jira_client import JiraClient
 from services.notification_service import NotificationService
 from database import async_session
@@ -23,7 +23,7 @@ class WatcherAgent(BaseAgent):
     def __init__(
         self,
         detective: DetectiveAgent,
-        journalist: JournalistAgent,
+        coroner: CoronerAgent,
         notification_service: NotificationService,
     ):
         super().__init__(
@@ -33,7 +33,7 @@ class WatcherAgent(BaseAgent):
             icon="👁️"
         )
         self.detective = detective
-        self.journalist = journalist
+        self.coroner = coroner
         self.notifier = notification_service
         self._running = False
         self._task = None
@@ -106,7 +106,7 @@ class WatcherAgent(BaseAgent):
 
                     if not is_resolved:
                         # Capture failure evidence
-                        failure_evidence = await self.journalist.capture_evidence(
+                        failure_evidence = await self.coroner.capture_evidence(
                             bug_data=bug.to_dict(),
                             project_info=project_info,
                             stage="retest",

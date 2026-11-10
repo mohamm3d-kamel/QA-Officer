@@ -3,7 +3,7 @@ import { Clock, Shield, Search, Camera, Scale, FileText, Tag, Eye, FlaskConical 
 
 const agentIcons = {
   Detective: Search,
-  Journalist: Camera,
+  Coroner: Camera,
   Judge: Scale,
   Reporter: FileText,
   Sheriff: Tag,

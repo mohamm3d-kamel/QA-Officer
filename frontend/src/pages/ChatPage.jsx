@@ -59,7 +59,7 @@ export default function ChatPage() {
               content:
                 `👋 Hello **Mohamed Kamel**! I am ready to test **${proj.name}**.\n\n` +
                 `- You can paste requirements, user stories, or a custom bug report template (I'll save them as persistent skills).\n` +
-                `- Or describe any bug you find manually: Detective will trace root cause, Journalist will capture live evidence, Judge will confirm, Reporter will draft the report, Sheriff will log it to Jira, and Watcher will retest when moved to 'In QA'.\n` +
+                `- Or describe any bug you find manually: Detective will trace root cause, Coroner will capture live evidence, Judge will confirm, Reporter will draft the report, Sheriff will log it to Jira, and Watcher will retest when moved to 'In QA'.\n` +
                 `- You can also click **🤖 Auto-Test** for autonomous defect exploration.`,
               timestamp: new Date().toISOString(),
             },

@@ -123,7 +123,7 @@ export default function LogsPage() {
         >
           <option value="">All Agents</option>
           <option value="Detective">Detective</option>
-          <option value="Journalist">Journalist</option>
+          <option value="Coroner">Coroner</option>
           <option value="Judge">Judge</option>
           <option value="Reporter">Reporter</option>
           <option value="Sheriff">Sheriff</option>

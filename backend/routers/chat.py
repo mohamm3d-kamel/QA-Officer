@@ -98,7 +98,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
         f"**Judge Confirmed Root Cause:** {pipeline_result.get('root_cause')}\n"
         f"**Jira Ticket:** [{pipeline_result['jira_ticket']['key']}]({pipeline_result['jira_ticket']['url']}) (Status: {pipeline_result['jira_ticket']['status']})\n"
         f"**Priority:** `{pipeline_result['jira_ticket']['priority']}` | **Label:** `{pipeline_result['jira_ticket']['label']}` | **Reporter:** `{pipeline_result['jira_ticket']['reporter']}`\n"
-        f"**Evidence:** {len(pipeline_result.get('evidence', []))} file(s) captured by Journalist.\n\n"
+        f"**Evidence:** {len(pipeline_result.get('evidence', []))} file(s) captured by Coroner.\n\n"
         f"The Watcher Agent is now actively monitoring this ticket for the `In QA` transition."
     )
 

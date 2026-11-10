@@ -4,7 +4,7 @@ import useAppStore from '../../store/appStore';
 
 const AGENTS = [
   { key: 'detective', name: 'Detective', role: 'Root Cause Investigator', icon: Search, color: 'text-purple-400', border: 'border-purple-500', bg: 'bg-purple-900/30' },
-  { key: 'journalist', name: 'Journalist', role: 'Evidence Capture', icon: Camera, color: 'text-amber-400', border: 'border-amber-500', bg: 'bg-amber-900/30' },
+  { key: 'coroner', name: 'Coroner', role: 'Evidence Capture', icon: Camera, color: 'text-amber-400', border: 'border-amber-500', bg: 'bg-amber-900/30' },
   { key: 'judge', name: 'Judge', role: 'Independent Verifier', icon: Scale, color: 'text-red-400', border: 'border-red-500', bg: 'bg-red-900/30' },
   { key: 'reporter', name: 'Reporter', role: 'Bug Report Author', icon: FileText, color: 'text-emerald-400', border: 'border-emerald-500', bg: 'bg-emerald-900/30' },
   { key: 'sheriff', name: 'Sheriff', role: 'Jira Commander', icon: Tag, color: 'text-blue-400', border: 'border-blue-500', bg: 'bg-blue-900/30' },

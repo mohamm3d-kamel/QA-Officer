@@ -74,7 +74,7 @@ async def run_e2e_tests():
     print(f"   • Jira Ticket: {pipeline_result['jira_ticket']['key']} (Status: {pipeline_result['jira_ticket']['status']})")
     print(f"   • Jira Reporter: {pipeline_result['jira_ticket']['reporter']}")
     print(f"   • Priority: {pipeline_result['jira_ticket']['priority']} | Label: {pipeline_result['jira_ticket']['label']}")
-    print(f"   • Journalist Evidence: {len(pipeline_result['evidence'])} file(s)")
+    print(f"   • Coroner Evidence: {len(pipeline_result['evidence'])} file(s)")
 
     # 4. Test Watcher & Retest Pipeline ('In QA' -> 'Ready To Deploy' -> Sanity Testers)
     print("\n[Step 3] Testing Watcher Agent Retest Trigger ('In QA')...")

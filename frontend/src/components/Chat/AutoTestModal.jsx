@@ -140,7 +140,7 @@ export default function AutoTestModal({ isOpen, onClose, projectId, onComplete }
           <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 text-[11px] text-slate-400 space-y-1">
             <div className="text-slate-300 font-medium">Pipeline Actions:</div>
             <div>• Detective investigates root cause & reproduces defect</div>
-            <div>• Journalist captures screenshot & video evidence</div>
+            <div>• Coroner captures screenshot & video evidence</div>
             <div>• Judge confirms findings independently</div>
             <div>• Reporter formats bug report matching your template</div>
             <div>• Sheriff logs tickets to Jira in 'To Do'</div>

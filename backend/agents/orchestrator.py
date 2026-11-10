@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Optional, Callable, Awaitable
 from sqlalchemy import select
 
 from agents.detective import DetectiveAgent
-from agents.journalist import JournalistAgent
+from agents.coroner import CoronerAgent
 from agents.judge import JudgeAgent
 from agents.reporter import ReporterAgent
 from agents.sheriff import SheriffAgent
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class AgentOrchestrator:
-    """Coordinates Detective, Journalist, Judge, Reporter, Sheriff, Watcher, and Sanity Testers."""
+    """Coordinates Detective, Coroner, Judge, Reporter, Sheriff, Watcher, and Sanity Testers."""
 
     def __init__(self, llm_router: LLMRouter, jira_settings: Dict[str, str], default_reporter: str = "Mohamed Kamel"):
         self.llm = llm_router
@@ -31,7 +31,7 @@ class AgentOrchestrator:
         self.default_reporter = default_reporter
 
         self.detective = DetectiveAgent(self.llm)
-        self.journalist = JournalistAgent()
+        self.coroner = CoronerAgent()
         self.judge = JudgeAgent(self.llm)
         self.reporter = ReporterAgent(self.llm)
         self.sheriff = SheriffAgent(default_reporter=default_reporter)
@@ -41,7 +41,7 @@ class AgentOrchestrator:
             slack_enabled=jira_settings.get("notification_slack_enabled") == "true",
             slack_webhook=jira_settings.get("notification_slack_webhook", ""),
         )
-        self.watcher = WatcherAgent(self.detective, self.journalist, self.notifier)
+        self.watcher = WatcherAgent(self.detective, self.coroner, self.notifier)
         self.sanity_tester = SanityTesterAgent(self.llm)
 
     async def get_project_skills_context(self, project_id: int) -> tuple[str, Optional[str]]:
@@ -68,7 +68,7 @@ class AgentOrchestrator:
         project_id: int,
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
-        """Execute the full 6-agent initial pipeline: Detective -> Journalist -> Judge -> Reporter -> Sheriff."""
+        """Execute the full 6-agent initial pipeline: Detective -> Coroner -> Judge -> Reporter -> Sheriff."""
         async def notify(agent: str, status: str, message: str, data: Any = None):
             if broadcast_callback:
                 try:
@@ -127,16 +127,16 @@ class AgentOrchestrator:
             b.module = detective_result.get("module", "General")
             await session.commit()
 
-        # 2. JOURNALIST (Pass 2 Evidence Capture)
-        await notify("journalist", "running", "Journalist is capturing video and screenshot evidence during reproduction pass...")
-        evidence_list = await self.journalist.capture_evidence(
+        # 2. CORONER (Pass 2 Evidence Capture)
+        await notify("coroner", "running", "Coroner is capturing video and screenshot evidence during reproduction pass...")
+        evidence_list = await self.coroner.capture_evidence(
             bug_data=detective_result,
             project_info=project_info,
             stage="detection",
             bug_report_id=bug_id,
             project_id=project_id,
         )
-        await notify("journalist", "success", f"Journalist captured {len(evidence_list)} evidence files", evidence_list)
+        await notify("coroner", "success", f"Coroner captured {len(evidence_list)} evidence files", evidence_list)
 
         # 3. JUDGE (Independent verification of root cause)
         await notify("judge", "running", "Judge is independently verifying the Detective root cause...")

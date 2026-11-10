@@ -1,6 +1,6 @@
 from agents.base import BaseAgent
 from agents.detective import DetectiveAgent
-from agents.journalist import JournalistAgent
+from agents.coroner import CoronerAgent
 from agents.judge import JudgeAgent
 from agents.reporter import ReporterAgent
 from agents.sheriff import SheriffAgent

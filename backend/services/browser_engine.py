@@ -1,6 +1,6 @@
 """Browser Engine - Playwright-based browser automation.
 
-Provides browser automation for the Detective, Journalist, and Sanity Tester agents.
+Provides browser automation for the Detective, Coroner, and Sanity Tester agents.
 Supports Chromium, Firefox, and WebKit.
 """
 import asyncio

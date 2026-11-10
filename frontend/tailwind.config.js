@@ -28,7 +28,7 @@ export default {
         },
         agent: {
           detective: '#8b5cf6',
-          journalist: '#f59e0b',
+          coroner: '#f59e0b',
           judge: '#ef4444',
           reporter: '#22c55e',
           sheriff: '#3b82f6',

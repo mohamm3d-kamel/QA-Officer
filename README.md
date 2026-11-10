@@ -12,7 +12,7 @@ An AI-powered software testing platform built for modern QA teams. It coordinate
 
 2. **Multi-Agent Defect Pipeline**
    - **🔍 Detective (Investigator)**: Analyzes bugs, traces logs/code/DOM, identifies root cause, and reproduces defects.
-   - **📸 Journalist (Evidence Collector)**: Runs automated Playwright browser session during Detective's second pass to capture full video recordings and high-res screenshots.
+   - **📸 Coroner (Evidence Collector)**: Runs automated Playwright browser session during Detective's second pass to capture full video recordings and high-res screenshots.
    - **⚖️ Judge (Senior Verifier)**: Independently re-investigates and confirms the true root cause before any report is finalized.
    - **📝 Reporter (Author)**: Automatically crafts pristine bug reports matching your custom template.
    - **🏷️ Sheriff (Jira Commander)**: Creates Jira Cloud tickets in the `To Do` backlog with evidence attachments, priority selection (`lowest` to `highest`), label classification (`Back-End`, `Front-End`, `Mobile`), and assigned reporter (`Mohamed Kamel`).
@@ -68,7 +68,7 @@ Open the **Settings** tab in the app to configure:
 ```
 QA Officer/
 ├── backend/
-│   ├── agents/               # Detective, Journalist, Judge, Reporter, Sheriff, Watcher, Sanity Testers
+│   ├── agents/               # Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers
 │   ├── models/               # SQLAlchemy SQLite Models (Project, Skill, BugReport, Evidence, AgentLog)
 │   ├── routers/              # FastAPI Routers (Projects, Skills, Bugs, Chat, Logs, Settings, Reports, WebSocket)
 │   ├── services/             # LLMRouter, JiraClient, BrowserEngine, NotificationService, EvidenceCapture
