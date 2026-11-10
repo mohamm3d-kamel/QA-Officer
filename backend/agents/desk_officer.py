@@ -20,8 +20,8 @@ AGENT_ROSTER: List[Dict[str, str]] = [
     {
         "key": "detective",
         "name": "Detective",
-        "role": "Root Cause Investigator & Tracer",
-        "description": "Traces bug symptoms, logs, and business requirements to identify root cause, reproduction steps, severity, label, and affected module; also retests fixes and performs autonomous bug discovery.",
+        "role": "Root Cause Investigator & Bug Report Author",
+        "description": "Traces bug symptoms, logs, and business requirements to identify root cause, reproduction steps, severity, label, and affected module; authors the formatted Markdown bug report adhering strictly to the project's custom template; and retests fixes or runs autonomous discovery.",
     },
     {
         "key": "coroner",
@@ -34,12 +34,6 @@ AGENT_ROSTER: List[Dict[str, str]] = [
         "name": "Judge",
         "role": "Independent Root Cause Verifier",
         "description": "Independently reviews and confirms, revises, or rejects the Detective's identified root cause and severity before a bug report is finalized.",
-    },
-    {
-        "key": "reporter",
-        "name": "Reporter",
-        "role": "Bug Report Author",
-        "description": "Authors the formatted Markdown bug report adhering strictly to the project's custom report template.",
     },
     {
         "key": "sheriff",
@@ -62,7 +56,7 @@ AGENT_ROSTER: List[Dict[str, str]] = [
 ]
 
 VALID_ACTIONS = {"chat", "run_main_workflow", "assign_agent", "save_skill"}
-VALID_AGENTS = {"none", "detective", "coroner", "judge", "reporter", "sheriff", "watcher", "sanity", "auto_test"}
+VALID_AGENTS = {"none", "detective", "coroner", "judge", "sheriff", "watcher", "sanity", "auto_test"}
 
 _NEGATION_PREFIX_RE = re.compile(
     r"\b(don'?t|do not|shouldn'?t|should not|mustn'?t|must not|won'?t|will not|can'?t|cannot|not yet|not to|never|without|before|until i ask|until asked|unless i ask|wait to|stand by|hold off)\b",
@@ -73,6 +67,29 @@ _NEGATION_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _CLAUSE_SPLIT_RE = re.compile(r"[,.;!?\n]+|\b(?:but|however|except|and)\b", re.IGNORECASE)
+
+_GREETING_PHRASES = {
+    "hi", "hello", "hey", "yo", "hola", "salam", "salam alaikum", "marhaba",
+    "good morning", "good afternoon", "good evening", "how are you",
+    "how are you doing", "whats up", "what's up", "sup",
+    "hi there", "hello there", "hey there",
+    "hi desk officer", "hello desk officer", "hey desk officer",
+    "test", "testing",
+}
+_ACK_PHRASES = {
+    "ok", "okay", "k", "thanks", "thank you", "thx", "ty",
+    "thanks a lot", "thank you so much", "thank you very much",
+    "cool", "nice", "great", "awesome", "perfect", "got it",
+    "sounds good", "noted", "bye", "goodbye",
+}
+_BUG_SIGNAL_RE = re.compile(
+    r"\b(bug|bugs|error|errors|fail|fails|failed|crash|crashes|broken|issue|issues|defect|404|500|exception|timeout|slow|fix|broken|create|assign|jira|retest|sanity)\b",
+    re.IGNORECASE,
+)
+_BUG_LIST_QUERY_RE = re.compile(
+    r"\b(what|which|show|list|view|get|check|status\s+of)\b[^.?\n]{0,30}\b(bugs?|defects?|issues?|tickets?|reports?)\b|\b(recent|latest|open|tracked)\s+(bugs?|defects?|issues?|tickets?)\b",
+    re.IGNORECASE,
+)
 
 
 def format_agent_roster() -> str:
@@ -185,7 +202,7 @@ class DeskOfficerAgent(BaseAgent):
             ("detective", r"\bdetective\b"),
             ("coroner", r"\bcoroner\b"),
             ("judge", r"\bjudge\b"),
-            ("reporter", r"\breporter\b"),
+            ("detective", r"(?<!default\s)(?<!jira\s)\breporter\b"),
             ("watcher", r"\bwatcher\b"),
             ("sanity", r"\bsanity(\s+testers?)?\b"),
         ]
@@ -216,13 +233,30 @@ class DeskOfficerAgent(BaseAgent):
             return "requirement"
         return None
 
-    @staticmethod
+    @classmethod
+    def _classify_small_talk(cls, text: str) -> Optional[str]:
+        """Classify greetings and short acknowledgements so they aren't treated as bug notes."""
+        normalized = " ".join(re.sub(r"[^\w'\s]", " ", (text or "").lower()).split())
+        if not normalized or len(normalized.split()) > 6:
+            return None
+        if normalized in _ACK_PHRASES:
+            return "ack"
+        if normalized in _GREETING_PHRASES:
+            return "greeting"
+        # Extended elongated greetings like 'hiii' / 'heyyy' / 'hi how are you'
+        first_word = normalized.split()[0]
+        if re.match(r"^(hi+|hello+|hey+)$", first_word) and not _BUG_SIGNAL_RE.search(normalized):
+            return "greeting"
+        return None
+
+    @classmethod
     def _synthesize_bug_context(
+        cls,
         message: str,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        """Combine prior chat discussion about the bug with the current message."""
+        """Combine prior substantive chat discussion about the bug with the current message."""
         chunks: List[str] = []
         if conversation_history:
             user_notes: List[str] = []
@@ -231,13 +265,15 @@ class DeskOfficerAgent(BaseAgent):
                 content = (item.get("content") or "").strip()
                 if not content or item.get("isStatus"):
                     continue
-                if sender == "user":
+                if sender == "user" and not cls._classify_small_talk(content):
                     user_notes.append(content)
             if user_notes:
                 chunks.append("Prior bug discussion from user:\n" + "\n---\n".join(user_notes))
 
         trimmed = message.strip()
-        if trimmed:
+        if trimmed and not cls._classify_small_talk(trimmed):
+            chunks.append(f"Latest user instruction:\n{trimmed}")
+        elif not chunks and trimmed:
             chunks.append(f"Latest user instruction:\n{trimmed}")
 
         if attachments:
@@ -282,7 +318,7 @@ class DeskOfficerAgent(BaseAgent):
         if wants_workflow:
             return {
                 "reply": (
-                    "Understood! Starting the main QA workflow now (**Detective → Coroner → Judge → Reporter**). "
+                    "Understood! Starting the main QA workflow now (**Detective → Coroner → Judge**, with **Detective** finalizing the formatted report). "
                     + (
                         "Since you also asked to raise it, **Sheriff** will log the ticket to Jira **Backlog** afterward."
                         if wants_jira
@@ -314,17 +350,50 @@ class DeskOfficerAgent(BaseAgent):
             }
 
         lower = message.strip().lower()
-        if re.search(r"\b(agents?|roster|who can|roles?|capabilities|help)\b", lower):
+        small_talk = self._classify_small_talk(message)
+        if small_talk == "greeting":
+            reply = (
+                f"Hi! 👋 I'm the **Desk Officer** for **{project_info.get('name', 'this project')}**.\n\n"
+                "How can I help with testing today? You can:\n"
+                "- **Describe a bug** or paste console/API logs so we can refine the issue first\n"
+                "- Say **\"Create a bug report\"** when you're ready to run the main workflow (**Detective → Coroner → Judge**)\n"
+                "- Ask about **\"agents\"** or assign one directly (e.g., *\"Assign Detective\"*, *\"Have Coroner capture evidence\"*)\n"
+                "- Say **\"Tell Sheriff to raise it\"** when you want a bug logged to Jira **Backlog**"
+            )
+        elif small_talk == "ack":
+            reply = (
+                "Got it! Let me know whenever you want to discuss another bug, "
+                "run **\"Create a bug report\"**, or assign any QA agent."
+            )
+        elif re.search(r"\b(agents?|roster|who can|roles?|capabilities|help)\b", lower):
             reply = (
                 f"{format_agent_roster()}\n\n"
                 "We can discuss any bug details first before starting the workflow. "
                 "Whenever you're ready, tell me **\"Create a bug report\"** to run the main workflow, "
                 "or ask me to assign a specific agent (for example, *\"Ask Detective to investigate\"* or *\"Tell Sheriff to raise it to Backlog\"*)."
             )
+        elif _BUG_LIST_QUERY_RE.search(lower):
+            if recent_bugs:
+                bug_lines = [
+                    f"- `#{b.get('id')}` — **{b.get('title')}** (`{b.get('status')}`"
+                    + (f", Jira: `{b.get('jira_ticket_id')}`" if b.get('jira_ticket_id') else "")
+                    + ")"
+                    for b in recent_bugs[:5]
+                ]
+                reply = (
+                    f"Here are the latest tracked defects in **{project_info.get('name', 'this project')}**:\n"
+                    + "\n".join(bug_lines)
+                    + "\n\nAsk me to investigate, retest, or tell **Sheriff** to raise any of them to Jira **Backlog**."
+                )
+            else:
+                reply = f"There are no tracked bug reports yet in **{project_info.get('name', 'this project')}**. Describe any issue to get started!"
         else:
-            history_count = len(
-                [h for h in (conversation_history or []) if (h.get("sender") or h.get("role") or "").lower() == "user"]
-            )
+            history_count = len([
+                h
+                for h in (conversation_history or [])
+                if (h.get("sender") or h.get("role") or "").lower() == "user"
+                and not self._classify_small_talk(h.get("content") or "")
+            ])
             recent_hint = ""
             if recent_bugs:
                 latest = recent_bugs[0]
@@ -334,7 +403,7 @@ class DeskOfficerAgent(BaseAgent):
                 f"({history_count + 1} user note(s) in our pre-workflow triage):{recent_hint}\n\n"
                 "Let's keep refining the issue before running the workflow — feel free to share steps to reproduce, expected vs. actual behavior, console/API logs, or target module.\n\n"
                 "When you're ready, you can:\n"
-                "- Say **\"Create a bug report\"** to run the main workflow (**Detective → Coroner → Judge → Reporter**; Sheriff stays on standby)\n"
+                "- Say **\"Create a bug report\"** to run the main workflow (**Detective → Coroner → Judge**, finalizing a formatted report; Sheriff stays on standby)\n"
                 "- Assign any specific agent by role (e.g., **\"Assign Detective\"**, **\"Have Coroner capture evidence\"**, **\"Ask Judge to verify\"**, **\"Ask Watcher to retest\"**)\n"
                 "- Say **\"Tell Sheriff to raise the bug report\"** when you want it pushed to Jira **Backlog**"
             )
@@ -370,6 +439,7 @@ class DeskOfficerAgent(BaseAgent):
             decision = self._build_fallback_decision(
                 message, conversation_history, project_info, recent_bugs, attachments
             )
+            decision["llm_degraded"] = False
             await self.log_action(
                 action="triage_chat_message",
                 input_data={"message": message[:300], "project_id": project_id},
@@ -406,14 +476,14 @@ class DeskOfficerAgent(BaseAgent):
             f"Built-in QA Officer Agents:\n{roster_str}\n- auto_test (Autonomous Bug Discovery): Runs Detective autonomous discovery across stored skills.\n\n"
             "STRICT WORKFLOW RULES:\n"
             "1. When the user is describing a bug, asking questions, discussing behavior, or asking about agents, keep action='chat' — DO NOT start the workflow yet. Respond conversationally as an experienced QA partner (ask clarifying questions, summarize understanding, or explain agent roles).\n"
-            "2. ONLY set action='run_main_workflow' when the user explicitly tells you to create/generate/start a bug report or run the main workflow (e.g., 'Create a bug report'). The main workflow runs Detective -> Coroner -> Judge -> Reporter.\n"
+            "2. ONLY set action='run_main_workflow' when the user explicitly tells you to create/generate/start a bug report or run the main workflow (e.g., 'Create a bug report'). The main workflow runs Detective (investigate) -> Coroner (capture evidence) -> Judge (verify) -> Detective (author formatted report).\n"
             "3. NEVER trigger Sheriff (also_raise_jira=true or target_agent='sheriff') unless the user EXPLICITLY asks Sheriff to raise/create/push the Jira ticket. When Sheriff does raise a ticket, it goes to Jira 'Backlog' (not 'To Do').\n"
-            "4. Set action='assign_agent' ONLY when the user asks to assign/run a specific agent by name or role (target_agent in: detective, coroner, judge, reporter, sheriff, watcher, sanity, auto_test).\n\n"
+            "4. Set action='assign_agent' ONLY when the user asks to assign/run a specific agent by name or role (target_agent in: detective, coroner, judge, sheriff, watcher, sanity, auto_test).\n\n"
             "Respond ONLY with a valid JSON object:\n"
             "{\n"
             '  "reply": "Your clear, helpful Markdown response to the tester",\n'
             '  "action": "chat|run_main_workflow|assign_agent",\n'
-            '  "target_agent": "none|detective|coroner|judge|reporter|sheriff|watcher|sanity|auto_test",\n'
+            '  "target_agent": "none|detective|coroner|judge|sheriff|watcher|sanity|auto_test",\n'
             '  "bug_summary": "Complete bug description synthesized from the conversation + latest message",\n'
             '  "bug_report_id": null,\n'
             '  "also_raise_jira": false\n'
@@ -432,26 +502,25 @@ class DeskOfficerAgent(BaseAgent):
             message, conversation_history, project_info, recent_bugs, attachments
         )
 
+        llm_degraded = False
         try:
             response = await self.llm.chat(
                 messages=[{"role": "user", "content": user_content}],
                 system_prompt=system_prompt,
                 temperature=0.2,
+                json_mode=True,
             )
-            content = response.content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            parsed = json.loads(content.strip())
+            parsed = self.parse_json_response(response.content)
+            if not isinstance(parsed, dict):
+                raise ValueError("Desk Officer expected JSON object response")
 
             action = parsed.get("action", "chat")
             if action not in VALID_ACTIONS:
                 action = "chat"
 
             target_agent = (parsed.get("target_agent") or "none").lower()
+            if target_agent == "reporter":
+                target_agent = "detective"
             if target_agent not in VALID_AGENTS:
                 target_agent = "none"
 
@@ -493,10 +562,12 @@ class DeskOfficerAgent(BaseAgent):
                 "also_raise_jira": also_raise_jira,
                 "skill_type": None,
                 "skill_title": None,
+                "llm_degraded": False,
             }
         except Exception as e:
+            llm_degraded = True
             logger.warning(f"Desk Officer LLM fallback triggered: {e}")
-            decision = fallback
+            decision = {**fallback, "llm_degraded": True, "llm_error": str(e)}
 
         await self.log_action(
             action=f"desk_officer_{decision['action']}",
@@ -506,8 +577,10 @@ class DeskOfficerAgent(BaseAgent):
                 "target_agent": decision["target_agent"],
                 "also_raise_jira": decision["also_raise_jira"],
                 "bug_report_id": decision["bug_report_id"],
+                "llm_degraded": llm_degraded,
+                **({"llm_error": decision["llm_error"]} if decision.get("llm_error") else {}),
             },
-            status="success",
+            status="degraded" if llm_degraded else "success",
             bug_report_id=decision.get("bug_report_id"),
             project_id=project_id,
             started_at=start_time,

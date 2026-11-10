@@ -9,7 +9,7 @@ class Evidence(Base):
     __tablename__ = "evidence"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    bug_report_id = Column(Integer, ForeignKey("bug_reports.id"), nullable=False)
+    bug_report_id = Column(Integer, ForeignKey("bug_reports.id"), nullable=False, index=True)
     type = Column(String(20), nullable=False)  # screenshot, video
     file_path = Column(String(500), nullable=False)
     file_name = Column(String(255), nullable=True)

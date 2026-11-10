@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, FolderGit2 } from 'lucide-react';
+import { Plus } from 'lucide-react';
+import toast from 'react-hot-toast';
 import useAppStore from '../store/appStore';
 import api from '../services/api';
 import ProjectList from '../components/Projects/ProjectList';
@@ -17,6 +18,7 @@ export default function ProjectsPage() {
         setProjects(projs);
       } catch (err) {
         console.error('Failed to load projects:', err);
+        toast.error(err?.message || 'Failed to load projects');
       }
     }
     load();

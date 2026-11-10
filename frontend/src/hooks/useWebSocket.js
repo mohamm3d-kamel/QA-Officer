@@ -2,11 +2,14 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 import useAppStore from '../store/appStore';
 import toast from 'react-hot-toast';
 
-export default function useWebSocket(onMessage) {
+export default function useWebSocket(onMessage, projectId = null) {
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
+  const shouldReconnectRef = useRef(true);
   const onMessageRef = useRef(onMessage);
+  const projectIdRef = useRef(projectId);
   onMessageRef.current = onMessage;
+  projectIdRef.current = projectId;
 
   const [isConnected, setIsConnected] = useState(false);
   const setAgentStatus = useAppStore((s) => s.setAgentStatus);
@@ -16,15 +19,25 @@ export default function useWebSocket(onMessage) {
   const setChatLoading = useAppStore((s) => s.setChatLoading);
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    if (!shouldReconnectRef.current) return;
+    if (
+      wsRef.current?.readyState === WebSocket.OPEN ||
+      wsRef.current?.readyState === WebSocket.CONNECTING
+    ) {
+      return;
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws`;
     const ws = new WebSocket(wsUrl);
+    ws._cancelled = false;
     wsRef.current = ws;
 
     ws.onopen = () => {
-      console.log('[WS] Connected');
+      if (ws._cancelled || !shouldReconnectRef.current || wsRef.current !== ws) {
+        ws.close();
+        return;
+      }
       setIsConnected(true);
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current);
@@ -33,24 +46,36 @@ export default function useWebSocket(onMessage) {
     };
 
     ws.onmessage = (event) => {
+      if (ws._cancelled || wsRef.current !== ws) return;
       try {
         const data = JSON.parse(event.data);
         if (onMessageRef.current) {
           onMessageRef.current(data);
         }
 
+        const targetProjectId = data.project_id ?? projectIdRef.current;
+
         switch (data.type) {
           case 'agent_status':
-            setAgentStatus(data.agent, data.status, data.message, data.data?.bug_id ?? data.bug_id);
+            setAgentStatus(
+              data.agent,
+              data.status,
+              data.message,
+              data.data?.bug_id ?? data.bug_id,
+              targetProjectId
+            );
             if (data.status === 'running') {
-              addMessage({
-                id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-                role: 'agent',
-                agent: data.agent,
-                content: data.message || `${data.agent} is working...`,
-                timestamp: new Date().toISOString(),
-                isStatus: true,
-              });
+              addMessage(
+                {
+                  id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                  role: 'agent',
+                  agent: data.agent,
+                  content: data.message || `${data.agent} is working...`,
+                  timestamp: new Date().toISOString(),
+                  isStatus: true,
+                },
+                targetProjectId
+              );
             }
             break;
 
@@ -58,17 +83,15 @@ export default function useWebSocket(onMessage) {
             if (data.done) {
               setChatLoading(false);
             } else {
-              appendToLastMessage(data.content);
+              appendToLastMessage(data.content, targetProjectId);
             }
             break;
 
           case 'notification':
             addNotification({
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
               title: data.title,
               message: data.message,
               level: data.level,
-              timestamp: new Date().toISOString(),
             });
             if (data.level === 'error') {
               toast.error(data.message);
@@ -88,23 +111,40 @@ export default function useWebSocket(onMessage) {
     };
 
     ws.onclose = () => {
-      console.log('[WS] Disconnected, reconnecting in 3s...');
+      if (ws._cancelled) return;
       setIsConnected(false);
-      reconnectTimer.current = setTimeout(connect, 3000);
+      if (wsRef.current === ws) wsRef.current = null;
+      if (shouldReconnectRef.current) {
+        reconnectTimer.current = setTimeout(connect, 3000);
+      }
     };
 
-    ws.onerror = (err) => {
-      console.error('[WS] Error:', err);
+    ws.onerror = () => {
+      if (ws._cancelled) return;
       setIsConnected(false);
-      ws.close();
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
     };
   }, [setAgentStatus, addMessage, appendToLastMessage, addNotification, setChatLoading]);
 
   useEffect(() => {
+    shouldReconnectRef.current = true;
     connect();
     return () => {
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      wsRef.current?.close();
+      shouldReconnectRef.current = false;
+      if (reconnectTimer.current) {
+        clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = null;
+      }
+      const currentWs = wsRef.current;
+      wsRef.current = null;
+      if (currentWs) {
+        currentWs._cancelled = true;
+        if (currentWs.readyState === WebSocket.OPEN) {
+          currentWs.close();
+        }
+      }
     };
   }, [connect]);
 

@@ -2,12 +2,25 @@
 
 Handles ticket creation, status updates, comments, and attachment uploads.
 """
-import base64
+import asyncio
 import logging
-from typing import Optional
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _escape_jql(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _text_to_adf(text: str) -> dict:
+    """Convert multi-line text/markdown into structured Atlassian Document Format paragraphs."""
+    paragraphs = [block.strip() for block in (text or "").split("\n\n") if block.strip()]
+    content = [
+        {"type": "paragraph", "content": [{"type": "text", "text": p}]}
+        for p in paragraphs
+    ] or [{"type": "paragraph", "content": [{"type": "text", "text": "No details provided."}]}]
+    return {"version": 1, "type": "doc", "content": content}
 
 
 class JiraClient:
@@ -29,6 +42,19 @@ class JiraClient:
             timeout=30.0,
         )
 
+    async def _lookup_account_id(self, client: httpx.AsyncClient, query: str) -> str | None:
+        if not query:
+            return None
+        try:
+            resp = await client.get(f"{self.api_url}/user/search", params={"query": query, "maxResults": 1})
+            if resp.status_code == 200:
+                users = resp.json()
+                if isinstance(users, list) and users:
+                    return users[0].get("accountId")
+        except Exception as e:
+            logger.debug(f"Jira reporter lookup failed for '{query}': {e}")
+        return None
+
     async def create_issue(
         self,
         project_key: str,
@@ -39,23 +65,11 @@ class JiraClient:
         labels: list[str] = None,
         reporter_name: str = None,
     ) -> dict:
-        """Create a Jira issue."""
-        # Build Atlassian Document Format (ADF) for description
-        adf_description = {
-            "version": 1,
-            "type": "doc",
-            "content": [
-                {
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": description}],
-                }
-            ],
-        }
-
+        """Create a Jira issue with structured ADF description and optional reporter lookup."""
         fields = {
             "project": {"key": project_key},
-            "summary": summary,
-            "description": adf_description,
+            "summary": summary[:255],
+            "description": _text_to_adf(description),
             "issuetype": {"name": issue_type},
             "priority": {"name": priority.capitalize()},
         }
@@ -63,10 +77,19 @@ class JiraClient:
         if labels:
             fields["labels"] = labels
 
-        payload = {"fields": fields}
-
         async with self._get_client() as client:
+            if reporter_name:
+                account_id = await self._lookup_account_id(client, reporter_name)
+                if account_id:
+                    fields["reporter"] = {"accountId": account_id}
+
+            payload = {"fields": fields}
             response = await client.post(f"{self.api_url}/issue", json=payload)
+            # Retry once without reporter field if project screen disallows overriding reporter
+            if response.status_code == 400 and "reporter" in fields:
+                logger.warning("Jira disallowed custom reporter field; retrying with API token reporter.")
+                fields.pop("reporter", None)
+                response = await client.post(f"{self.api_url}/issue", json={"fields": fields})
             response.raise_for_status()
             data = response.json()
             logger.info(f"Created Jira issue: {data['key']}")
@@ -78,17 +101,7 @@ class JiraClient:
 
     async def add_comment(self, issue_key: str, comment: str) -> dict:
         """Add a comment to a Jira issue."""
-        adf_comment = {
-            "version": 1,
-            "type": "doc",
-            "content": [
-                {
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": comment}],
-                }
-            ],
-        }
-        payload = {"body": adf_comment}
+        payload = {"body": _text_to_adf(comment)}
 
         async with self._get_client() as client:
             response = await client.post(
@@ -98,17 +111,20 @@ class JiraClient:
             return response.json()
 
     async def add_attachment(self, issue_key: str, file_path: str, file_name: str) -> dict:
-        """Upload an attachment to a Jira issue."""
+        """Upload an attachment to a Jira issue without blocking the event loop."""
+        def _read_bytes(path: str) -> bytes:
+            with open(path, "rb") as f:
+                return f.read()
+
+        file_bytes = await asyncio.to_thread(_read_bytes, file_path)
         async with self._get_client() as client:
-            # Attachments need special headers
             headers = {"X-Atlassian-Token": "no-check"}
-            with open(file_path, "rb") as f:
-                files = {"file": (file_name, f)}
-                response = await client.post(
-                    f"{self.api_url}/issue/{issue_key}/attachments",
-                    headers=headers,
-                    files=files,
-                )
+            files = {"file": (file_name, file_bytes)}
+            response = await client.post(
+                f"{self.api_url}/issue/{issue_key}/attachments",
+                headers=headers,
+                files=files,
+            )
             response.raise_for_status()
             return response.json()
 
@@ -163,16 +179,20 @@ class JiraClient:
     async def search_issues(
         self, project_key: str, status: str = None, max_results: int = 50
     ) -> list[dict]:
-        """Search for issues in a project, optionally filtered by status."""
-        jql = f'project = "{project_key}"'
+        """Search for issues in a project via Jira Cloud v3 /search/jql, optionally filtered by status."""
+        jql = f'project = "{_escape_jql(project_key)}"'
         if status:
-            jql += f' AND status = "{status}"'
+            jql += f' AND status = "{_escape_jql(status)}"'
         jql += " ORDER BY created DESC"
 
-        payload = {"jql": jql, "maxResults": max_results}
+        payload = {
+            "jql": jql,
+            "maxResults": max_results,
+            "fields": ["summary", "status", "priority", "labels"],
+        }
 
         async with self._get_client() as client:
-            response = await client.post(f"{self.api_url}/search", json=payload)
+            response = await client.post(f"{self.api_url}/search/jql", json=payload)
             response.raise_for_status()
             data = response.json()
 

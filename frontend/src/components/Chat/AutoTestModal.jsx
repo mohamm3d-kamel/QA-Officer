@@ -1,24 +1,50 @@
-import React, { useState } from 'react';
-import { Bot, X, Play, CheckCircle2, Layers } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Bot, X, Play, CheckCircle2 } from 'lucide-react';
+import toast from 'react-hot-toast';
 import api from '../../services/api';
 import useAppStore from '../../store/appStore';
 
+const FALLBACK_MODULES = [
+  'Authentication & Session',
+  'Checkout & Payment Gateway',
+  'Shopping Cart & Discounts',
+  'Core API & Validation',
+];
+
 export default function AutoTestModal({ isOpen, onClose, projectId, onComplete }) {
-  const [scope, setScope] = useState('all');
-  const [selectedModules, setSelectedModules] = useState(['Authentication', 'Checkout & Payment', 'Cart Persistence']);
-  const [loading, setLoading] = useState(false);
+  const skills = useAppStore((s) => s.skills);
+  const bugs = useAppStore((s) => s.bugs);
   const addNotification = useAppStore((s) => s.addNotification);
 
-  if (!isOpen) return null;
+  const availableModules = useMemo(() => {
+    const seen = new Set();
+    const result = [];
+    const addMod = (raw) => {
+      const clean = (raw || '').trim();
+      if (!clean || seen.has(clean.toLowerCase())) return;
+      seen.add(clean.toLowerCase());
+      result.push(clean);
+    };
 
-  const availableModules = [
-    'Authentication & Session',
-    'Checkout & Payment Gateway',
-    'Shopping Cart & Discounts',
-    'Product Catalog & Filters',
-    'Profile & Address Management',
-    'Order History & Webhooks',
-  ];
+    skills
+      .filter((s) => s.type !== 'report_format')
+      .forEach((s) => addMod(s.title?.split('-')[0]));
+    bugs.forEach((b) => addMod(b.module));
+    FALLBACK_MODULES.forEach(addMod);
+    return result;
+  }, [skills, bugs]);
+
+  const [scope, setScope] = useState('all');
+  const [selectedModules, setSelectedModules] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      setSelectedModules(availableModules.slice(0, 3));
+    }
+  }, [isOpen, availableModules]);
+
+  if (!isOpen) return null;
 
   const toggleModule = (mod) => {
     if (selectedModules.includes(mod)) {
@@ -29,6 +55,11 @@ export default function AutoTestModal({ isOpen, onClose, projectId, onComplete }
   };
 
   const handleStartAutoTest = async () => {
+    if (scope === 'selected' && selectedModules.length === 0) {
+      toast.error('Select at least one target module or switch to All Requirements');
+      return;
+    }
+
     setLoading(true);
     try {
       const res = await api.autoTest(projectId, {
@@ -36,16 +67,21 @@ export default function AutoTestModal({ isOpen, onClose, projectId, onComplete }
         modules: scope === 'selected' ? selectedModules : null,
       });
 
+      const summaryMsg = `Detective found ${res.discovered_count} defect(s) and created ${res.processed_pipeline_count} report(s)${
+        res.skipped_duplicates ? ` (${res.skipped_duplicates} duplicate skipped)` : ''
+      }.`;
+      toast.success(summaryMsg);
       addNotification({
         title: 'Autonomous Testing Completed',
-        message: `Detective found ${res.discovered_count} potential defects and processed ${res.processed_pipeline_count} through the pipeline.`,
+        message: summaryMsg,
         level: 'success',
       });
 
-      if (onComplete) onComplete(res);
+      if (onComplete) await onComplete(res);
       onClose();
     } catch (err) {
       console.error('Auto test error:', err);
+      toast.error(err.message || 'Auto-Test failed');
       addNotification({
         title: 'Auto Test Failed',
         message: err.message,
@@ -142,20 +178,22 @@ export default function AutoTestModal({ isOpen, onClose, projectId, onComplete }
             <div>• Detective investigates root cause & reproduces defect</div>
             <div>• Coroner captures screenshot & video evidence</div>
             <div>• Judge confirms findings independently</div>
-            <div>• Reporter formats bug report matching your template</div>
-            <div>• Sheriff stands by until asked, then logs to Jira 'Backlog'</div>
+            <div>• Detective formats bug report matching your template</div>
+            <div>• Sheriff stands by until asked, then logs to Jira &apos;Backlog&apos;</div>
           </div>
         </div>
 
         {/* Footer */}
         <div className="px-6 py-4 border-t border-slate-800 bg-slate-950/60 flex items-center justify-end gap-3">
           <button
+            type="button"
             onClick={onClose}
             className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-slate-200 transition-colors"
           >
             Cancel
           </button>
           <button
+            type="button"
             onClick={handleStartAutoTest}
             disabled={loading}
             className="flex items-center gap-2 px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition-all disabled:opacity-50 shadow-lg shadow-cyan-900/30"
@@ -177,4 +215,3 @@ export default function AutoTestModal({ isOpen, onClose, projectId, onComplete }
     </div>
   );
 }
-

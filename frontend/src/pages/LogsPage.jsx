@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Filter, Table as TableIcon, GitCommit, RefreshCw } from 'lucide-react';
+import toast from 'react-hot-toast';
 import useAppStore from '../store/appStore';
 import api from '../services/api';
 import LogsTable from '../components/Logs/LogsTable';
@@ -18,7 +19,7 @@ export default function LogsPage() {
   const [selectedAgent, setSelectedAgent] = useState('');
   const [selectedStatus, setSelectedStatus] = useState('');
 
-  const fetchLogs = async () => {
+  const fetchLogs = useCallback(async () => {
     setLoading(true);
     try {
       const res = await api.getLogs({
@@ -29,11 +30,11 @@ export default function LogsPage() {
       });
       setLogs(res);
     } catch (err) {
-      console.error('Failed to fetch logs:', err);
+      toast.error(err.message || 'Failed to fetch activity logs');
     } finally {
       setLoading(false);
     }
-  };
+  }, [selectedProjectId, selectedAgent, selectedStatus]);
 
   useEffect(() => {
     async function loadProjects() {
@@ -41,7 +42,7 @@ export default function LogsPage() {
         const projs = await api.getProjects();
         setProjects(projs);
       } catch (err) {
-        console.error(err);
+        toast.error(err.message || 'Failed to load projects');
       }
     }
     loadProjects();
@@ -49,7 +50,7 @@ export default function LogsPage() {
 
   useEffect(() => {
     fetchLogs();
-  }, [selectedProjectId, selectedAgent, selectedStatus]);
+  }, [fetchLogs]);
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6">
@@ -126,7 +127,6 @@ export default function LogsPage() {
           <option value="Detective">Detective</option>
           <option value="Coroner">Coroner</option>
           <option value="Judge">Judge</option>
-          <option value="Reporter">Reporter</option>
           <option value="Sheriff">Sheriff</option>
           <option value="Watcher">Watcher</option>
           <option value="Sanity Testers">Sanity Testers</option>
@@ -140,6 +140,7 @@ export default function LogsPage() {
         >
           <option value="">All Statuses</option>
           <option value="success">Success</option>
+          <option value="degraded">Degraded (Fallback)</option>
           <option value="failed">Failed</option>
           <option value="running">Running</option>
         </select>
@@ -167,4 +168,3 @@ export default function LogsPage() {
     </div>
   );
 }
-

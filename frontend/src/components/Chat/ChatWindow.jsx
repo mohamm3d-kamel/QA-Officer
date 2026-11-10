@@ -3,8 +3,11 @@ import useAppStore from '../../store/appStore';
 import MessageBubble from './MessageBubble';
 import { MessageSquare } from 'lucide-react';
 
-export default function ChatWindow() {
-  const messages = useAppStore((s) => s.messages);
+const EMPTY_MESSAGES = [];
+
+export default function ChatWindow({ projectId, onQuickSend }) {
+  const pid = String(projectId || 'default');
+  const messages = useAppStore((s) => s.messagesByProject[pid] || EMPTY_MESSAGES);
   const chatLoading = useAppStore((s) => s.chatLoading);
   const bottomRef = useRef(null);
 
@@ -20,18 +23,18 @@ export default function ChatWindow() {
         </div>
         <h2 className="text-xl font-semibold text-white mb-2">Start a Conversation</h2>
         <p className="text-slate-400 max-w-md text-sm">
-          Send a message to begin QA testing. Upload skills, trigger auto-tests, or ask
-          the AI agents to investigate specific areas of your application.
+          Describe a bug, upload requirements/report templates, ask about built-in agents, or trigger autonomous QA testing.
         </p>
         <div className="flex flex-wrap gap-2 mt-6 justify-center">
           {[
-            'Run a full regression test',
-            'Check the login flow',
-            'Test API endpoints',
-            'Review latest changes',
+            'What built-in agents are available?',
+            'Create a bug report',
+            'Assign Detective to investigate a bug',
+            'Start auto-test',
           ].map((suggestion) => (
             <button
               key={suggestion}
+              onClick={() => onQuickSend && onQuickSend(suggestion)}
               className="px-3 py-1.5 rounded-full text-xs font-medium bg-slate-700/50 border border-slate-600/50 text-slate-300 hover:text-brand-400 hover:border-brand-500/30 transition-all"
             >
               {suggestion}

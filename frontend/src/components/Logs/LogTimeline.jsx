@@ -1,12 +1,11 @@
 import React from 'react';
-import { Clock, Shield, Headset, Search, Camera, Scale, FileText, Tag, Eye, FlaskConical } from 'lucide-react';
+import { Shield, Headset, Search, Camera, Scale, Tag, Eye, FlaskConical } from 'lucide-react';
 
 const agentIcons = {
   'Desk Officer': Headset,
   Detective: Search,
   Coroner: Camera,
   Judge: Scale,
-  Reporter: FileText,
   Sheriff: Tag,
   Watcher: Eye,
   'Sanity Testers': FlaskConical,
@@ -25,14 +24,17 @@ export default function LogTimeline({ logs }) {
     <div className="relative pl-6 space-y-6 before:absolute before:left-3 before:top-2 before:bottom-2 before:w-0.5 before:bg-slate-800 py-4">
       {logs.map((log) => {
         const Icon = agentIcons[log.agent_name] || Shield;
-        const isSuccess = log.status === 'success';
+        const borderClass =
+          log.status === 'success'
+            ? 'border-cyan-500 text-cyan-400'
+            : log.status === 'degraded'
+            ? 'border-amber-500 text-amber-400'
+            : 'border-red-500 text-red-400';
 
         return (
           <div key={log.id} className="relative flex items-start gap-4 group">
             <div
-              className={`absolute -left-6 top-1.5 w-6 h-6 rounded-full flex items-center justify-center border-2 bg-slate-900 ${
-                isSuccess ? 'border-cyan-500 text-cyan-400' : 'border-red-500 text-red-400'
-              }`}
+              className={`absolute -left-6 top-1.5 w-6 h-6 rounded-full flex items-center justify-center border-2 bg-slate-900 ${borderClass}`}
             >
               <Icon className="w-3.5 h-3.5" />
             </div>
@@ -44,6 +46,11 @@ export default function LogTimeline({ logs }) {
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-cyan-300">
                     {log.action}
                   </span>
+                  {log.status === 'degraded' && (
+                    <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-amber-950 text-amber-400 border border-amber-800">
+                      degraded
+                    </span>
+                  )}
                 </div>
                 <span className="text-[11px] text-slate-500 font-mono">
                   {new Date(log.started_at).toLocaleTimeString()}
@@ -62,4 +69,3 @@ export default function LogTimeline({ logs }) {
     </div>
   );
 }
-

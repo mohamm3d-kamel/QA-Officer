@@ -1,12 +1,13 @@
 """Projects Router."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional
 
 from database import get_db
 from models.project import Project
+from models.agent_log import AgentLog
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -80,12 +81,14 @@ async def update_project(project_id: int, data: ProjectUpdate, db: AsyncSession 
 
 @router.delete("/{project_id}")
 async def delete_project(project_id: int, db: AsyncSession = Depends(get_db)):
-    """Delete project."""
+    """Delete project and its orphaned agent audit logs."""
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     await db.delete(project)
+    await db.flush()
+    await db.execute(delete(AgentLog).where(AgentLog.project_id == project_id))
     await db.commit()
     return {"message": "Project deleted successfully", "id": project_id}
 

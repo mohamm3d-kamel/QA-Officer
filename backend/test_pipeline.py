@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import asyncio
 from sqlalchemy import select
 from database import init_db, async_session
+import config
 from main import seed_initial_data
 from models.project import Project
 from models.bug_report import BugReport
@@ -26,6 +27,7 @@ from routers.reports import generate_summary_report
 
 
 async def run_e2e_tests():
+    before_evidence = set(config.EVIDENCE_DIR.glob("*"))
     print("=" * 60)
     print("  🧪 QA OFFICER — COMPLETE E2E VERIFICATION TEST")
     print("=" * 60)
@@ -54,9 +56,24 @@ async def run_e2e_tests():
     assert report_format, "Default report format template should exist"
     print("✅ Found Stored Skills & Report Format Template.")
 
-    # 3. Test Desk Officer Pre-Workflow Chat (Workflow must NOT start yet)
-    print("\n[Step 2] Testing Desk Officer Pre-Workflow Chat & Agent Roster Awareness...")
+    # 3. Test Desk Officer Small Talk & Pre-Workflow Chat (Workflow must NOT start yet)
+    print("\n[Step 2] Testing Desk Officer Small Talk, Pre-Workflow Chat & Agent Roster Awareness...")
     chat_history = []
+    triage_greet = await orchestrator.desk_officer.triage_and_route(
+        message="hi",
+        project_info=project_info,
+        skills_context=skills_context,
+        recent_bugs=[],
+        conversation_history=chat_history,
+        project_id=1,
+    )
+    assert triage_greet["action"] == "chat"
+    assert "noted these bug details" not in triage_greet["reply"].lower(), (
+        f"Greeting 'hi' should not be treated as bug notes: {triage_greet['reply']}"
+    )
+    chat_history.append({"sender": "user", "content": "hi"})
+    chat_history.append({"sender": "agent", "agent": "Desk Officer", "content": triage_greet["reply"]})
+
     msg1 = (
         "Cart total does not update after applying discount code 'SUMMER20'. "
         "The checkout shows 20% discount badge, but final price charged to credit card "
@@ -72,9 +89,10 @@ async def run_e2e_tests():
     )
     assert triage1["action"] == "chat", f"Expected pre-workflow chat, got {triage1['action']}"
     assert triage1["also_raise_jira"] is False
+    assert "\nhi\n" not in triage1["bug_summary"], "Small talk 'hi' should not pollute synthesized bug context"
     chat_history.append({"sender": "user", "content": msg1})
     chat_history.append({"sender": "agent", "agent": "Desk Officer", "content": triage1["reply"]})
-    print("✅ Pre-workflow bug chat stayed conversational (main workflow did NOT auto-trigger).")
+    print("✅ Small talk 'hi' greeted naturally without polluting triage & bug chat stayed conversational.")
 
     triage_roster = await orchestrator.desk_officer.triage_and_route(
         message="What built-in agents are available and what are their roles?",
@@ -85,12 +103,13 @@ async def run_e2e_tests():
         project_id=1,
     )
     assert triage_roster["action"] == "chat"
-    for expected_agent in ["Detective", "Coroner", "Judge", "Reporter", "Sheriff", "Watcher", "Sanity Testers"]:
+    for expected_agent in ["Detective", "Coroner", "Judge", "Sheriff", "Watcher", "Sanity Testers"]:
         assert expected_agent in triage_roster["reply"], f"Roster reply missing {expected_agent}"
-    print("✅ Desk Officer knows and explains all 7 built-in agents.")
+    assert "**Reporter**" not in triage_roster["reply"], "Standalone Reporter agent should be merged into Detective"
+    print("✅ Desk Officer knows and explains all 6 specialized built-in agents (Detective includes report authoring).")
 
-    # 4. Test Individual Agent Assignment by Desk Officer (e.g. Detective)
-    print("\n[Step 3] Testing Desk Officer Assigning Individual Agent (Detective)...")
+    # 4. Test Individual Agent Assignment by Desk Officer (Merged Detective: trace + report)
+    print("\n[Step 3] Testing Desk Officer Assigning Individual Agent (Merged Detective)...")
     triage_detective = await orchestrator.desk_officer.triage_and_route(
         message="Assign Detective to investigate this bug",
         project_info=project_info,
@@ -107,7 +126,29 @@ async def run_e2e_tests():
         bug_input=triage_detective["bug_summary"],
     )
     assert detective_dispatch["status"] == "success"
-    print(f"✅ Desk Officer assigned Detective -> Draft Bug #{detective_dispatch['bug_id']} created.")
+    assert detective_dispatch.get("formatted_report"), "Merged Detective should also produce formatted_report"
+
+    # Also verify legacy 'Reporter' phrasing routes to merged Detective cleanly
+    triage_legacy_reporter = await orchestrator.desk_officer.triage_and_route(
+        message=f"Ask Reporter to format the report for bug #{detective_dispatch['bug_id']}",
+        project_info=project_info,
+        skills_context=skills_context,
+        recent_bugs=[],
+        conversation_history=chat_history,
+        project_id=1,
+    )
+    assert triage_legacy_reporter["action"] == "assign_agent"
+    assert triage_legacy_reporter["target_agent"] == "detective"
+    report_dispatch = await orchestrator.dispatch_agent(
+        target_agent=triage_legacy_reporter["target_agent"],
+        project_id=1,
+        bug_input=triage_legacy_reporter["bug_summary"],
+        bug_report_id=triage_legacy_reporter["bug_report_id"],
+    )
+    assert report_dispatch["status"] == "success"
+    assert report_dispatch.get("mode") == "report"
+    assert report_dispatch.get("formatted_report")
+    print(f"✅ Desk Officer assigned Detective -> Draft Bug #{detective_dispatch['bug_id']} created with formatted report.")
 
     # 5. Test Main Workflow Trigger ('Create a bug report') WITHOUT Sheriff raising Jira
     print("\n[Step 4] Testing 'Create a bug report' Main Workflow (Sheriff stays on standby)...")
@@ -138,11 +179,16 @@ async def run_e2e_tests():
     bug_id = pipeline_result["bug_id"]
     assert pipeline_result["jira_ticket"] is None, "Sheriff should NOT raise ticket until asked!"
     assert pipeline_result["status"] == "confirmed"
-    assert pipeline_result["formatted_report"], "Reporter output should be generated and saved"
+    assert pipeline_result["formatted_report"], "Detective output should include a formatted bug report"
+    assert pipeline_result.get("llm_degraded") is True, "Offline/test LLM key should flag llm_degraded=True"
+    assert len(pipeline_result.get("evidence", [])) >= 1, "Coroner should produce evidence"
+    ev_first = pipeline_result["evidence"][0]
+    assert isinstance(ev_first.get("id"), int) and ev_first["id"] > 0, "Coroner must attach DB id onto evidence items"
+    assert Path(ev_first["file_path"]).is_file(), "Coroner evidence file must exist on disk"
     print(f"\n✅ Main Workflow Complete! Created Bug Report #{bug_id} (Status: {pipeline_result['status']})")
     print(f"   • Title: {pipeline_result['title']}")
     print(f"   • Judge Confirmed Root Cause: {pipeline_result['root_cause']}")
-    print(f"   • Coroner Evidence: {len(pipeline_result['evidence'])} file(s)")
+    print(f"   • Coroner Evidence: {len(pipeline_result['evidence'])} file(s) (id={ev_first['id']})")
     print("   • Sheriff Ticket: Not raised yet (awaiting explicit request)")
 
     # 6. Test Explicit Sheriff Raise -> Must go to 'Backlog' (NOT 'To Do')
@@ -182,19 +228,37 @@ async def run_e2e_tests():
     print("\n[Step 7] Testing Summary Report Generation...")
     async with async_session() as session:
         summary = await generate_summary_report(project_id=1, db=session)
+        assert summary["total_modules"] == 2, f"Expected 2 modules (excluding report_format), got {summary['total_modules']}"
+        assert summary["covered_modules"] == 1, f"Expected 1 covered module, got {summary['covered_modules']}"
+        assert summary["coverage_percentage"] == 50.0, f"Expected 50.0% coverage, got {summary['coverage_percentage']}"
         print(f"✅ Summary Generated for: {summary['project_name']}")
         print(f"   • Coverage: {summary['coverage_percentage']}% ({summary['covered_modules']}/{summary['total_modules']} modules)")
         print(f"   • Total Tickets Added: {summary['tickets_added']}")
         print(f"   • Resolved: {summary['tickets_resolved']}")
 
-    # 9. Verify Agent Logs include Desk Officer + all pipeline agents
+    # 9. Verify Agent Logs include Desk Officer, all pipeline agents, and honest degraded status
     print("\n[Step 8] Checking Agent Activity Audit Trail...")
     async with async_session() as session:
         res = await session.execute(select(AgentLog).where(AgentLog.project_id == 1))
         logs = res.scalars().all()
         logged_agents = {l.agent_name for l in logs}
-        print(f"✅ Total Agent Actions Logged: {len(logs)} | Agents: {sorted(logged_agents)}")
+        logged_statuses = {l.status for l in logs}
+        print(f"✅ Total Agent Actions Logged: {len(logs)} | Agents: {sorted(logged_agents)} | Statuses: {sorted(logged_statuses)}")
         assert "Desk Officer" in logged_agents, "Desk Officer actions should be logged"
+        assert "Detective" in logged_agents, "Detective actions should be logged"
+        assert "Reporter" not in logged_agents, "Reporter agent should be merged into Detective"
+        assert "degraded" in logged_statuses, "Offline/invalid-key fallbacks must log status='degraded'"
+        assert any(
+            l.agent_name == "Detective" and l.action == "generate_bug_report" for l in logs
+        ), "Detective should log generate_bug_report actions"
+
+    # Cleanup evidence artifacts generated only by this E2E run
+    after_evidence = set(config.EVIDENCE_DIR.glob("*"))
+    for p in after_evidence - before_evidence:
+        if p.is_file():
+            p.unlink(missing_ok=True)
+    if TEST_DB_FILE.exists():
+        TEST_DB_FILE.unlink()
 
     print("\n" + "=" * 60)
     print("  🎉 ALL QA OFFICER SYSTEMS VERIFIED SUCCESSFULLY!")

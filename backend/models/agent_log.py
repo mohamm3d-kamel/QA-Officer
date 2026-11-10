@@ -9,14 +9,14 @@ class AgentLog(Base):
     __tablename__ = "agent_logs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    bug_report_id = Column(Integer, ForeignKey("bug_reports.id"), nullable=True)
-    project_id = Column(Integer, nullable=True)
-    agent_name = Column(String(50), nullable=False)
+    bug_report_id = Column(Integer, ForeignKey("bug_reports.id"), nullable=True, index=True)
+    project_id = Column(Integer, nullable=True, index=True)
+    agent_name = Column(String(50), nullable=False, index=True)
     action = Column(String(255), nullable=False)
     input_data = Column(Text, nullable=True)
     output_data = Column(Text, nullable=True)
-    status = Column(String(20), default="running")  # running, success, failed
-    started_at = Column(DateTime, default=datetime.utcnow)
+    status = Column(String(20), default="running")  # running, success, failed, degraded
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
     finished_at = Column(DateTime, nullable=True)
 
     # Relationships

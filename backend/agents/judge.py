@@ -2,7 +2,7 @@
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 from agents.base import BaseAgent
 from services.llm_router import LLMRouter
@@ -29,6 +29,7 @@ class JudgeAgent(BaseAgent):
         project_info: Dict[str, Any],
         project_id: int,
         bug_report_id: Optional[int] = None,
+        runtime_telemetry: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Independently analyze and confirm whether Detective's root cause is accurate."""
         start_time = datetime.utcnow()
@@ -47,6 +48,12 @@ class JudgeAgent(BaseAgent):
             "}"
         )
 
+        telemetry_block = (
+            f"\nCoroner Runtime & Browser Telemetry:\n{json.dumps(runtime_telemetry)}\n"
+            if runtime_telemetry
+            else ""
+        )
+
         user_content = (
             f"Project: {project_info.get('name')}\n"
             f"Requirements / Business Logic:\n{skills_context}\n\n"
@@ -56,24 +63,25 @@ class JudgeAgent(BaseAgent):
             f"Detective Reproduction Steps:\n{bug_data.get('steps_to_reproduce')}\n"
             f"Detective Severity: {bug_data.get('severity')}\n"
             f"Detective Label: {bug_data.get('label')}\n"
+            f"{telemetry_block}"
         )
 
+        llm_degraded = False
         try:
             response = await self.llm.chat(
                 messages=[{"role": "user", "content": user_content}],
                 system_prompt=system_prompt,
                 temperature=0.1,
+                json_mode=True,
             )
-            content = response.content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            decision = json.loads(content.strip())
+            decision = self.parse_json_response(response.content)
+            if not isinstance(decision, dict):
+                raise ValueError("Judge expected JSON object response")
+            decision["llm_degraded"] = False
+            log_status = "success" if decision.get("confirmed") else "failed"
         except Exception as e:
-            logger.warning(f"Judge JSON parsing fallback: {e}")
+            llm_degraded = True
+            logger.warning(f"Judge fell back to offline heuristic verification: {e}")
             decision = {
                 "confirmed": True,
                 "final_root_cause": bug_data.get("root_cause", "Verified defect logic."),
@@ -81,13 +89,20 @@ class JudgeAgent(BaseAgent):
                 "verdict": "CONFIRMED",
                 "severity_adjustment": bug_data.get("severity", "medium"),
                 "confidence": 0.95,
+                "llm_degraded": True,
+                "llm_error": str(e),
             }
+            log_status = "degraded"
 
         await self.log_action(
             action="judge_root_cause_verification",
-            input_data={"bug_title": bug_data.get("title"), "detective_root_cause": bug_data.get("root_cause")},
+            input_data={
+                "bug_title": bug_data.get("title"),
+                "detective_root_cause": bug_data.get("root_cause"),
+                "has_runtime_telemetry": bool(runtime_telemetry),
+            },
             output_data=decision,
-            status="success" if decision.get("confirmed") else "failed",
+            status=log_status,
             bug_report_id=bug_report_id,
             project_id=project_id,
             started_at=start_time,

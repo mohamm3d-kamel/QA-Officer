@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 from datetime import datetime
 import json
 import logging
+import re
 
 from database import async_session
 from models.agent_log import AgentLog
@@ -19,6 +20,30 @@ class BaseAgent(ABC):
         self.role = role
         self.color = color
         self.icon = icon
+
+    @staticmethod
+    def parse_json_response(content: str) -> Any:
+        """Parse JSON from an LLM response, handling Markdown fences or surrounding prose."""
+        text = (content or "").strip()
+        if not text:
+            raise ValueError("Empty LLM response")
+
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+        if fence_match:
+            text = fence_match.group(1).strip()
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            decoder = json.JSONDecoder()
+            for idx, ch in enumerate(text):
+                if ch in "{[":
+                    try:
+                        obj, _ = decoder.raw_decode(text, idx)
+                        return obj
+                    except json.JSONDecodeError:
+                        continue
+            raise
 
     async def log_action(
         self,

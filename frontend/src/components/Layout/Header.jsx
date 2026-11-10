@@ -1,6 +1,7 @@
 import { useLocation } from 'react-router-dom';
-import { Bell, Search } from 'lucide-react';
+import { Bell, Trash2 } from 'lucide-react';
 import useAppStore from '../../store/appStore';
+import api from '../../services/api';
 import { useState, useRef, useEffect } from 'react';
 
 const pageTitles = {
@@ -13,12 +14,25 @@ const pageTitles = {
 export default function Header() {
   const location = useLocation();
   const notifications = useAppStore((s) => s.notifications);
+  const markAllNotificationsRead = useAppStore((s) => s.markAllNotificationsRead);
+  const clearNotifications = useAppStore((s) => s.clearNotifications);
+  const reporterName = useAppStore((s) => s.reporterName);
+  const setReporterName = useAppStore((s) => s.setReporterName);
   const [showNotifs, setShowNotifs] = useState(false);
   const notifRef = useRef(null);
 
   let title = pageTitles[location.pathname] || '';
   if (location.pathname.startsWith('/chat/')) title = 'Chat';
   if (location.pathname.startsWith('/summary/')) title = 'Summary Report';
+
+  useEffect(() => {
+    api
+      .getSettings()
+      .then((s) => {
+        if (s?.default_reporter) setReporterName(s.default_reporter);
+      })
+      .catch(() => {});
+  }, [setReporterName]);
 
   useEffect(() => {
     function handleClick(e) {
@@ -30,9 +44,16 @@ export default function Header() {
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
 
-  const unread = notifications.filter(
-    (n) => Date.now() - new Date(n.timestamp).getTime() < 60000
-  ).length;
+  const unread = notifications.filter((n) => !n.read).length;
+  const avatarInitial = (reporterName || 'M').trim().charAt(0).toUpperCase() || 'M';
+
+  const handleToggleNotifs = () => {
+    const nextOpen = !showNotifs;
+    setShowNotifs(nextOpen);
+    if (nextOpen && unread > 0) {
+      markAllNotificationsRead();
+    }
+  };
 
   return (
     <header className="flex items-center justify-between h-16 px-6 border-b border-slate-700/50 bg-surface-800/50 backdrop-blur-sm flex-shrink-0">
@@ -44,7 +65,8 @@ export default function Header() {
         {/* Notifications */}
         <div className="relative" ref={notifRef}>
           <button
-            onClick={() => setShowNotifs(!showNotifs)}
+            onClick={handleToggleNotifs}
+            aria-label="Notifications"
             className="relative p-2 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-700/50 transition-colors"
           >
             <Bell className="w-5 h-5" />
@@ -57,8 +79,17 @@ export default function Header() {
 
           {showNotifs && (
             <div className="absolute right-0 top-full mt-2 w-80 max-h-96 overflow-y-auto glass-card shadow-2xl z-50 animate-fade-in">
-              <div className="p-3 border-b border-slate-700/50">
+              <div className="p-3 border-b border-slate-700/50 flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-white">Notifications</h3>
+                {notifications.length > 0 && (
+                  <button
+                    onClick={clearNotifications}
+                    className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-200 px-2 py-1 rounded hover:bg-slate-700/40 transition-colors"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    Clear all
+                  </button>
+                )}
               </div>
               {notifications.length === 0 ? (
                 <div className="p-6 text-center text-slate-500 text-sm">
@@ -99,9 +130,11 @@ export default function Header() {
         {/* User avatar */}
         <div className="flex items-center gap-2 pl-3 border-l border-slate-700/50">
           <div className="w-8 h-8 rounded-full bg-gradient-to-br from-brand-400 to-brand-600 flex items-center justify-center text-white text-sm font-bold">
-            M
+            {avatarInitial}
           </div>
-          <span className="text-sm font-medium text-slate-300 hidden sm:block">Mohamed</span>
+          <span className="text-sm font-medium text-slate-300 hidden sm:block">
+            {reporterName || 'Mohamed Kamel'}
+          </span>
         </div>
       </div>
     </header>

@@ -1,8 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { Save, Key, Cpu, Tag, Bell, Globe, CheckCircle } from 'lucide-react';
+import { Save, Key, Cpu, Bell, Globe, CheckCircle, Mail } from 'lucide-react';
+import toast from 'react-hot-toast';
 import api from '../../services/api';
+import useAppStore from '../../store/appStore';
 
 export default function SettingsForm() {
+  const setReporterName = useAppStore((s) => s.setReporterName);
+
   const [settings, setSettings] = useState({
     llm_provider: 'openai',
     llm_api_key: '',
@@ -17,6 +21,11 @@ export default function SettingsForm() {
     notification_email: '',
     notification_slack_enabled: 'false',
     notification_slack_webhook: '',
+    smtp_host: '',
+    smtp_port: '587',
+    smtp_username: '',
+    smtp_password: '',
+    smtp_from: '',
     browser_chromium: 'true',
     browser_firefox: 'true',
     browser_webkit: 'true',
@@ -36,16 +45,41 @@ export default function SettingsForm() {
             mapped[item.key] = item.value;
           });
           setSettings((prev) => ({ ...prev, ...mapped }));
+          if (mapped.default_reporter) {
+            setReporterName(mapped.default_reporter);
+          }
         }
       } catch (err) {
-        console.error('Failed to load settings:', err);
+        toast.error(err.message || 'Failed to load settings');
       }
     }
     loadSettings();
-  }, []);
+  }, [setReporterName]);
+
+  const DEFAULT_MODELS = {
+    openai: 'gpt-4o',
+    gemini: 'gemini-3-flash-preview',
+    anthropic: 'claude-3-5-sonnet-latest',
+    ollama: 'llama3.1',
+  };
 
   const handleChange = (key, value) => {
-    setSettings((prev) => ({ ...prev, [key]: value }));
+    setSettings((prev) => {
+      const next = { ...prev, [key]: value };
+      if (key === 'llm_provider') {
+        const knownDefaults = new Set([
+          ...Object.values(DEFAULT_MODELS),
+          'gpt-4',
+          'gemini-1.5-pro',
+          'gemini-2.5-flash',
+          'claude-3-opus',
+        ]);
+        if (!prev.llm_model || knownDefaults.has(prev.llm_model)) {
+          next.llm_model = DEFAULT_MODELS[value] || prev.llm_model;
+        }
+      }
+      return next;
+    });
     setSaved(false);
   };
 
@@ -54,10 +88,12 @@ export default function SettingsForm() {
     setLoading(true);
     try {
       await api.updateSettings(settings);
+      setReporterName(settings.default_reporter);
       setSaved(true);
+      toast.success('Configuration saved successfully');
       setTimeout(() => setSaved(false), 3000);
     } catch (err) {
-      console.error('Failed to update settings:', err);
+      toast.error(err.message || 'Failed to save configuration');
     } finally {
       setLoading(false);
     }
@@ -100,7 +136,7 @@ export default function SettingsForm() {
               type="text"
               value={settings.llm_model}
               onChange={(e) => handleChange('llm_model', e.target.value)}
-              placeholder="gpt-4, gemini-1.5-pro, claude-3-opus..."
+              placeholder="gpt-4o, gemini-3-flash-preview, claude-3-5-sonnet-latest..."
               className="w-full bg-slate-950 border border-slate-800 rounded-lg text-sm text-slate-200 px-3 py-2 focus:border-cyan-500 focus:outline-none"
             />
           </div>
@@ -111,7 +147,7 @@ export default function SettingsForm() {
               type="password"
               value={settings.llm_api_key}
               onChange={(e) => handleChange('llm_api_key', e.target.value)}
-              placeholder="sk-..."
+              placeholder="sk-... (stored masked once saved)"
               className="w-full bg-slate-950 border border-slate-800 rounded-lg text-sm text-slate-200 px-3 py-2 focus:border-cyan-500 focus:outline-none font-mono"
             />
           </div>
@@ -160,7 +196,7 @@ export default function SettingsForm() {
           </div>
         </div>
 
-        <div className="mt-4 pt-4 border-t border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="mt-4 pt-4 border-t border-slate-800 grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label className="text-xs font-medium text-slate-400 mb-1.5 block">Default Reporter Name</label>
             <input
@@ -184,12 +220,24 @@ export default function SettingsForm() {
               className="w-full bg-slate-950 border border-slate-800 rounded-lg text-sm text-slate-200 px-3 py-2 focus:border-cyan-500 focus:outline-none"
             />
           </div>
+
+          <div className="flex items-end">
+            <label className="w-full flex items-center justify-between p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-300 cursor-pointer">
+              <span>Watcher Background Polling</span>
+              <input
+                type="checkbox"
+                checked={settings.watcher_enabled === 'true'}
+                onChange={(e) => handleChange('watcher_enabled', e.target.checked ? 'true' : 'false')}
+                className="rounded text-cyan-500"
+              />
+            </label>
+          </div>
         </div>
       </div>
 
-      {/* Notifications (Email & Slack) */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 shadow">
-        <div className="flex items-center gap-2.5 mb-4 text-amber-400">
+      {/* Notifications (Email SMTP & Slack) */}
+      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 shadow space-y-5">
+        <div className="flex items-center gap-2.5 text-amber-400">
           <Bell className="w-5 h-5" />
           <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-100">External Notifications</h3>
         </div>
@@ -207,7 +255,7 @@ export default function SettingsForm() {
             </div>
             <input
               type="email"
-              placeholder="notification@example.com"
+              placeholder="Recipient: notification@example.com"
               value={settings.notification_email}
               onChange={(e) => handleChange('notification_email', e.target.value)}
               className="w-full bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2"
@@ -225,13 +273,58 @@ export default function SettingsForm() {
               />
             </div>
             <input
-              type="url"
+              type="password"
               placeholder="https://hooks.slack.com/services/..."
               value={settings.notification_slack_webhook}
               onChange={(e) => handleChange('notification_slack_webhook', e.target.value)}
-              className="w-full bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2"
+              className="w-full bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2 font-mono"
             />
           </div>
+        </div>
+
+        {/* SMTP Transport */}
+        <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3">
+          <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
+            <Mail className="w-4 h-4 text-cyan-400" />
+            <span>SMTP Server (Required when Email Alerts are enabled)</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+            <input
+              type="text"
+              placeholder="smtp.gmail.com"
+              value={settings.smtp_host}
+              onChange={(e) => handleChange('smtp_host', e.target.value)}
+              className="md:col-span-2 bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2"
+            />
+            <input
+              type="number"
+              placeholder="587"
+              value={settings.smtp_port}
+              onChange={(e) => handleChange('smtp_port', e.target.value)}
+              className="bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2"
+            />
+            <input
+              type="text"
+              placeholder="SMTP Username"
+              value={settings.smtp_username}
+              onChange={(e) => handleChange('smtp_username', e.target.value)}
+              className="bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2"
+            />
+            <input
+              type="password"
+              placeholder="SMTP Password"
+              value={settings.smtp_password}
+              onChange={(e) => handleChange('smtp_password', e.target.value)}
+              className="bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2 font-mono"
+            />
+          </div>
+          <input
+            type="email"
+            placeholder="From address (optional, e.g. qa-bot@company.com)"
+            value={settings.smtp_from}
+            onChange={(e) => handleChange('smtp_from', e.target.value)}
+            className="w-full md:w-1/2 bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2"
+          />
         </div>
       </div>
 
@@ -289,7 +382,7 @@ export default function SettingsForm() {
         <button
           type="submit"
           disabled={loading}
-          className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition-all shadow-lg shadow-cyan-900/30"
+          className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition-all shadow-lg shadow-cyan-900/30 disabled:opacity-50"
         >
           <Save className="w-4 h-4" />
           <span>{loading ? 'Saving Settings...' : 'Save Configuration'}</span>
@@ -298,4 +391,3 @@ export default function SettingsForm() {
     </form>
   );
 }
-

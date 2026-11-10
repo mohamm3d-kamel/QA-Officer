@@ -9,8 +9,8 @@ class Skill(Base):
     __tablename__ = "skills"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
-    type = Column(String(50), nullable=False)  # requirement, report_format, test_case, business_doc
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    type = Column(String(50), nullable=False, index=True)  # requirement, report_format, test_case, business_doc
     title = Column(String(255), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -10,7 +10,6 @@ from agents.desk_officer import DeskOfficerAgent
 from agents.detective import DetectiveAgent
 from agents.coroner import CoronerAgent
 from agents.judge import JudgeAgent
-from agents.reporter import ReporterAgent
 from agents.sheriff import SheriffAgent
 from agents.watcher import WatcherAgent
 from agents.sanity_tester import SanityTesterAgent
@@ -20,12 +19,13 @@ from database import async_session
 from models.bug_report import BugReport
 from models.skill import Skill
 from models.project import Project
+import config
 
 logger = logging.getLogger(__name__)
 
 
 class AgentOrchestrator:
-    """Coordinates Desk Officer, Detective, Coroner, Judge, Reporter, Sheriff, Watcher, and Sanity Testers."""
+    """Coordinates Desk Officer, Detective, Coroner, Judge, Sheriff, Watcher, and Sanity Testers."""
 
     def __init__(self, llm_router: LLMRouter, jira_settings: Dict[str, str], default_reporter: str = "Mohamed Kamel"):
         self.llm = llm_router
@@ -36,22 +36,23 @@ class AgentOrchestrator:
         self.detective = DetectiveAgent(self.llm)
         self.coroner = CoronerAgent()
         self.judge = JudgeAgent(self.llm)
-        self.reporter = ReporterAgent(self.llm)
         self.sheriff = SheriffAgent(default_reporter=default_reporter)
-        self.notifier = NotificationService(
-            email_enabled=jira_settings.get("notification_email_enabled") == "true",
-            email_address=jira_settings.get("notification_email", ""),
-            slack_enabled=jira_settings.get("notification_slack_enabled") == "true",
-            slack_webhook=jira_settings.get("notification_slack_webhook", ""),
-        )
+        self.notifier = NotificationService.from_settings(jira_settings)
         self.watcher = WatcherAgent(self.detective, self.coroner, self.notifier)
         self.sanity_tester = SanityTesterAgent(self.llm)
 
-    async def get_project_skills_context(self, project_id: int) -> tuple[str, Optional[str]]:
-        """Retrieve stored skills/requirements and report format for a project."""
+    def _browser_config(self) -> tuple[List[str], bool]:
+        browsers = config.get_enabled_browsers(self.jira_settings)
+        headless = str(self.jira_settings.get("browser_headless", "true")).lower() == "true"
+        return browsers, headless
+
+    async def get_project_skills_context(self, project_id: int, max_chars: int = 12000) -> tuple[str, Optional[str]]:
+        """Retrieve stored skills/requirements and latest report format for a project."""
         async with async_session() as session:
             result = await session.execute(
-                select(Skill).where(Skill.project_id == project_id)
+                select(Skill)
+                .where(Skill.project_id == project_id)
+                .order_by(Skill.created_at.asc(), Skill.id.asc())
             )
             skills = result.scalars().all()
 
@@ -61,19 +62,26 @@ class AgentOrchestrator:
         for s in skills:
             if s.type == "report_format":
                 report_format = s.content
-            context_lines.append(f"[{s.type.upper()}] {s.title}:\n{s.content}\n")
+            else:
+                context_lines.append(f"[{s.type.upper()}] {s.title}:\n{s.content}\n")
 
-        return "\n".join(context_lines), report_format
+        combined = "\n".join(context_lines)
+        if len(combined) > max_chars:
+            combined = combined[:max_chars] + "\n...[skills context truncated to fit prompt budget]..."
+
+        return combined, report_format
 
     async def _make_notifier(
         self,
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]],
+        project_id: Optional[int] = None,
     ):
         async def notify(agent: str, status: str, message: str, data: Any = None):
             if broadcast_callback:
                 try:
                     await broadcast_callback({
                         "type": "agent_status",
+                        "project_id": project_id,
                         "agent": agent,
                         "status": status,
                         "message": message,
@@ -92,11 +100,12 @@ class AgentOrchestrator:
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         include_sheriff: bool = False,
     ) -> Dict[str, Any]:
-        """Execute the main bug reporting pipeline: Detective -> Coroner -> Judge -> Reporter.
+        """Execute the main bug reporting pipeline: Detective -> Coroner -> Judge -> Detective (Report).
 
         Sheriff is NOT invoked automatically unless ``include_sheriff=True`` (explicitly requested).
         """
-        notify = await self._make_notifier(broadcast_callback)
+        notify = await self._make_notifier(broadcast_callback, project_id=project_id)
+        browsers, headless = self._browser_config()
 
         # Fetch Project
         async with async_session() as session:
@@ -128,6 +137,8 @@ class AgentOrchestrator:
             project_info=project_info,
             project_id=project_id,
             bug_report_id=bug_id,
+            browsers=browsers,
+            headless=headless,
         )
         await notify("detective", "success", f"Detective identified root cause for: {detective_result.get('title')}", detective_result)
 
@@ -148,16 +159,18 @@ class AgentOrchestrator:
 
         # 2. CORONER (Pass 2 Evidence Capture)
         await notify("coroner", "running", "Coroner is capturing video and screenshot evidence during reproduction pass...")
-        evidence_list = await self.coroner.capture_evidence(
+        evidence_list, runtime_telemetry = await self.coroner.capture_with_telemetry(
             bug_data=detective_result,
             project_info=project_info,
             stage="detection",
             bug_report_id=bug_id,
             project_id=project_id,
+            browsers=browsers,
+            headless=headless,
         )
         await notify("coroner", "success", f"Coroner captured {len(evidence_list)} evidence files", evidence_list)
 
-        # 3. JUDGE (Independent verification of root cause)
+        # 3. JUDGE (Independent verification of root cause grounded with runtime telemetry)
         await notify("judge", "running", "Judge is independently verifying the Detective root cause...")
         judge_verdict = await self.judge.verify_root_cause(
             bug_data=detective_result,
@@ -165,31 +178,34 @@ class AgentOrchestrator:
             project_info=project_info,
             project_id=project_id,
             bug_report_id=bug_id,
+            runtime_telemetry=runtime_telemetry,
         )
-        await notify("judge", "success", f"Judge Verdict: {judge_verdict.get('verdict')} - {judge_verdict.get('final_root_cause')[:80]}...", judge_verdict)
+        await notify("judge", "success", f"Judge Verdict: {judge_verdict.get('verdict')} - {judge_verdict.get('final_root_cause', '')[:80]}...", judge_verdict)
 
         # Update root cause with Judge's final decision
         async with async_session() as session:
             b = await session.get(BugReport, bug_id)
             b.root_cause = judge_verdict.get("final_root_cause")
+            b.severity = judge_verdict.get("severity_adjustment") or b.severity
             b.status = "confirmed"
             await session.commit()
 
-        # 4. REPORTER (Writes report adhering to Tester's format)
-        await notify("reporter", "running", "Reporter is authoring the final bug report matching your custom template...")
-        formatted_report = await self.reporter.generate_report(
+        # 4. DETECTIVE (Authors formatted report incorporating Judge verdict & Coroner evidence)
+        await notify("detective", "running", "Detective is authoring the final bug report matching your custom template...")
+        formatted_report = await self.detective.generate_report(
             bug_data=detective_result,
             judge_verdict=judge_verdict,
             report_format_template=report_format,
             project_info=project_info,
             project_id=project_id,
             bug_report_id=bug_id,
+            evidence_list=evidence_list,
         )
         async with async_session() as session:
             b = await session.get(BugReport, bug_id)
             b.formatted_report = formatted_report
             await session.commit()
-        await notify("reporter", "success", "Reporter completed formatted bug report", {"preview": formatted_report[:200]})
+        await notify("detective", "success", "Detective completed formatted bug report", {"preview": formatted_report[:200]})
 
         ticket_result = None
         final_status = "confirmed"
@@ -218,6 +234,78 @@ class AgentOrchestrator:
             "evidence": evidence_list,
             "jira_ticket": ticket_result,
             "status": final_status,
+            "llm_degraded": bool(detective_result.get("llm_degraded") or judge_verdict.get("llm_degraded")),
+        }
+
+    async def run_auto_test(
+        self,
+        project_id: int,
+        scope: str = "all",
+        selected_modules: Optional[List[str]] = None,
+        broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> Dict[str, Any]:
+        """Run autonomous bug discovery with duplicate filtering and bounded concurrent pipeline execution."""
+        notify = await self._make_notifier(broadcast_callback, project_id=project_id)
+        browsers, headless = self._browser_config()
+
+        async with async_session() as session:
+            project = await session.get(Project, project_id)
+            if not project:
+                raise ValueError(f"Project #{project_id} not found")
+            project_info = project.to_dict()
+
+            existing_res = await session.execute(
+                select(BugReport.title).where(BugReport.project_id == project_id)
+            )
+            seen_titles = {t.strip().lower() for t in existing_res.scalars().all() if t}
+
+        skills_context, _ = await self.get_project_skills_context(project_id)
+
+        await notify("detective", "running", "Detective is analyzing requirements and probing the app for defects...")
+        discovered = await self.detective.autonomous_discover(
+            skills_context=skills_context,
+            project_info=project_info,
+            scope=scope,
+            selected_modules=selected_modules,
+            browsers=browsers,
+            headless=headless,
+        )
+
+        unique_items: List[Dict[str, Any]] = []
+        skipped_duplicates = 0
+        for item in discovered:
+            title_norm = (item.get("title") or "").strip().lower()
+            if title_norm and title_norm in seen_titles:
+                skipped_duplicates += 1
+                continue
+            if title_norm:
+                seen_titles.add(title_norm)
+            unique_items.append(item)
+
+        to_process = unique_items[:3]
+        semaphore = asyncio.Semaphore(2)
+
+        async def _run_item(item: Dict[str, Any]) -> Dict[str, Any]:
+            async with semaphore:
+                return await self.process_bug_pipeline(
+                    bug_input=f"{item.get('title')}: {item.get('description')}\nRoot Cause: {item.get('root_cause')}",
+                    project_id=project_id,
+                    broadcast_callback=broadcast_callback,
+                    include_sheriff=False,
+                )
+
+        reports = list(await asyncio.gather(*(_run_item(it) for it in to_process)))
+        await notify(
+            "detective",
+            "success",
+            f"Auto-Test finished: {len(reports)} bug report(s) created ({skipped_duplicates} duplicate(s) skipped).",
+            {"discovered_count": len(discovered), "processed_count": len(reports)},
+        )
+        return {
+            "discovered_count": len(discovered),
+            "processed_count": len(reports),
+            "skipped_duplicates": skipped_duplicates,
+            "reports": reports,
         }
 
     async def raise_jira_ticket(
@@ -226,8 +314,6 @@ class AgentOrchestrator:
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Explicitly invoke Sheriff to create a Jira ticket in 'Backlog' for an existing bug report."""
-        notify = await self._make_notifier(broadcast_callback)
-
         async with async_session() as session:
             res = await session.execute(
                 select(BugReport)
@@ -237,6 +323,8 @@ class AgentOrchestrator:
             bug = res.scalar_one_or_none()
             if not bug:
                 raise ValueError(f"Bug Report #{bug_report_id} not found")
+
+            notify = await self._make_notifier(broadcast_callback, project_id=bug.project_id)
 
             if bug.jira_ticket_id:
                 return {
@@ -271,7 +359,7 @@ class AgentOrchestrator:
                 }
                 for ev in (bug.evidence or [])
             ]
-            formatted_report = bug.formatted_report or self.reporter._fallback_report(
+            formatted_report = bug.formatted_report or self.detective._fallback_report(
                 bug_data=bug_data,
                 judge_verdict={
                     "final_root_cause": bug.root_cause or bug.description or "Pending confirmation",
@@ -279,6 +367,7 @@ class AgentOrchestrator:
                     "severity_adjustment": bug.severity or "medium",
                 },
                 project_info=project_info,
+                evidence_list=evidence_list,
             )
 
         await notify(
@@ -371,7 +460,8 @@ class AgentOrchestrator:
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Assign and execute a single specialized built-in agent on behalf of Desk Officer."""
-        notify = await self._make_notifier(broadcast_callback)
+        notify = await self._make_notifier(broadcast_callback, project_id=project_id)
+        browsers, headless = self._browser_config()
         agent_key = target_agent.lower().strip()
 
         async with async_session() as session:
@@ -383,12 +473,25 @@ class AgentOrchestrator:
         skills_context, report_format = await self.get_project_skills_context(project_id)
 
         if agent_key == "detective":
+            report_only = False
             if bug_report_id:
                 bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=False)
                 if not bug:
                     return {"agent": "Detective", "status": "not_found", "message": f"Bug #{bug_report_id} was not found in this project."}
                 bug_id = bug.id
                 effective_input = bug_input or bug.description or bug.title
+                lower_in = (
+                    (bug_input or "").split("Latest user instruction:\n")[-1].lower()
+                    if bug_input
+                    else ""
+                )
+                if (
+                    bug.root_cause
+                    and "report" in lower_in
+                    and any(w in lower_in for w in ("format", "write", "draft", "rewrite", "author", "generate"))
+                    and not any(w in lower_in for w in ("investigat", "trace", "reproduc", "analy"))
+                ):
+                    report_only = True
             else:
                 async with async_session() as session:
                     bug = BugReport(
@@ -403,10 +506,73 @@ class AgentOrchestrator:
                     bug_id = bug.id
                 effective_input = bug_input
 
-            await notify("detective", "running", "Detective is tracing the bug and investigating root cause...")
+            if report_only:
+                bug_data = {
+                    "title": bug.title,
+                    "description": bug.description or bug_input,
+                    "steps_to_reproduce": bug.steps_to_reproduce.splitlines() if bug.steps_to_reproduce else [],
+                    "severity": bug.severity or "medium",
+                    "label": bug.label or "Front-End",
+                    "module": bug.module or "General",
+                }
+                judge_verdict = {
+                    "final_root_cause": bug.root_cause or bug.description or "Confirmed defect",
+                    "judge_notes": "Formatted by Detective via Desk Officer assignment.",
+                    "severity_adjustment": bug.severity or "medium",
+                }
+                evidence_list = [
+                    {
+                        "type": ev.type,
+                        "file_path": ev.file_path,
+                        "file_name": ev.file_name,
+                        "stage": ev.stage,
+                        "description": ev.description,
+                    }
+                    for ev in (bug.evidence or [])
+                ]
+                await notify("detective", "running", f"Detective is authoring the formatted bug report for Bug #{bug.id}...")
+                formatted_report = await self.detective.generate_report(
+                    bug_data=bug_data,
+                    judge_verdict=judge_verdict,
+                    report_format_template=report_format,
+                    project_info=project_info,
+                    project_id=project_id,
+                    bug_report_id=bug.id,
+                    evidence_list=evidence_list,
+                )
+                async with async_session() as session:
+                    b = await session.get(BugReport, bug.id)
+                    b.formatted_report = formatted_report
+                    await session.commit()
+                await notify("detective", "success", f"Detective completed formatted bug report for Bug #{bug.id}", {"preview": formatted_report[:200]})
+                return {
+                    "agent": "Detective",
+                    "status": "success",
+                    "mode": "report",
+                    "bug_id": bug.id,
+                    "formatted_report": formatted_report,
+                    "result": {**bug_data, "root_cause": bug.root_cause},
+                }
+
+            await notify("detective", "running", "Detective is tracing the bug, investigating root cause, and drafting the report...")
             detective_result = await self.detective.trace_bug(
                 bug_input=effective_input,
                 skills_context=skills_context,
+                project_info=project_info,
+                project_id=project_id,
+                bug_report_id=bug_id,
+                browsers=browsers,
+                headless=headless,
+            )
+            judge_draft_verdict = {
+                "final_root_cause": detective_result.get("root_cause") or effective_input,
+                "judge_notes": "Initial Detective draft (pending independent Judge verification).",
+                "severity_adjustment": detective_result.get("severity", "medium"),
+            }
+            formatted_report = await self.detective.generate_report(
+                bug_data=detective_result,
+                judge_verdict=judge_draft_verdict,
+                report_format_template=report_format,
                 project_info=project_info,
                 project_id=project_id,
                 bug_report_id=bug_id,
@@ -423,9 +589,17 @@ class AgentOrchestrator:
                 b.severity = detective_result.get("severity", "medium")
                 b.label = detective_result.get("label", "Front-End")
                 b.module = detective_result.get("module", "General")
+                b.formatted_report = formatted_report
                 await session.commit()
-            await notify("detective", "success", f"Detective identified root cause for: {detective_result.get('title')}", detective_result)
-            return {"agent": "Detective", "status": "success", "bug_id": bug_id, "result": detective_result}
+            await notify("detective", "success", f"Detective identified root cause and drafted report for: {detective_result.get('title')}", detective_result)
+            return {
+                "agent": "Detective",
+                "status": "success",
+                "mode": "investigate_and_report",
+                "bug_id": bug_id,
+                "result": detective_result,
+                "formatted_report": formatted_report,
+            }
 
         if agent_key == "coroner":
             bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=True)
@@ -448,6 +622,8 @@ class AgentOrchestrator:
                 stage="detection",
                 bug_report_id=bug.id,
                 project_id=project_id,
+                browsers=browsers,
+                headless=headless,
             )
             await notify("coroner", "success", f"Coroner captured {len(evidence_list)} evidence files", evidence_list)
             return {"agent": "Coroner", "status": "success", "bug_id": bug.id, "evidence": evidence_list}
@@ -480,39 +656,6 @@ class AgentOrchestrator:
             await notify("judge", "success", f"Judge Verdict: {judge_verdict.get('verdict')} - {judge_verdict.get('final_root_cause', '')[:80]}", judge_verdict)
             return {"agent": "Judge", "status": "success", "bug_id": bug.id, "verdict": judge_verdict}
 
-        if agent_key == "reporter":
-            bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=True)
-            if not bug:
-                return {"agent": "Reporter", "status": "missing_context", "message": "Please describe the bug or reference a bug # so Reporter can draft the report."}
-            bug_data = {
-                "title": bug.title,
-                "description": bug.description or bug_input,
-                "steps_to_reproduce": bug.steps_to_reproduce.splitlines() if bug.steps_to_reproduce else [],
-                "severity": bug.severity or "medium",
-                "label": bug.label or "Front-End",
-                "module": bug.module or "General",
-            }
-            judge_verdict = {
-                "final_root_cause": bug.root_cause or bug.description or "Confirmed defect",
-                "judge_notes": "Authored by Reporter via Desk Officer assignment.",
-                "severity_adjustment": bug.severity or "medium",
-            }
-            await notify("reporter", "running", f"Reporter is authoring the bug report for Bug #{bug.id}...")
-            formatted_report = await self.reporter.generate_report(
-                bug_data=bug_data,
-                judge_verdict=judge_verdict,
-                report_format_template=report_format,
-                project_info=project_info,
-                project_id=project_id,
-                bug_report_id=bug.id,
-            )
-            async with async_session() as session:
-                b = await session.get(BugReport, bug.id)
-                b.formatted_report = formatted_report
-                await session.commit()
-            await notify("reporter", "success", "Reporter completed formatted bug report", {"preview": formatted_report[:200]})
-            return {"agent": "Reporter", "status": "success", "bug_id": bug.id, "formatted_report": formatted_report}
-
         if agent_key == "sheriff":
             bug = await self._resolve_target_bug(
                 project_id, bug_report_id, bug_input, create_if_missing=False, prefer_unraised=True
@@ -544,32 +687,22 @@ class AgentOrchestrator:
                 project_info=project_info,
                 project_id=project_id,
                 bug_report_id=bug.id,
+                browsers=browsers,
+                headless=headless,
             )
             await notify("sanity", "success", f"Sanity Testing complete: {sanity_result.get('summary')}", sanity_result)
             return {"agent": "Sanity Testers", "status": "success", "bug_id": bug.id, "sanity": sanity_result}
 
         if agent_key == "auto_test":
-            await notify("detective", "running", "Detective is running Autonomous Bug Discovery across project skills...")
-            discovered = await self.detective.autonomous_discover(
-                skills_context=skills_context,
-                project_info=project_info,
+            auto_res = await self.run_auto_test(
+                project_id=project_id,
                 scope="all",
+                broadcast_callback=broadcast_callback,
             )
-            reports = []
-            for item in discovered[:3]:
-                res = await self.process_bug_pipeline(
-                    bug_input=f"{item.get('title')}: {item.get('description')}\nRoot Cause: {item.get('root_cause')}",
-                    project_id=project_id,
-                    broadcast_callback=broadcast_callback,
-                    include_sheriff=False,
-                )
-                reports.append(res)
             return {
                 "agent": "Auto-Test",
                 "status": "success",
-                "discovered_count": len(discovered),
-                "processed_count": len(reports),
-                "reports": reports,
+                **auto_res,
             }
 
         return {"agent": target_agent, "status": "unknown", "message": f"Unknown agent '{target_agent}'."}
@@ -580,7 +713,14 @@ class AgentOrchestrator:
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Triggered when ticket moves to 'In QA': Retests bug, transitions, and runs Sanity Testers."""
-        notify = await self._make_notifier(broadcast_callback)
+        async with async_session() as session:
+            bug = await session.get(BugReport, bug_report_id)
+            if not bug:
+                return {"retest": {"error": "Bug report not found"}, "sanity": None}
+            project_id = bug.project_id
+
+        notify = await self._make_notifier(broadcast_callback, project_id=project_id)
+        browsers, headless = self._browser_config()
 
         # Watcher & Detective retest
         await notify("watcher", "running", "Watcher detected ticket moved to 'In QA'. Alerting Detective to retest...")
@@ -601,8 +741,10 @@ class AgentOrchestrator:
 
             async with async_session() as session:
                 bug = await session.get(BugReport, bug_report_id)
-                bug_dict = bug.to_dict() if bug else {}
-                project = await session.get(Project, bug.project_id) if bug else None
+                if not bug:
+                    return {"retest": retest_outcome, "sanity": None}
+                bug_dict = bug.to_dict()
+                project = await session.get(Project, bug.project_id)
                 project_info = project.to_dict() if project else {}
 
             skills_context, _ = await self.get_project_skills_context(bug.project_id)
@@ -612,6 +754,8 @@ class AgentOrchestrator:
                 project_info=project_info,
                 project_id=bug.project_id,
                 bug_report_id=bug_report_id,
+                browsers=browsers,
+                headless=headless,
             )
 
             await notify("sanity", "success", f"Sanity Testing complete: {sanity_result.get('summary')}", sanity_result)

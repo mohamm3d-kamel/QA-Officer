@@ -37,7 +37,7 @@ async def get_orchestrator(db: AsyncSession) -> AgentOrchestrator:
     all_settings = {s.key: s.value for s in res.scalars().all()}
 
     provider = all_settings.get("llm_provider", "openai")
-    api_key = all_settings.get("llm_api_key", "mock")
+    api_key = all_settings.get("llm_api_key", "")
     model = all_settings.get("llm_model", "gpt-4")
     default_reporter = all_settings.get("default_reporter", "Mohamed Kamel")
 
@@ -54,13 +54,21 @@ def _format_dispatch_reply(desk_reply: str, target_agent: str, result: Dict[str,
     bug_id = result.get("bug_id")
     if target_agent == "detective":
         d = result.get("result", {})
+        report = result.get("formatted_report", "")
+        if result.get("mode") == "report":
+            return (
+                f"{desk_reply}\n\n"
+                f"### 🔍 Detective Bug Report Draft (Bug #{bug_id})\n\n{report}"
+            )
+        report_preview = f"\n\n**Formatted Bug Report Draft:**\n{report[:900]}" if report else ""
         return (
             f"{desk_reply}\n\n"
-            f"### 🔍 Detective Investigation (Bug #{bug_id})\n"
+            f"### 🔍 Detective Investigation & Report (Bug #{bug_id})\n"
             f"**Title:** {d.get('title')}\n"
             f"**Root Cause:** {d.get('root_cause')}\n"
             f"**Severity:** `{d.get('severity', 'medium')}` | **Label:** `{d.get('label', 'Front-End')}` | **Module:** `{d.get('module', 'General')}`\n"
             f"**Summary:** {d.get('trace_summary', '')}"
+            f"{report_preview}"
         )
 
     if target_agent == "coroner":
@@ -80,13 +88,6 @@ def _format_dispatch_reply(desk_reply: str, target_agent: str, result: Dict[str,
             f"**Verdict:** `{v.get('verdict', 'CONFIRMED')}`\n"
             f"**Final Root Cause:** {v.get('final_root_cause')}\n"
             f"**Notes:** {v.get('judge_notes', '')}"
-        )
-
-    if target_agent == "reporter":
-        report = result.get("formatted_report", "")
-        return (
-            f"{desk_reply}\n\n"
-            f"### 📝 Reporter Draft (Bug #{bug_id})\n\n{report}"
         )
 
     if target_agent == "sheriff":
@@ -152,10 +153,11 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
     recent_bugs = [b.to_dict() for b in res_bugs.scalars().all()]
 
     async def broadcast_ws(payload: Dict[str, Any]):
-        await manager.broadcast(payload)
+        await manager.broadcast({**payload, "project_id": payload.get("project_id") or data.project_id})
 
     await broadcast_ws({
         "type": "agent_status",
+        "project_id": data.project_id,
         "agent": "desk_officer",
         "status": "running",
         "message": "Desk Officer is reviewing your message...",
@@ -191,12 +193,13 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
         await db.refresh(skill)
         await broadcast_ws({
             "type": "agent_status",
+            "project_id": data.project_id,
             "agent": "desk_officer",
             "status": "success",
             "message": f"Saved {skill_type.replace('_', ' ')} skill.",
         })
         if skill_type == "report_format":
-            msg = "✅ I have recorded your custom **Bug Report Format** as a project skill. The Reporter Agent will strictly format all future bug reports according to this template."
+            msg = "✅ I have recorded your custom **Bug Report Format** as a project skill. The Detective Agent will strictly format all future bug reports according to this template."
         else:
             msg = f"📋 Requirement stored as a project skill: **{skill.title}**. All agents will now use this context."
         return {
@@ -204,6 +207,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             "agent": "Desk Officer",
             "response": msg,
             "data": skill.to_dict(),
+            "llm_degraded": False,
         }
 
     # 2. Main Workflow triggered explicitly (e.g. "Create a bug report")
@@ -211,9 +215,10 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
         include_sheriff = bool(decision.get("also_raise_jira", False))
         await broadcast_ws({
             "type": "agent_status",
+            "project_id": data.project_id,
             "agent": "desk_officer",
             "status": "success",
-            "message": "Dispatched main workflow (Detective → Coroner → Judge → Reporter).",
+            "message": "Dispatched main workflow (Detective → Coroner → Judge → Formatted Report).",
         })
 
         pipeline_result = await orchestrator.process_bug_pipeline(
@@ -238,6 +243,13 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             )
             tail_line = ""
 
+        llm_degraded = bool(pipeline_result.get("llm_degraded") or decision.get("llm_degraded"))
+        degraded_note = (
+            "\n\n> ⚠️ *Fallback mode active: configure a valid LLM API key in Settings for full AI analysis.*"
+            if llm_degraded
+            else ""
+        )
+
         summary_response = (
             f"### 🎯 Bug Report #{pipeline_result['bug_id']} Created!\n\n"
             f"**Title:** {pipeline_result.get('title')}\n"
@@ -246,6 +258,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             f"**Evidence:** {len(pipeline_result.get('evidence', []))} file(s) captured by Coroner.\n\n"
             f"**Formatted Report Preview:**\n{pipeline_result.get('formatted_report', '')[:1200]}\n"
             + (f"\n{tail_line}" if tail_line else "")
+            + degraded_note
         )
 
         return {
@@ -253,6 +266,8 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             "agent": "Desk Officer",
             "response": summary_response,
             "pipeline_result": pipeline_result,
+            "evidence": pipeline_result.get("evidence", []),
+            "llm_degraded": llm_degraded,
         }
 
     # 3. Specific Built-in Agent Assignment
@@ -260,6 +275,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
         target_agent = decision.get("target_agent", "detective")
         await broadcast_ws({
             "type": "agent_status",
+            "project_id": data.project_id,
             "agent": "desk_officer",
             "status": "success",
             "message": f"Assigned {target_agent.replace('_', ' ').title()} to handle request.",
@@ -271,18 +287,33 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             bug_report_id=decision.get("bug_report_id"),
             broadcast_callback=broadcast_ws,
         )
+        llm_degraded = bool(
+            decision.get("llm_degraded")
+            or (dispatch_result.get("result") or {}).get("llm_degraded")
+            or (dispatch_result.get("verdict") or {}).get("llm_degraded")
+            or (dispatch_result.get("sanity") or {}).get("llm_degraded")
+        )
         reply_text = _format_dispatch_reply(decision.get("reply", ""), target_agent, dispatch_result)
+        if llm_degraded and "Fallback mode active" not in reply_text:
+            reply_text += "\n\n> ⚠️ *Fallback mode active: configure a valid LLM API key in Settings for full AI analysis.*"
         return {
             "type": "agent_dispatched",
             "agent": "Desk Officer",
             "assigned_agent": target_agent,
             "response": reply_text,
             "data": dispatch_result,
+            "evidence": dispatch_result.get("evidence", []),
+            "llm_degraded": llm_degraded,
         }
 
     # 4. Pre-workflow Conversational Triage Chat (Default!)
+    llm_degraded = bool(decision.get("llm_degraded"))
+    reply_text = decision.get("reply") or ""
+    if llm_degraded:
+        reply_text += "\n\n> ⚠️ *Fallback mode active: configure a valid LLM API key in Settings for full AI analysis.*"
     await broadcast_ws({
         "type": "agent_status",
+        "project_id": data.project_id,
         "agent": "desk_officer",
         "status": "success",
         "message": "Chatting with tester before starting workflow.",
@@ -290,5 +321,6 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
     return {
         "type": "chat",
         "agent": "Desk Officer",
-        "response": decision.get("reply"),
+        "response": reply_text,
+        "llm_degraded": llm_degraded,
     }

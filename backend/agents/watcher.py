@@ -13,6 +13,7 @@ from services.notification_service import NotificationService
 from database import async_session
 from models.bug_report import BugReport
 from models.project import Project
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -68,35 +69,53 @@ class WatcherAgent(BaseAgent):
                     current_status = issue.get("status", current_status)
                 except Exception as e:
                     logger.warning(f"Could not poll Jira issue {bug.jira_ticket_id}: {e}")
+                    await self.log_action(
+                        action="jira_poll_error",
+                        input_data={"bug_id": bug.id, "ticket": bug.jira_ticket_id},
+                        output_data={"error": str(e)},
+                        status="failed",
+                        bug_report_id=bug.id,
+                        project_id=bug.project_id,
+                        started_at=start_time,
+                    )
 
             # Normalization of status matching "In QA"
             is_in_qa = current_status.lower().replace(" ", "") in ["inqa", "in_qa"]
 
             if not is_in_qa and force_status is None:
-                await self.log_action(
-                    action="status_check",
-                    input_data={"bug_id": bug.id, "ticket": bug.jira_ticket_id, "status": current_status},
-                    output_data={"action_taken": "none", "reason": "Not in 'In QA' column"},
-                    status="success",
-                    bug_report_id=bug.id,
-                    project_id=bug.project_id,
-                    started_at=start_time,
-                )
                 return {"status": current_status, "retested": False}
 
             # Ticket is IN QA -> Report Detective to retest bug
             bug.status = "in_qa"
             await session.commit()
 
+            browsers = config.get_enabled_browsers(jira_settings)
+            headless = str(jira_settings.get("browser_headless", "true")).lower() == "true"
+
             retest_result = await self.detective.retest_bug(
                 bug_data=bug.to_dict(),
                 project_info=project_info,
                 project_id=bug.project_id,
                 bug_report_id=bug.id,
+                browsers=browsers,
+                headless=headless,
             )
 
             is_resolved = retest_result.get("is_resolved", False)
             target_status = "Ready To Deploy" if is_resolved else "Failed QA"
+
+            # Always capture failure evidence when QA fails (both local and Jira mode)
+            failure_evidence = []
+            if not is_resolved:
+                failure_evidence = await self.coroner.capture_evidence(
+                    bug_data=bug.to_dict(),
+                    project_info=project_info,
+                    stage="retest",
+                    bug_report_id=bug.id,
+                    project_id=bug.project_id,
+                    browsers=browsers,
+                    headless=headless,
+                )
 
             # Transition in Jira if active client
             if base_url and email and token and bug.jira_ticket_id:
@@ -105,14 +124,6 @@ class WatcherAgent(BaseAgent):
                     await jira_client.transition_issue(bug.jira_ticket_id, target_status)
 
                     if not is_resolved:
-                        # Capture failure evidence
-                        failure_evidence = await self.coroner.capture_evidence(
-                            bug_data=bug.to_dict(),
-                            project_info=project_info,
-                            stage="retest",
-                            bug_report_id=bug.id,
-                            project_id=bug.project_id,
-                        )
                         comment = f"❌ *QA Retest Failed*\n\n{retest_result.get('failure_reason', 'Issue still persists in test environment.')}"
                         await jira_client.add_comment(bug.jira_ticket_id, comment)
                         for ev in failure_evidence:
@@ -137,7 +148,7 @@ class WatcherAgent(BaseAgent):
                 action="retest_workflow_executed",
                 input_data={"bug_id": bug.id, "ticket": bug.jira_ticket_id, "previous_status": "In QA"},
                 output_data={"is_resolved": is_resolved, "new_status": target_status, "result": retest_result},
-                status="success",
+                status="degraded" if retest_result.get("llm_degraded") else "success",
                 bug_report_id=bug.id,
                 project_id=bug.project_id,
                 started_at=start_time,

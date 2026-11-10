@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FolderGit2, Bug, CheckCircle2, AlertTriangle, ArrowRight, Plus, Bot, ShieldCheck } from 'lucide-react';
+import toast from 'react-hot-toast';
 import useAppStore from '../store/appStore';
 import api from '../services/api';
 import ProjectForm from '../components/Projects/ProjectForm';
@@ -9,10 +10,13 @@ export default function DashboardPage() {
   const navigate = useNavigate();
   const projects = useAppStore((s) => s.projects);
   const setProjects = useAppStore((s) => s.setProjects);
+  const reporterName = useAppStore((s) => s.reporterName);
+  const setReporterName = useAppStore((s) => s.setReporterName);
 
   const [stats, setStats] = useState({
     totalProjects: 0,
     totalBugs: 0,
+    jiraBugs: 0,
     resolvedBugs: 0,
     failedBugs: 0,
   });
@@ -20,37 +24,42 @@ export default function DashboardPage() {
   const [isFormOpen, setIsFormOpen] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     async function loadData() {
       try {
-        const projs = await api.getProjects();
+        const [projs, logs, dashStats, settingsList] = await Promise.all([
+          api.getProjects(),
+          api.getLogs({ limit: 8 }),
+          api.getDashboardStats(),
+          api.getSettings().catch(() => []),
+        ]);
+        if (cancelled) return;
+
         setProjects(projs);
-
-        const logs = await api.getLogs({ limit: 8 });
         setRecentLogs(logs);
-
-        let totalB = 0;
-        let resolvedB = 0;
-        let failedB = 0;
-
-        for (const p of projs) {
-          const bugs = await api.getBugs(p.id);
-          totalB += bugs.length;
-          resolvedB += bugs.filter((b) => b.status === 'resolved').length;
-          failedB += bugs.filter((b) => b.status === 'failed').length;
-        }
-
         setStats({
-          totalProjects: projs.length,
-          totalBugs: totalB,
-          resolvedBugs: resolvedB,
-          failedBugs: failedB,
+          totalProjects: dashStats.total_projects ?? projs.length,
+          totalBugs: dashStats.total_bugs ?? 0,
+          jiraBugs: dashStats.jira_bugs ?? 0,
+          resolvedBugs: dashStats.resolved_bugs ?? 0,
+          failedBugs: dashStats.failed_bugs ?? 0,
         });
+
+        if (Array.isArray(settingsList)) {
+          const rep = settingsList.find((item) => item.key === 'default_reporter');
+          if (rep?.value) setReporterName(rep.value);
+        }
       } catch (err) {
-        console.error('Failed to load dashboard:', err);
+        if (!cancelled) {
+          toast.error(err.message || 'Failed to load dashboard overview');
+        }
       }
     }
     loadData();
-  }, [setProjects]);
+    return () => {
+      cancelled = true;
+    };
+  }, [setProjects, setReporterName]);
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-8">
@@ -62,10 +71,10 @@ export default function DashboardPage() {
             <span>Autonomous QA Assistant Operational</span>
           </div>
           <h1 className="text-3xl font-extrabold text-slate-100 tracking-tight">
-            Welcome, <span className="text-cyan-400">Mohamed Kamel</span>
+            Welcome, <span className="text-cyan-400">{reporterName}</span>
           </h1>
           <p className="text-sm text-slate-400 leading-relaxed">
-            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand, Detective traces root cause, Coroner captures live proof, Judge independently confirms, Reporter drafts formatted reports, Sheriff raises tickets to Jira Backlog when requested, and Watcher verifies retests.
+            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand, Detective traces root cause and drafts formatted reports, Coroner captures live proof, Judge independently confirms, Sheriff raises tickets to Jira Backlog when requested, and Watcher verifies retests.
           </p>
 
           <div className="flex items-center gap-3 pt-2">
@@ -106,12 +115,14 @@ export default function DashboardPage() {
             <Bug className="w-4 h-4" />
           </div>
           <div className="text-3xl font-bold text-slate-100">{stats.totalBugs}</div>
-          <p className="text-[11px] text-slate-500 mt-1">Traced & logged to Jira</p>
+          <p className="text-[11px] text-slate-500 mt-1">
+            {stats.jiraBugs} raised to Jira Backlog
+          </p>
         </div>
 
         <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow">
           <div className="flex items-center justify-between text-emerald-400 mb-2">
-            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">Resolved Today</span>
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">Resolved Defects</span>
             <CheckCircle2 className="w-4 h-4" />
           </div>
           <div className="text-3xl font-bold text-emerald-400">{stats.resolvedBugs}</div>
@@ -220,4 +231,3 @@ export default function DashboardPage() {
     </div>
   );
 }
-

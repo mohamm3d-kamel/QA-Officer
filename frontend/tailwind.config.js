@@ -31,7 +31,6 @@ export default {
           detective: '#8b5cf6',
           coroner: '#f59e0b',
           judge: '#ef4444',
-          reporter: '#22c55e',
           sheriff: '#3b82f6',
           watcher: '#6366f1',
           sanity: '#14b8a6',

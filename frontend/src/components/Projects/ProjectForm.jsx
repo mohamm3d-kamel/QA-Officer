@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, FolderGit2, Save } from 'lucide-react';
+import toast from 'react-hot-toast';
 import api from '../../services/api';
 import useAppStore from '../../store/appStore';
 
@@ -53,13 +54,16 @@ export default function ProjectForm({ isOpen, onClose, initialData = null }) {
       if (initialData?.id) {
         const updated = await api.updateProject(initialData.id, payload);
         updateProject(initialData.id, updated);
+        toast.success('Project updated');
       } else {
         const created = await api.createProject(payload);
         addProject(created);
+        toast.success('Project created');
       }
       onClose();
     } catch (err) {
       console.error('Project save error:', err);
+      toast.error(err?.message || 'Failed to save project');
     } finally {
       setLoading(false);
     }

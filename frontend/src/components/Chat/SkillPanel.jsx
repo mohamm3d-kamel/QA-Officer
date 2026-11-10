@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { BookOpen, Plus, Trash2, FileText, CheckCircle, Upload } from 'lucide-react';
+import React, { useRef, useState } from 'react';
+import { BookOpen, Plus, Trash2, Upload } from 'lucide-react';
+import toast from 'react-hot-toast';
 import useAppStore from '../../store/appStore';
 import api from '../../services/api';
 
@@ -13,6 +14,8 @@ export default function SkillPanel({ projectId }) {
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const uploadInputRef = useRef(null);
 
   const handleSaveSkill = async (e) => {
     e.preventDefault();
@@ -25,10 +28,33 @@ export default function SkillPanel({ projectId }) {
       setTitle('');
       setContent('');
       setIsAdding(false);
+      toast.success('Skill saved');
     } catch (err) {
-      console.error('Failed to save skill:', err);
+      toast.error(err.message || 'Failed to save skill');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleUploadFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append('type', type);
+    formData.append('title', file.name.replace(/\.[^.]+$/, ''));
+    formData.append('file', file);
+
+    setUploading(true);
+    try {
+      const saved = await api.uploadSkillFile(projectId, formData);
+      addSkill(saved);
+      toast.success(`Uploaded skill "${saved.title}"`);
+    } catch (err) {
+      toast.error(err.message || 'Failed to upload skill document');
+    } finally {
+      setUploading(false);
     }
   };
 
@@ -36,8 +62,9 @@ export default function SkillPanel({ projectId }) {
     try {
       await api.deleteSkill(id);
       removeSkill(id);
+      toast.success('Skill removed');
     } catch (err) {
-      console.error('Failed to delete skill:', err);
+      toast.error(err.message || 'Failed to delete skill');
     }
   };
 
@@ -48,17 +75,36 @@ export default function SkillPanel({ projectId }) {
           <BookOpen className="w-4 h-4 text-cyan-400" />
           <h3 className="text-sm font-semibold text-slate-200">Stored Skills & Rules</h3>
         </div>
-        <button
-          onClick={() => setIsAdding(!isAdding)}
-          className="p-1 rounded-md bg-slate-800 hover:bg-slate-700 text-cyan-400 hover:text-cyan-300 transition-colors"
-          title="Add Skill / Format"
-        >
-          <Plus className="w-4 h-4" />
-        </button>
+        <div className="flex items-center gap-1.5">
+          <input
+            ref={uploadInputRef}
+            type="file"
+            accept=".txt,.md,.json,.csv,.docx,.yaml,.yml,.log"
+            onChange={handleUploadFile}
+            className="hidden"
+          />
+          <button
+            type="button"
+            disabled={uploading}
+            onClick={() => uploadInputRef.current?.click()}
+            className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-cyan-300 transition-colors disabled:opacity-50"
+            title="Upload Requirements / .docx Document"
+          >
+            <Upload className={`w-3.5 h-3.5 ${uploading ? 'animate-pulse text-cyan-400' : ''}`} />
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsAdding(!isAdding)}
+            className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-cyan-400 hover:text-cyan-300 transition-colors"
+            title="Add Skill / Format"
+          >
+            <Plus className="w-4 h-4" />
+          </button>
+        </div>
       </div>
 
       <p className="text-xs text-slate-400 mb-3">
-        Requirements & report formats stored here reduce repetitive instructions for the AI agents.
+        Requirements & report formats stored here (or uploaded as .txt/.md/.docx) guide every AI agent.
       </p>
 
       {/* Add form */}
@@ -123,7 +169,7 @@ export default function SkillPanel({ projectId }) {
       <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
         {skills.length === 0 ? (
           <div className="text-center py-4 text-xs text-slate-500 border border-dashed border-slate-800 rounded-lg">
-            No skills stored yet. Click + to add your requirements or report format.
+            No skills stored yet. Click + or Upload to add requirements or report formats.
           </div>
         ) : (
           skills.map((skill) => (
@@ -148,6 +194,7 @@ export default function SkillPanel({ projectId }) {
               </div>
 
               <button
+                type="button"
                 onClick={() => handleDelete(skill.id)}
                 className="opacity-0 group-hover:opacity-100 p-1 text-slate-500 hover:text-red-400 transition-opacity"
                 title="Delete skill"
@@ -161,4 +208,3 @@ export default function SkillPanel({ projectId }) {
     </div>
   );
 }
-
