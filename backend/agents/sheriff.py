@@ -34,7 +34,7 @@ class SheriffAgent(BaseAgent):
         bug_report_id: Optional[int] = None,
         reporter_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Create Jira ticket in 'To Do' with bug report, evidence, priority, and label."""
+        """Create Jira ticket in 'Backlog' with bug report, evidence, priority, and label."""
         start_time = datetime.utcnow()
         reporter = reporter_name or jira_settings.get("default_reporter") or self.default_reporter
         jira_key = project_info.get("jira_project_key", "QA")
@@ -68,6 +68,12 @@ class SheriffAgent(BaseAgent):
                 issue_key = created["key"]
                 issue_url = created["url"]
 
+                # Ensure ticket lands in 'Backlog' rather than 'To Do'
+                try:
+                    await client.transition_issue(issue_key, "Backlog")
+                except Exception as trans_err:
+                    logger.warning(f"Could not transition {issue_key} to Backlog: {trans_err}")
+
                 # Upload evidence attachments
                 for ev in evidence_list:
                     file_path = ev.get("file_path")
@@ -81,7 +87,7 @@ class SheriffAgent(BaseAgent):
                 ticket_result = {
                     "key": issue_key,
                     "url": issue_url,
-                    "status": "To Do",
+                    "status": "Backlog",
                     "reporter": reporter,
                     "priority": priority,
                     "label": label,
@@ -97,7 +103,7 @@ class SheriffAgent(BaseAgent):
             ticket_result = {
                 "key": sim_key,
                 "url": f"{base_url.rstrip('/')}/browse/{sim_key}" if base_url else f"https://jira.local/browse/{sim_key}",
-                "status": "To Do",
+                "status": "Backlog",
                 "reporter": reporter,
                 "priority": priority,
                 "label": label,

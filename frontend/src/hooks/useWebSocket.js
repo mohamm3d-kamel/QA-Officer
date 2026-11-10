@@ -1,10 +1,14 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import useAppStore from '../store/appStore';
 import toast from 'react-hot-toast';
 
-export default function useWebSocket() {
+export default function useWebSocket(onMessage) {
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
+  const onMessageRef = useRef(onMessage);
+  onMessageRef.current = onMessage;
+
+  const [isConnected, setIsConnected] = useState(false);
   const setAgentStatus = useAppStore((s) => s.setAgentStatus);
   const addMessage = useAppStore((s) => s.addMessage);
   const appendToLastMessage = useAppStore((s) => s.appendToLastMessage);
@@ -21,6 +25,7 @@ export default function useWebSocket() {
 
     ws.onopen = () => {
       console.log('[WS] Connected');
+      setIsConnected(true);
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current);
         reconnectTimer.current = null;
@@ -30,13 +35,16 @@ export default function useWebSocket() {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        if (onMessageRef.current) {
+          onMessageRef.current(data);
+        }
 
         switch (data.type) {
           case 'agent_status':
-            setAgentStatus(data.agent, data.status, data.message, data.bug_id);
+            setAgentStatus(data.agent, data.status, data.message, data.data?.bug_id ?? data.bug_id);
             if (data.status === 'running') {
               addMessage({
-                id: Date.now(),
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
                 role: 'agent',
                 agent: data.agent,
                 content: data.message || `${data.agent} is working...`,
@@ -56,7 +64,7 @@ export default function useWebSocket() {
 
           case 'notification':
             addNotification({
-              id: Date.now(),
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
               title: data.title,
               message: data.message,
               level: data.level,
@@ -81,11 +89,13 @@ export default function useWebSocket() {
 
     ws.onclose = () => {
       console.log('[WS] Disconnected, reconnecting in 3s...');
+      setIsConnected(false);
       reconnectTimer.current = setTimeout(connect, 3000);
     };
 
     ws.onerror = (err) => {
       console.error('[WS] Error:', err);
+      setIsConnected(false);
       ws.close();
     };
   }, [setAgentStatus, addMessage, appendToLastMessage, addNotification, setChatLoading]);
@@ -98,5 +108,5 @@ export default function useWebSocket() {
     };
   }, [connect]);
 
-  return wsRef;
+  return { wsRef, isConnected };
 }

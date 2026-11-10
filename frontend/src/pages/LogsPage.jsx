@@ -122,6 +122,7 @@ export default function LogsPage() {
           className="bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-200 px-3 py-1.5 focus:border-cyan-500 focus:outline-none"
         >
           <option value="">All Agents</option>
+          <option value="Desk Officer">Desk Officer</option>
           <option value="Detective">Detective</option>
           <option value="Coroner">Coroner</option>
           <option value="Judge">Judge</option>

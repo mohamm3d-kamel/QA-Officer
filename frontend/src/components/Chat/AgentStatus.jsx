@@ -1,13 +1,14 @@
 import React from 'react';
-import { Search, Camera, Scale, FileText, Tag, Eye, FlaskConical, CheckCircle, Clock, AlertTriangle } from 'lucide-react';
+import { Headset, Search, Camera, Scale, FileText, Tag, Eye, FlaskConical, CheckCircle, Clock, AlertTriangle } from 'lucide-react';
 import useAppStore from '../../store/appStore';
 
 const AGENTS = [
+  { key: 'desk_officer', name: 'Desk Officer', role: 'Chat Triage & Agent Dispatcher', icon: Headset, color: 'text-cyan-400', border: 'border-cyan-500', bg: 'bg-cyan-900/30' },
   { key: 'detective', name: 'Detective', role: 'Root Cause Investigator', icon: Search, color: 'text-purple-400', border: 'border-purple-500', bg: 'bg-purple-900/30' },
   { key: 'coroner', name: 'Coroner', role: 'Evidence Capture', icon: Camera, color: 'text-amber-400', border: 'border-amber-500', bg: 'bg-amber-900/30' },
   { key: 'judge', name: 'Judge', role: 'Independent Verifier', icon: Scale, color: 'text-red-400', border: 'border-red-500', bg: 'bg-red-900/30' },
   { key: 'reporter', name: 'Reporter', role: 'Bug Report Author', icon: FileText, color: 'text-emerald-400', border: 'border-emerald-500', bg: 'bg-emerald-900/30' },
-  { key: 'sheriff', name: 'Sheriff', role: 'Jira Commander', icon: Tag, color: 'text-blue-400', border: 'border-blue-500', bg: 'bg-blue-900/30' },
+  { key: 'sheriff', name: 'Sheriff', role: 'Jira Commander (Backlog, on request)', icon: Tag, color: 'text-blue-400', border: 'border-blue-500', bg: 'bg-blue-900/30' },
   { key: 'watcher', name: 'Watcher', role: 'Jira Sentinel (In QA)', icon: Eye, color: 'text-indigo-400', border: 'border-indigo-500', bg: 'bg-indigo-900/30' },
   { key: 'sanity', name: 'Sanity Testers', role: 'Regression Verifier', icon: FlaskConical, color: 'text-teal-400', border: 'border-teal-500', bg: 'bg-teal-900/30' },
 ];

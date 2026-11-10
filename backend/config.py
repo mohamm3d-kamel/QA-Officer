@@ -8,7 +8,7 @@ from typing import Optional
 BASE_DIR = Path(__file__).parent
 STORAGE_DIR = BASE_DIR / "storage"
 EVIDENCE_DIR = STORAGE_DIR / "evidence"
-DB_PATH = STORAGE_DIR / "qa_officer.db"
+DB_PATH = Path(os.environ["QA_OFFICER_DB_PATH"]) if os.environ.get("QA_OFFICER_DB_PATH") else (STORAGE_DIR / "qa_officer.db")
 
 # Ensure directories exist
 STORAGE_DIR.mkdir(exist_ok=True)

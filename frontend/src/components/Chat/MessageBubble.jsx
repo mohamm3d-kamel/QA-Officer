@@ -1,4 +1,5 @@
 import {
+  Headset,
   Search,
   Camera,
   Scale,
@@ -12,6 +13,8 @@ import {
 import api from '../../services/api';
 
 const agentConfig = {
+  desk_officer: { icon: Headset, color: 'text-cyan-400', bg: 'bg-cyan-500/10', border: 'border-cyan-500/20', label: 'Desk Officer' },
+  'desk officer': { icon: Headset, color: 'text-cyan-400', bg: 'bg-cyan-500/10', border: 'border-cyan-500/20', label: 'Desk Officer' },
   detective: { icon: Search, color: 'text-purple-400', bg: 'bg-purple-500/10', border: 'border-purple-500/20', label: 'Detective' },
   coroner: { icon: Camera, color: 'text-amber-400', bg: 'bg-amber-500/10', border: 'border-amber-500/20', label: 'Coroner' },
   judge: { icon: Scale, color: 'text-red-400', bg: 'bg-red-500/10', border: 'border-red-500/20', label: 'Judge' },

@@ -65,9 +65,7 @@ export default function DashboardPage() {
             Welcome, <span className="text-cyan-400">Mohamed Kamel</span>
           </h1>
           <p className="text-sm text-slate-400 leading-relaxed">
-            Multi-Agent QA pipeline is active: Detective traces root cause, Coroner captures live proof,
-            Judge independently confirms, Reporter drafts formatted reports, Sheriff creates Jira tickets,
-            and Watcher verifies retests.
+            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand, Detective traces root cause, Coroner captures live proof, Judge independently confirms, Reporter drafts formatted reports, Sheriff raises tickets to Jira Backlog when requested, and Watcher verifies retests.
           </p>
 
           <div className="flex items-center gap-3 pt-2">

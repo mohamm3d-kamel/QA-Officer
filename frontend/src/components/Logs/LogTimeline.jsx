@@ -1,7 +1,8 @@
 import React from 'react';
-import { Clock, Shield, Search, Camera, Scale, FileText, Tag, Eye, FlaskConical } from 'lucide-react';
+import { Clock, Shield, Headset, Search, Camera, Scale, FileText, Tag, Eye, FlaskConical } from 'lucide-react';
 
 const agentIcons = {
+  'Desk Officer': Headset,
   Detective: Search,
   Coroner: Camera,
   Judge: Scale,

@@ -11,6 +11,7 @@ from models.bug_report import BugReport
 from models.project import Project
 from models.settings import Settings
 from agents.orchestrator import AgentOrchestrator
+from routers.websocket import manager
 from services.llm_router import LLMRouter
 
 router = APIRouter(tags=["bugs"])
@@ -68,6 +69,22 @@ async def get_bug(bug_id: int, db: AsyncSession = Depends(get_db)):
     return data
 
 
+@router.post("/api/bugs/{bug_id}/raise-jira")
+async def raise_bug_to_jira(bug_id: int, db: AsyncSession = Depends(get_db)):
+    """Explicitly trigger Sheriff to raise a Jira ticket in 'Backlog' for an existing bug report."""
+    bug = await db.get(BugReport, bug_id)
+    if not bug:
+        raise HTTPException(status_code=404, detail="Bug report not found")
+
+    orchestrator = await get_orchestrator(db)
+
+    async def broadcast_ws(payload):
+        await manager.broadcast(payload)
+
+    ticket = await orchestrator.raise_jira_ticket(bug_report_id=bug_id, broadcast_callback=broadcast_ws)
+    return {"bug_id": bug_id, "jira_ticket": ticket}
+
+
 @router.post("/api/bugs/{bug_id}/retest")
 async def trigger_retest(bug_id: int, db: AsyncSession = Depends(get_db)):
     """Trigger Watcher and Detective to retest an 'In QA' bug and run sanity tests if resolved."""
@@ -120,6 +137,7 @@ async def run_auto_test(project_id: int, data: AutoTestRequest, db: AsyncSession
         pipeline_res = await orchestrator.process_bug_pipeline(
             bug_input=f"{bug_item.get('title')}: {bug_item.get('description')}\nRoot Cause: {bug_item.get('root_cause')}",
             project_id=project_id,
+            include_sheriff=False,
         )
         created_reports.append(pipeline_res)
 

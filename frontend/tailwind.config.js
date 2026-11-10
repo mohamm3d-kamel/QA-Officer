@@ -27,6 +27,7 @@ export default {
           900: '#020617',
         },
         agent: {
+          desk_officer: '#06b6d4',
           detective: '#8b5cf6',
           coroner: '#f59e0b',
           judge: '#ef4444',

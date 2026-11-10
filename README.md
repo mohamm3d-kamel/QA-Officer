@@ -11,11 +11,12 @@ An AI-powered software testing platform built for modern QA teams. It coordinate
    - All instructions are permanently remembered as **Skills** to eliminate repetitive prompting.
 
 2. **Multi-Agent Defect Pipeline**
+   - **🎖️ Desk Officer (Chat Coordinator & Dispatcher)**: Chats with you about bugs before the workflow runs, knows all built-in agents and their roles, assigns any agent on demand, and launches the main workflow when you ask to create a bug report.
    - **🔍 Detective (Investigator)**: Analyzes bugs, traces logs/code/DOM, identifies root cause, and reproduces defects.
    - **📸 Coroner (Evidence Collector)**: Runs automated Playwright browser session during Detective's second pass to capture full video recordings and high-res screenshots.
    - **⚖️ Judge (Senior Verifier)**: Independently re-investigates and confirms the true root cause before any report is finalized.
    - **📝 Reporter (Author)**: Automatically crafts pristine bug reports matching your custom template.
-   - **🏷️ Sheriff (Jira Commander)**: Creates Jira Cloud tickets in the `To Do` backlog with evidence attachments, priority selection (`lowest` to `highest`), label classification (`Back-End`, `Front-End`, `Mobile`), and assigned reporter (`Mohamed Kamel`).
+   - **🏷️ Sheriff (Jira Commander)**: Creates Jira Cloud tickets in the `Backlog` (not `To Do`) only when explicitly requested, with evidence attachments, priority selection (`lowest` to `highest`), label classification (`Back-End`, `Front-End`, `Mobile`), and assigned reporter (`Mohamed Kamel`).
    - **👁️ Watcher (Jira Sentinel)**: Periodically monitors tickets. When a ticket moves to `In QA`, it prompts Detective to retest. If resolved, it transitions to `Ready To Deploy`. If unresolved, it moves to `Failed QA` with a detailed comment and failure evidence.
    - **🧪 Sanity Testers (Regression Checker)**: Automatically evaluates adjacent and affected modules of resolved bugs to guarantee fixes introduce zero side-effects.
 
@@ -68,7 +69,7 @@ Open the **Settings** tab in the app to configure:
 ```
 QA Officer/
 ├── backend/
-│   ├── agents/               # Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers
+│   ├── agents/               # Desk Officer, Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers
 │   ├── models/               # SQLAlchemy SQLite Models (Project, Skill, BugReport, Evidence, AgentLog)
 │   ├── routers/              # FastAPI Routers (Projects, Skills, Bugs, Chat, Logs, Settings, Reports, WebSocket)
 │   ├── services/             # LLMRouter, JiraClient, BrowserEngine, NotificationService, EvidenceCapture

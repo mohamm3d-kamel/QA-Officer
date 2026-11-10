@@ -123,7 +123,7 @@ class JiraClient:
             # Find the matching transition
             target = None
             for t in transitions:
-                if t["name"].lower() == status_name.lower():
+                if t["name"].lower() == status_name.lower() or (t.get("to") or {}).get("name", "").lower() == status_name.lower():
                     target = t
                     break
 

@@ -42,6 +42,7 @@ const api = {
   getBugs: (projectId) => request(`/projects/${projectId}/bugs`),
   getBug: (id) => request(`/bugs/${id}`),
   retestBug: (id) => request(`/bugs/${id}/retest`, { method: 'POST' }),
+  raiseBugToJira: (id) => request(`/bugs/${id}/raise-jira`, { method: 'POST' }),
   updateBugStatus: (id, status) => request(`/bugs/${id}/status`, { method: 'PUT', body: { status } }),
   autoTest: (projectId, data) =>
     request(`/projects/${projectId}/bugs/auto-test`, { method: 'POST', body: data }),
