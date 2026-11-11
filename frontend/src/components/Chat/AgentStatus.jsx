@@ -9,7 +9,7 @@ const AGENTS = [
   { key: 'judge', name: 'Judge', role: 'Independent Verifier', icon: Scale, color: 'text-red-400', border: 'border-red-500', bg: 'bg-red-900/30' },
   { key: 'reporter', name: 'Reporter', role: 'Bug Report Author', icon: FileText, color: 'text-emerald-400', border: 'border-emerald-500', bg: 'bg-emerald-900/30' },
   { key: 'sheriff', name: 'Sheriff', role: 'Jira Commander (Backlog, on request)', icon: Tag, color: 'text-blue-400', border: 'border-blue-500', bg: 'bg-blue-900/30' },
-  { key: 'watcher', name: 'Watcher', role: 'Jira Sentinel (In QA)', icon: Eye, color: 'text-indigo-400', border: 'border-indigo-500', bg: 'bg-indigo-900/30' },
+  { key: 'watcher', name: 'Watcher', role: 'System Sentinel & Slack/Email Alerter', icon: Eye, color: 'text-indigo-400', border: 'border-indigo-500', bg: 'bg-indigo-900/30' },
   { key: 'sanity', name: 'Sanity Testers', role: 'Regression Verifier', icon: FlaskConical, color: 'text-teal-400', border: 'border-teal-500', bg: 'bg-teal-900/30' },
 ];
 
@@ -96,4 +96,3 @@ export default function AgentStatus() {
     </div>
   );
 }
-

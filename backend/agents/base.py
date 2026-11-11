@@ -7,6 +7,7 @@ import logging
 
 from database import async_session
 from models.agent_log import AgentLog
+from services.watcher_bus import observe_agent_log, sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +30,23 @@ class BaseAgent(ABC):
         bug_report_id: Optional[int] = None,
         project_id: Optional[int] = None,
         started_at: Optional[datetime] = None,
+        module: Optional[str] = None,
+        category: str = "agent_action",
+        level: Optional[str] = None,
+        jira_key: Optional[str] = None,
+        notified_channels: Optional[str] = None,
+        notify: bool = True,
+        observer_bypass: bool = False,
     ) -> int:
-        """Log agent activity to SQLite database."""
+        """Log agent activity to SQLite database and notify Watcher telemetry bus."""
         now = datetime.utcnow()
         start = started_at or now
 
-        # Serialize if needed
-        in_str = json.dumps(input_data) if isinstance(input_data, (dict, list)) else (str(input_data) if input_data is not None else None)
-        out_str = json.dumps(output_data) if isinstance(output_data, (dict, list)) else (str(output_data) if output_data is not None else None)
+        clean_in = sanitize_for_log(input_data)
+        clean_out = sanitize_for_log(output_data)
+
+        in_str = json.dumps(clean_in, ensure_ascii=False, default=str) if isinstance(clean_in, (dict, list)) else (str(clean_in) if clean_in is not None else None)
+        out_str = json.dumps(clean_out, ensure_ascii=False, default=str) if isinstance(clean_out, (dict, list)) else (str(clean_out) if clean_out is not None else None)
 
         async with async_session() as session:
             log_entry = AgentLog(
@@ -47,16 +57,51 @@ class BaseAgent(ABC):
                 input_data=in_str,
                 output_data=out_str,
                 status=status,
+                module=module,
+                category=category,
+                level=level,
+                jira_key=jira_key,
+                notified_channels=notified_channels[:120] if notified_channels else None,
                 started_at=start,
                 finished_at=now,
             )
             session.add(log_entry)
             await session.commit()
             await session.refresh(log_entry)
-            return log_entry.id
+            log_id = log_entry.id
+            log_dict = log_entry.to_dict()
+
+        if not observer_bypass:
+            await observe_agent_log(
+                log_id=log_id,
+                agent_name=self.name,
+                action=action,
+                status=status,
+                module=module,
+                category=category,
+                level=level,
+                project_id=project_id,
+                bug_report_id=bug_report_id,
+                jira_key=jira_key,
+                input_data=clean_in,
+                output_data=clean_out,
+                notify=notify,
+            )
+        else:
+            try:
+                from routers.websocket import manager
+                await manager.broadcast({
+                    "type": "watcher_event",
+                    "log": log_dict,
+                    "level": level or status,
+                    "timestamp": now.isoformat(),
+                })
+            except Exception:
+                pass
+
+        return log_id
 
     @abstractmethod
     async def run(self, *args, **kwargs) -> Any:
         """Run agent task."""
         pass
-

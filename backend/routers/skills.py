@@ -3,11 +3,12 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
-from typing import Optional
 
+from agents.reporter import strip_report_format_preamble
 from database import get_db
 from models.skill import Skill
 from models.project import Project
+from services.watcher_bus import record_system_event
 
 router = APIRouter(tags=["skills"])
 
@@ -39,11 +40,25 @@ async def add_project_skill(project_id: int, data: SkillCreate, db: AsyncSession
         project_id=project_id,
         type=data.type,
         title=data.title,
-        content=data.content,
+        content=(strip_report_format_preamble(data.content) or data.content) if data.type == "report_format" else data.content,
     )
     db.add(skill)
+    if data.type == "report_format" and (data.content or "").strip():
+        project.report_format = strip_report_format_preamble(data.content) or data.content.strip()
     await db.commit()
     await db.refresh(skill)
+
+    await record_system_event(
+        action="skill_created",
+        summary=f"Added {skill.type} skill '{skill.title}' to {project.name}.",
+        module="Skills",
+        category="system_change",
+        status="success",
+        level="change",
+        agent_name="Watcher",
+        project_id=project_id,
+        output_data={"id": skill.id, "type": skill.type, "title": skill.title},
+    )
     return skill.to_dict()
 
 
@@ -70,11 +85,25 @@ async def upload_skill_file(
         project_id=project_id,
         type=type,
         title=title or file.filename,
-        content=content_text,
+        content=(strip_report_format_preamble(content_text) or content_text) if type == "report_format" else content_text,
     )
     db.add(skill)
+    if type == "report_format" and (content_text or "").strip():
+        project.report_format = strip_report_format_preamble(content_text) or content_text.strip()
     await db.commit()
     await db.refresh(skill)
+
+    await record_system_event(
+        action="skill_uploaded",
+        summary=f"Uploaded skill file '{file.filename}' ({skill.type}: '{skill.title}') to {project.name}.",
+        module="Skills",
+        category="system_change",
+        status="success",
+        level="change",
+        agent_name="Watcher",
+        project_id=project_id,
+        output_data={"id": skill.id, "filename": file.filename, "type": skill.type, "title": skill.title},
+    )
     return skill.to_dict()
 
 
@@ -85,7 +114,21 @@ async def delete_skill(skill_id: int, db: AsyncSession = Depends(get_db)):
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
 
+    proj_id = skill.project_id
+    skill_title = skill.title
+    skill_type = skill.type
     await db.delete(skill)
     await db.commit()
-    return {"message": "Skill deleted", "id": skill_id}
 
+    await record_system_event(
+        action="skill_deleted",
+        summary=f"Deleted skill #{skill_id} ('{skill_title}', type={skill_type}).",
+        module="Skills",
+        category="system_change",
+        status="success",
+        level="change",
+        agent_name="Watcher",
+        project_id=proj_id,
+        output_data={"id": skill_id, "title": skill_title, "deleted": True},
+    )
+    return {"message": "Skill deleted", "id": skill_id}

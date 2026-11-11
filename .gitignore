@@ -10,9 +10,15 @@ ENV/
 backend/site-packages/
 
 # Database & Storage
-backend/storage/qa_officer.db
+backend/qa_officer.db*
+backend/storage/qa_officer.db*
+*.db-wal
+*.db-shm
+*.db-journal
 backend/storage/evidence/*
 !backend/storage/evidence/.gitkeep
+backend/storage/chat_uploads/*
+!backend/storage/chat_uploads/.gitkeep
 
 # Node & Frontend
 frontend/node_modules/
@@ -29,4 +35,3 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
-

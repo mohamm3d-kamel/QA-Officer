@@ -6,10 +6,10 @@ sys.path.insert(0, str(Path(__file__).parent / "site-packages"))
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 from sqlalchemy import select
 
 from database import init_db, async_session
@@ -36,13 +36,14 @@ watcher_task = None
 
 
 async def watcher_background_worker():
-    """Background polling loop for Watcher agent."""
+    """Background polling loop for system-wide Watcher sentinel."""
     logger.info("Watcher Background Worker started.")
     from agents.detective import DetectiveAgent
     from agents.coroner import CoronerAgent
     from agents.watcher import WatcherAgent
     from services.llm_router import LLMRouter
     from services.notification_service import NotificationService
+    from services.watcher_bus import record_system_event
 
     while True:
         try:
@@ -50,7 +51,7 @@ async def watcher_background_worker():
                 res = await session.execute(select(Settings))
                 settings_dict = {s.key: s.value for s in res.scalars().all()}
 
-            interval = int(settings_dict.get("watcher_interval_minutes", "60"))
+            interval = int(settings_dict.get("watcher_interval_minutes", "60") or 60)
             enabled = settings_dict.get("watcher_enabled", "true") == "true"
 
             if enabled:
@@ -58,13 +59,14 @@ async def watcher_background_worker():
                     provider=settings_dict.get("llm_provider", "openai"),
                     api_key=settings_dict.get("llm_api_key", ""),
                     model=settings_dict.get("llm_model", "gpt-4"),
+                    base_url=settings_dict.get("llm_base_url", ""),
                 )
                 detective = DetectiveAgent(llm)
                 coroner = CoronerAgent()
-                notifier = NotificationService()
+                notifier = NotificationService.from_settings(settings_dict)
                 watcher = WatcherAgent(detective, coroner, notifier)
 
-                logger.info(f"Watcher polling active tickets (interval: {interval}m)...")
+                logger.info(f"Watcher running system-wide sweep (interval: {interval}m)...")
                 await watcher.poll_all_active_projects(settings_dict)
 
             await asyncio.sleep(max(60, interval * 60))
@@ -72,6 +74,19 @@ async def watcher_background_worker():
             break
         except Exception as e:
             logger.error(f"Watcher background worker loop error: {e}")
+            try:
+                await record_system_event(
+                    action="watcher_worker_error",
+                    summary=f"Watcher background loop encountered an error: {e}",
+                    module="Watcher Monitor",
+                    category="error",
+                    status="failed",
+                    level="error",
+                    agent_name="Watcher",
+                    output_data={"error": str(e)},
+                )
+            except Exception:
+                pass
             await asyncio.sleep(60)
 
 
@@ -89,6 +104,14 @@ async def seed_initial_data():
         res_proj = await session.execute(select(Project))
         proj = res_proj.scalars().first()
         if not proj:
+            default_report_format = (
+                "# Bug Report: [Title]\n\n"
+                "## 1. Summary\n[Summary of the defect]\n\n"
+                "## 2. Root Cause (Judge Confirmed)\n[Verified Root Cause]\n\n"
+                "## 3. Steps to Reproduce\n1. [Step 1]\n2. [Step 2]\n\n"
+                "## 4. Expected vs Actual\n**Expected:** ...\n**Actual:** ...\n\n"
+                "## 5. Visual Evidence\n[Attached screenshot / video recording]"
+            )
             default_proj = Project(
                 name="E-Commerce Core Platform",
                 jira_project_key="QA",
@@ -96,6 +119,7 @@ async def seed_initial_data():
                 app_url="https://example.com",
                 repo_url="https://github.com/company/ecommerce-core",
                 description="Primary web store and checkout service under automated QA supervision.",
+                report_format=default_report_format,
             )
             session.add(default_proj)
             await session.flush()
@@ -105,14 +129,7 @@ async def seed_initial_data():
                 project_id=default_proj.id,
                 type="report_format",
                 title="Default QA Bug Report Format",
-                content=(
-                    "# Bug Report: [Title]\n\n"
-                    "## 1. Summary\n[Summary of the defect]\n\n"
-                    "## 2. Root Cause (Judge Confirmed)\n[Verified Root Cause]\n\n"
-                    "## 3. Steps to Reproduce\n1. [Step 1]\n2. [Step 2]\n\n"
-                    "## 4. Expected vs Actual\n**Expected:** ...\n**Actual:** ...\n\n"
-                    "## 5. Visual Evidence\n[Attached screenshot / video recording]"
-                ),
+                content=default_report_format,
             ))
             session.add(Skill(
                 project_id=default_proj.id,
@@ -162,6 +179,49 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def watcher_unhandled_error_middleware(request: Request, call_next):
+    """Capture unhandled 500 server errors across all modules via Watcher telemetry."""
+    try:
+        response = await call_next(request)
+        if response.status_code >= 500 and not response.headers.get("x-watcher-logged") and "raise-jira" not in request.url.path:
+            try:
+                from services.watcher_bus import record_system_event
+                await record_system_event(
+                    action="api_server_error",
+                    summary=f"{request.method} {request.url.path} returned HTTP {response.status_code}.",
+                    module="API / System",
+                    category="error",
+                    status="failed",
+                    level="error",
+                    agent_name="Watcher",
+                    input_data={"method": request.method, "path": request.url.path},
+                    output_data={"status_code": response.status_code},
+                )
+            except Exception:
+                pass
+        return response
+    except Exception as exc:
+        logger.exception(f"Unhandled exception on {request.method} {request.url.path}: {exc}")
+        try:
+            from services.watcher_bus import record_system_event
+            await record_system_event(
+                action="unhandled_api_exception",
+                summary=f"Unhandled error in {request.method} {request.url.path}: {str(exc)[:200]}",
+                module="API / System",
+                category="error",
+                status="failed",
+                level="error",
+                agent_name="Watcher",
+                input_data={"method": request.method, "path": request.url.path},
+                output_data={"error": str(exc)},
+            )
+        except Exception:
+            pass
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
+
 
 # Static storage for evidence files
 app.mount("/evidence_files", StaticFiles(directory=str(config.EVIDENCE_DIR)), name="evidence_files")

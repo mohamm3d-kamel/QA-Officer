@@ -3,10 +3,11 @@ import useAppStore from '../../store/appStore';
 import MessageBubble from './MessageBubble';
 import { MessageSquare } from 'lucide-react';
 
-export default function ChatWindow() {
+export default function ChatWindow({ onSuggestionClick }) {
   const messages = useAppStore((s) => s.messages);
   const chatLoading = useAppStore((s) => s.chatLoading);
   const bottomRef = useRef(null);
+  const hasActiveStream = messages.some((m) => m.isStreaming);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -18,21 +19,22 @@ export default function ChatWindow() {
         <div className="w-20 h-20 rounded-2xl bg-brand-500/10 border border-brand-500/20 flex items-center justify-center mb-6">
           <MessageSquare className="w-10 h-10 text-brand-400" />
         </div>
-        <h2 className="text-xl font-semibold text-white mb-2">Start a Conversation</h2>
+        <h2 className="text-xl font-semibold text-white mb-2">Start a Conversation with Desk Officer</h2>
         <p className="text-slate-400 max-w-md text-sm">
-          Send a message to begin QA testing. Upload skills, trigger auto-tests, or ask
-          the AI agents to investigate specific areas of your application.
+          Describe a bug, drop or paste screenshots, PDFs, HAR captures &amp; logs, ask about any built-in agent, or trigger targeted QA tasks interactively.
         </p>
         <div className="flex flex-wrap gap-2 mt-6 justify-center">
           {[
-            'Run a full regression test',
-            'Check the login flow',
-            'Test API endpoints',
-            'Review latest changes',
+            'Check my Jira In QA list',
+            'Show all project assets and built-in agents',
+            'Organize Detective, Coroner, and Reporter for a bug',
+            'Create a bug report',
           ].map((suggestion) => (
             <button
               key={suggestion}
-              className="px-3 py-1.5 rounded-full text-xs font-medium bg-slate-700/50 border border-slate-600/50 text-slate-300 hover:text-brand-400 hover:border-brand-500/30 transition-all"
+              disabled={chatLoading}
+              onClick={() => onSuggestionClick && onSuggestionClick(suggestion)}
+              className="px-3 py-1.5 rounded-full text-xs font-medium bg-slate-700/50 border border-slate-600/50 text-slate-300 hover:text-brand-400 hover:border-brand-500/30 transition-all disabled:opacity-50"
             >
               {suggestion}
             </button>
@@ -45,16 +47,21 @@ export default function ChatWindow() {
   return (
     <div className="flex-1 overflow-y-auto p-4 space-y-1">
       {messages.map((msg) => (
-        <MessageBubble key={msg.id} message={msg} />
+        <MessageBubble
+          key={msg.id}
+          message={msg}
+          disabled={chatLoading}
+          onSuggestionClick={onSuggestionClick}
+        />
       ))}
-      {chatLoading && (
+      {chatLoading && !hasActiveStream && (
         <div className="flex items-center gap-2 px-4 py-3 animate-fade-in">
           <div className="flex gap-1">
-            <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
-            <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
-            <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce" />
+            <span className="w-2 h-2 bg-cyan-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
+            <span className="w-2 h-2 bg-cyan-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
+            <span className="w-2 h-2 bg-cyan-400 rounded-full animate-bounce" />
           </div>
-          <span className="text-sm text-slate-400">Agents are processing...</span>
+          <span className="text-sm text-slate-400">Desk Officer is thinking...</span>
         </div>
       )}
       <div ref={bottomRef} />

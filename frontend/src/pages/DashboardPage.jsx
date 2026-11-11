@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FolderGit2, Bug, CheckCircle2, AlertTriangle, ArrowRight, Plus, Bot, ShieldCheck } from 'lucide-react';
+import { FolderGit2, Bug, CheckCircle2, AlertTriangle, ArrowRight, Plus, Bot, ShieldCheck, SlidersHorizontal } from 'lucide-react';
 import useAppStore from '../store/appStore';
 import api from '../services/api';
 import ProjectForm from '../components/Projects/ProjectForm';
@@ -9,6 +9,9 @@ export default function DashboardPage() {
   const navigate = useNavigate();
   const projects = useAppStore((s) => s.projects);
   const setProjects = useAppStore((s) => s.setProjects);
+  const watcherEvents = useAppStore((s) => s.watcherEvents);
+  const latestEvent = watcherEvents[0];
+  const prevEventId = useRef(latestEvent?.id);
 
   const [stats, setStats] = useState({
     totalProjects: 0,
@@ -18,6 +21,7 @@ export default function DashboardPage() {
   });
   const [recentLogs, setRecentLogs] = useState([]);
   const [isFormOpen, setIsFormOpen] = useState(false);
+  const [editingProject, setEditingProject] = useState(null);
 
   useEffect(() => {
     async function loadData() {
@@ -25,7 +29,7 @@ export default function DashboardPage() {
         const projs = await api.getProjects();
         setProjects(projs);
 
-        const logs = await api.getLogs({ limit: 8 });
+        const logs = await api.getLogs({ limit: 10 });
         setRecentLogs(logs);
 
         let totalB = 0;
@@ -52,6 +56,16 @@ export default function DashboardPage() {
     loadData();
   }, [setProjects]);
 
+  useEffect(() => {
+    if (latestEvent && latestEvent.id && latestEvent.id !== prevEventId.current) {
+      prevEventId.current = latestEvent.id;
+      setRecentLogs((prev) => {
+        const deduped = prev.filter((item) => item.id !== latestEvent.id);
+        return [latestEvent, ...deduped].slice(0, 10);
+      });
+    }
+  }, [latestEvent]);
+
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-8">
       {/* Welcome Hero Banner */}
@@ -65,12 +79,15 @@ export default function DashboardPage() {
             Welcome, <span className="text-cyan-400">Mohamed Kamel</span>
           </h1>
           <p className="text-sm text-slate-400 leading-relaxed">
-            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand, Detective traces root cause, Coroner captures live proof, Judge independently confirms, Reporter drafts formatted reports, Sheriff raises tickets to Jira Backlog when requested, and Watcher verifies retests.
+            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand, Detective traces root cause, Coroner captures live proof, Judge independently confirms, Reporter drafts formatted reports, Sheriff raises tickets to Jira Backlog when requested, and Watcher monitors every module, agent, and log with Slack &amp; Email updates.
           </p>
 
           <div className="flex items-center gap-3 pt-2">
             <button
-              onClick={() => setIsFormOpen(true)}
+              onClick={() => {
+                setEditingProject(null);
+                setIsFormOpen(true);
+              }}
               className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold shadow-lg shadow-cyan-900/30 transition-all"
             >
               <Plus className="w-4 h-4" />
@@ -106,7 +123,7 @@ export default function DashboardPage() {
             <Bug className="w-4 h-4" />
           </div>
           <div className="text-3xl font-bold text-slate-100">{stats.totalBugs}</div>
-          <p className="text-[11px] text-slate-500 mt-1">Traced & logged to Jira</p>
+          <p className="text-[11px] text-slate-500 mt-1">Traced &amp; logged to Jira</p>
         </div>
 
         <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow">
@@ -166,6 +183,18 @@ export default function DashboardPage() {
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
+                      setEditingProject(p);
+                      setIsFormOpen(true);
+                    }}
+                    title="Project Configuration & Report Format"
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium inline-flex items-center gap-1"
+                  >
+                    <SlidersHorizontal className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="hidden sm:inline">Config</span>
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
                       navigate(`/summary/${p.id}`);
                     }}
                     className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium"
@@ -184,10 +213,10 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Live Agent activity feed */}
+        {/* Live Watcher & Agent activity feed */}
         <div className="space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="text-base font-semibold text-slate-100">Live Agent Stream</h2>
+            <h2 className="text-base font-semibold text-slate-100">Live Watcher Stream</h2>
             <button
               onClick={() => navigate('/logs')}
               className="text-xs font-medium text-cyan-400 hover:text-cyan-300"
@@ -198,13 +227,29 @@ export default function DashboardPage() {
 
           <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 divide-y divide-slate-800/60 max-h-96 overflow-y-auto">
             {recentLogs.length === 0 ? (
-              <div className="text-center py-8 text-xs text-slate-500">No agent actions recorded yet.</div>
+              <div className="text-center py-8 text-xs text-slate-500">No Watcher or agent actions recorded yet.</div>
             ) : (
               recentLogs.map((l) => (
                 <div key={l.id} className="py-2.5 first:pt-0 last:pb-0">
                   <div className="flex items-center justify-between text-[11px] mb-1">
-                    <span className="font-semibold text-slate-200">{l.agent_name}</span>
-                    <span className="text-slate-500 font-mono">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                          l.status === 'failed'
+                            ? 'bg-red-400'
+                            : l.level === 'change'
+                            ? 'bg-amber-400'
+                            : 'bg-cyan-400'
+                        }`}
+                      />
+                      <span className="font-semibold text-slate-200 truncate">{l.agent_name}</span>
+                      {l.module && (
+                        <span className="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-[10px] text-slate-400 truncate">
+                          {l.module}
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-slate-500 font-mono flex-shrink-0 ml-2">
                       {new Date(l.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </span>
                   </div>
@@ -216,8 +261,14 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      <ProjectForm isOpen={isFormOpen} onClose={() => setIsFormOpen(false)} />
+      <ProjectForm
+        isOpen={isFormOpen}
+        onClose={() => {
+          setIsFormOpen(false);
+          setEditingProject(null);
+        }}
+        initialData={editingProject}
+      />
     </div>
   );
 }
-

@@ -60,6 +60,7 @@ class SanityTesterAgent(BaseAgent):
             f"Business / Requirements Context:\n{skills_context}\n"
         )
 
+        llm_failure_err: Optional[str] = None
         try:
             response = await self.llm.chat(
                 messages=[{"role": "user", "content": user_content}],
@@ -75,6 +76,8 @@ class SanityTesterAgent(BaseAgent):
                 content = content[:-3]
             sanity_result = json.loads(content.strip())
         except Exception as e:
+            if self.llm.is_configured():
+                llm_failure_err = self.llm._redact_secrets(str(e))
             logger.warning(f"Sanity test parsing fallback: {e}")
             sanity_result = {
                 "affected_modules": [resolved_bug.get("module", "Core System"), "Data Persistence"],
@@ -95,18 +98,26 @@ class SanityTesterAgent(BaseAgent):
                 "overall_status": "PASSED",
                 "summary": "All impacted modules tested successfully. Zero regressions discovered.",
             }
+            if llm_failure_err:
+                sanity_result["llm_error"] = llm_failure_err
 
+        failed = bool(llm_failure_err or sanity_result.get("regression_detected") or str(sanity_result.get("overall_status")).upper() == "FAILED")
         await self.log_action(
             action="run_sanity_regression_checks",
-            input_data={"resolved_bug_id": bug_report_id, "resolved_title": resolved_bug.get("title")},
+            input_data={
+                "resolved_bug_id": bug_report_id,
+                "resolved_title": resolved_bug.get("title"),
+                "module": resolved_bug.get("module"),
+            },
             output_data=sanity_result,
-            status="success" if not sanity_result.get("regression_detected") else "failed",
+            status="failed" if failed else "success",
             bug_report_id=bug_report_id,
             project_id=project_id,
+            module=resolved_bug.get("module") or "Sanity & Regression",
+            level="error" if failed else "success",
             started_at=start_time,
         )
         return sanity_result
 
     async def run(self, *args, **kwargs) -> Any:
         return await self.run_sanity_checks(*args, **kwargs)
-

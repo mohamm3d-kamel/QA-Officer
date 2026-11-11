@@ -1,23 +1,34 @@
 """Agent Pipeline Orchestrator - Coordinates all AI Agents through the QA lifecycle."""
 import asyncio
+import io
 import logging
+import shutil
+import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable, Awaitable
+from PIL import Image
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from agents.desk_officer import DeskOfficerAgent
+import config
+from agents.desk_officer import AGENT_ROSTER, DeskOfficerAgent
 from agents.detective import DetectiveAgent
 from agents.coroner import CoronerAgent
 from agents.judge import JudgeAgent
-from agents.reporter import ReporterAgent
+from agents.reporter import ReporterAgent, ensure_evidence_in_report, strip_report_format_preamble
 from agents.sheriff import SheriffAgent
 from agents.watcher import WatcherAgent
 from agents.sanity_tester import SanityTesterAgent
+from services.attachment_processor import format_attachment_text_block, resolve_stored_upload
+from services.jira_client import is_real_jira_issue_key
 from services.llm_router import LLMRouter
 from services.notification_service import NotificationService
+from services.project_assets import ProjectAssetHub
+from services.watcher_bus import record_system_event
 from database import async_session
 from models.bug_report import BugReport
+from models.evidence import Evidence
 from models.skill import Skill
 from models.project import Project
 
@@ -31,6 +42,7 @@ class AgentOrchestrator:
         self.llm = llm_router
         self.jira_settings = jira_settings
         self.default_reporter = default_reporter
+        self.asset_hub = ProjectAssetHub(jira_settings)
 
         self.desk_officer = DeskOfficerAgent(self.llm)
         self.detective = DetectiveAgent(self.llm)
@@ -38,30 +50,53 @@ class AgentOrchestrator:
         self.judge = JudgeAgent(self.llm)
         self.reporter = ReporterAgent(self.llm)
         self.sheriff = SheriffAgent(default_reporter=default_reporter)
-        self.notifier = NotificationService(
-            email_enabled=jira_settings.get("notification_email_enabled") == "true",
-            email_address=jira_settings.get("notification_email", ""),
-            slack_enabled=jira_settings.get("notification_slack_enabled") == "true",
-            slack_webhook=jira_settings.get("notification_slack_webhook", ""),
-        )
+        self.notifier = NotificationService.from_settings(jira_settings)
         self.watcher = WatcherAgent(self.detective, self.coroner, self.notifier)
         self.sanity_tester = SanityTesterAgent(self.llm)
 
+        self.agent_registry = {
+            "desk_officer": self.desk_officer,
+            "detective": self.detective,
+            "coroner": self.coroner,
+            "judge": self.judge,
+            "reporter": self.reporter,
+            "sheriff": self.sheriff,
+            "watcher": self.watcher,
+            "sanity": self.sanity_tester,
+        }
+        if hasattr(self.desk_officer, "attach_context"):
+            self.desk_officer.attach_context(
+                asset_hub=self.asset_hub,
+                agent_registry=self.agent_registry,
+            )
+
     async def get_project_skills_context(self, project_id: int) -> tuple[str, Optional[str]]:
-        """Retrieve stored skills/requirements and report format for a project."""
+        """Retrieve non-template project skills/requirements and the authoritative Project Report Format."""
         async with async_session() as session:
+            project = await session.get(Project, project_id)
             result = await session.execute(
-                select(Skill).where(Skill.project_id == project_id)
+                select(Skill).where(Skill.project_id == project_id).order_by(Skill.id.asc())
             )
             skills = result.scalars().all()
 
         context_lines = []
-        report_format = None
+        report_format = strip_report_format_preamble(project.report_format) if project else None
+        fallback_custom_format = None
+        fallback_default_format = None
 
         for s in skills:
             if s.type == "report_format":
-                report_format = s.content
+                cleaned = strip_report_format_preamble(s.content)
+                if cleaned:
+                    if (s.title or "").strip().lower() == "default qa bug report format":
+                        fallback_default_format = cleaned
+                    else:
+                        fallback_custom_format = cleaned
+                continue
             context_lines.append(f"[{s.type.upper()}] {s.title}:\n{s.content}\n")
+
+        if not report_format:
+            report_format = fallback_custom_format or fallback_default_format
 
         return "\n".join(context_lines), report_format
 
@@ -85,15 +120,98 @@ class AgentOrchestrator:
 
         return notify
 
+    async def _attach_user_images_as_evidence(
+        self,
+        bug_id: int,
+        attachments: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """Persist user-uploaded screenshot attachments as PNG Evidence assets on the bug report."""
+        if not bug_id or not attachments:
+            return []
+
+        config.EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        added: List[Dict[str, Any]] = []
+
+        async with async_session() as session:
+            res_existing = await session.execute(
+                select(Evidence).where(Evidence.bug_report_id == bug_id)
+            )
+            existing = res_existing.scalars().all()
+            existing_sigs = set()
+            for ev in existing:
+                fsize = None
+                if ev.file_path and Path(ev.file_path).exists():
+                    fsize = Path(ev.file_path).stat().st_size
+                existing_sigs.add((ev.file_name or "", fsize))
+
+            for att in attachments:
+                if not isinstance(att, dict) or not att.get("is_image"):
+                    continue
+                src_path: Optional[Path] = None
+                if att.get("file_path") and Path(att["file_path"]).exists():
+                    src_path = Path(att["file_path"])
+                elif att.get("stored_name"):
+                    src_path = resolve_stored_upload(att["stored_name"])
+                if src_path is None:
+                    continue
+
+                orig_name = str(att.get("name") or src_path.name)[:240]
+                dest_name = f"user_upload_{bug_id}_{uuid.uuid4().hex[:8]}.png"
+                dest_path = config.EVIDENCE_DIR / dest_name
+                try:
+                    raw_bytes = src_path.read_bytes()
+                    with Image.open(io.BytesIO(raw_bytes)) as img:
+                        if img.mode not in ("RGB", "RGBA", "L", "LA"):
+                            img = img.convert("RGBA")
+                        img.save(dest_path, format="PNG")
+                except Exception:
+                    shutil.copy2(src_path, dest_path)
+
+                dest_size = dest_path.stat().st_size if dest_path.exists() else None
+                if (orig_name, dest_size) in existing_sigs:
+                    try:
+                        dest_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue
+
+                existing_sigs.add((orig_name, dest_size))
+                summary = att.get("summary") or "chat upload"
+                ev = Evidence(
+                    bug_report_id=bug_id,
+                    type="screenshot",
+                    file_path=str(dest_path),
+                    file_name=orig_name,
+                    stage="detection",
+                    description=f"User uploaded screenshot: {orig_name} ({summary})"[:490],
+                )
+                session.add(ev)
+                added.append({
+                    "type": "screenshot",
+                    "file_path": str(dest_path),
+                    "file_name": orig_name,
+                    "stage": "detection",
+                    "description": ev.description,
+                })
+
+            if added:
+                await session.commit()
+
+        return added
+
     async def process_bug_pipeline(
         self,
         bug_input: str,
         project_id: int,
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         include_sheriff: bool = False,
+        bug_report_id: Optional[int] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Execute the main bug reporting pipeline: Detective -> Coroner -> Judge -> Reporter.
 
+        Reuses an in-progress draft BugReport (from an earlier investigation step) when ``bug_report_id``
+        points to a draft unformatted bug in the same project.
         Sheriff is NOT invoked automatically unless ``include_sheriff=True`` (explicitly requested).
         """
         notify = await self._make_notifier(broadcast_callback)
@@ -106,28 +224,86 @@ class AgentOrchestrator:
             project_info = project.to_dict()
 
         skills_context, report_format = await self.get_project_skills_context(project_id)
+        local_repo = self.asset_hub._scan_local_repo(project_info.get("repo_url") or "")
+        if local_repo and local_repo.get("files"):
+            skills_context = (
+                f"{skills_context}\n\n[LOCAL REPO FILES ({local_repo['root']})]:\n"
+                + ", ".join(local_repo["files"][:30])
+            ).strip()
 
-        # Create Draft Bug Report record in DB
-        async with async_session() as session:
-            bug = BugReport(
-                project_id=project_id,
-                title="Analyzing bug...",
-                description=bug_input,
-                status="draft",
-            )
-            session.add(bug)
-            await session.commit()
-            await session.refresh(bug)
-            bug_id = bug.id
+        # Reuse an active draft/investigated bug report or create a new BugReport record
+        existing_evidence: List[Dict[str, Any]] = []
+        prior_investigation_note = ""
+        reused_bug_id: Optional[int] = None
+
+        if bug_report_id:
+            async with async_session() as session:
+                res_existing = await session.execute(
+                    select(BugReport)
+                    .options(selectinload(BugReport.evidence))
+                    .where(BugReport.id == bug_report_id, BugReport.project_id == project_id)
+                )
+                existing_bug = res_existing.scalar_one_or_none()
+                if (
+                    existing_bug
+                    and existing_bug.status == "draft"
+                    and not (existing_bug.formatted_report or "").strip()
+                ):
+                    reused_bug_id = existing_bug.id
+                    existing_evidence = [
+                        {
+                            "type": ev.type,
+                            "file_path": ev.file_path,
+                            "file_name": ev.file_name,
+                            "stage": ev.stage,
+                            "description": ev.description,
+                        }
+                        for ev in (existing_bug.evidence or [])
+                    ]
+                    if existing_bug.root_cause:
+                        prior_investigation_note = (
+                            f"\n\nPrior Investigation on Bug #{existing_bug.id}:\n"
+                            f"- Preliminary Title: {existing_bug.title}\n"
+                            f"- Preliminary Root Cause: {existing_bug.root_cause}\n"
+                            f"- Preliminary Steps: {existing_bug.steps_to_reproduce or 'None'}"
+                        )
+
+        if reused_bug_id is not None:
+            bug_id = reused_bug_id
+            effective_bug_input = f"{bug_input}{prior_investigation_note}".strip()
+        else:
+            effective_bug_input = bug_input
+            async with async_session() as session:
+                bug = BugReport(
+                    project_id=project_id,
+                    title="Analyzing bug...",
+                    description=bug_input,
+                    status="draft",
+                )
+                session.add(bug)
+                await session.commit()
+                await session.refresh(bug)
+                bug_id = bug.id
+
+        if attachments and "[Attachment:" not in effective_bug_input:
+            att_notes = "\n\n".join(format_attachment_text_block(a, max_chars=2500) for a in attachments)
+            if att_notes:
+                effective_bug_input = f"{effective_bug_input}\n\nAttached Files & Images:\n{att_notes}".strip()
+
+        user_evidence = await self._attach_user_images_as_evidence(bug_id, attachments)
+        if user_evidence:
+            existing_evidence.extend(user_evidence)
 
         # 1. DETECTIVE (Pass 1)
         await notify("detective", "running", "Detective is tracing the bug and investigating root cause...")
         detective_result = await self.detective.trace_bug(
-            bug_input=bug_input,
+            bug_input=effective_bug_input,
             skills_context=skills_context,
             project_info=project_info,
             project_id=project_id,
             bug_report_id=bug_id,
+            attachments=attachments,
+            report_format_template=report_format,
         )
         await notify("detective", "success", f"Detective identified root cause for: {detective_result.get('title')}", detective_result)
 
@@ -135,6 +311,8 @@ class AgentOrchestrator:
         async with async_session() as session:
             b = await session.get(BugReport, bug_id)
             b.title = detective_result.get("title", "Reported Defect")
+            if detective_result.get("description"):
+                b.description = detective_result["description"]
             b.root_cause = detective_result.get("root_cause")
             b.steps_to_reproduce = (
                 "\n".join(detective_result.get("steps_to_reproduce", []))
@@ -146,26 +324,71 @@ class AgentOrchestrator:
             b.module = detective_result.get("module", "General")
             await session.commit()
 
-        # 2. CORONER (Pass 2 Evidence Capture)
-        await notify("coroner", "running", "Coroner is capturing video and screenshot evidence during reproduction pass...")
-        evidence_list = await self.coroner.capture_evidence(
-            bug_data=detective_result,
-            project_info=project_info,
-            stage="detection",
-            bug_report_id=bug_id,
-            project_id=project_id,
+        # 2. CORONER (Pass 2 Evidence Capture — reuse verified investigation evidence if already captured)
+        has_coroner_evidence = any(
+            not (ev.get("description") or "").startswith("User uploaded screenshot:")
+            for ev in existing_evidence
         )
-        await notify("coroner", "success", f"Coroner captured {len(evidence_list)} evidence files", evidence_list)
+        if existing_evidence and has_coroner_evidence:
+            await notify("coroner", "running", f"Coroner is attaching {len(existing_evidence)} captured evidence file(s) from investigation...")
+            evidence_list = existing_evidence
+            await notify("coroner", "success", f"Coroner verified {len(evidence_list)} evidence files", evidence_list)
+        else:
+            await notify("coroner", "running", "Coroner is capturing video and screenshot evidence during reproduction pass...")
+            coroner_evidence = await self.coroner.capture_evidence(
+                bug_data=detective_result,
+                project_info=project_info,
+                stage="detection",
+                bug_report_id=bug_id,
+                project_id=project_id,
+            )
+            evidence_list = existing_evidence + (coroner_evidence or [])
+            await notify("coroner", "success", f"Coroner verified {len(evidence_list)} evidence file(s)", evidence_list)
 
-        # 3. JUDGE (Independent verification of root cause)
-        await notify("judge", "running", "Judge is independently verifying the Detective root cause...")
+        # 3. JUDGE (Independent verification of Detective + Coroner findings)
+        evidence_summary = ", ".join(
+            f"{e.get('type', 'file')}: {e.get('file_name', 'asset')}"
+            for e in (evidence_list or [])
+        ) or "No visual evidence captured"
+        judge_bug_data = {**detective_result, "evidence_summary": evidence_summary}
+
+        await notify("judge", "running", "Judge is independently verifying the Detective root cause and evidence...")
         judge_verdict = await self.judge.verify_root_cause(
-            bug_data=detective_result,
+            bug_data=judge_bug_data,
             skills_context=skills_context,
             project_info=project_info,
             project_id=project_id,
             bug_report_id=bug_id,
+            attachments=attachments,
+            report_format_template=report_format,
         )
+
+        verdict_label = str(judge_verdict.get("verdict") or "CONFIRMED").upper()
+        is_confirmed = bool(judge_verdict.get("confirmed", True)) and verdict_label != "REJECTED"
+
+        if not is_confirmed:
+            await notify(
+                "judge",
+                "failed",
+                f"Judge REJECTED root cause (needs clarification): {judge_verdict.get('judge_notes') or judge_verdict.get('final_root_cause', '')}",
+                judge_verdict,
+            )
+            async with async_session() as session:
+                b = await session.get(BugReport, bug_id)
+                b.root_cause = judge_verdict.get("final_root_cause") or b.root_cause
+                b.status = "draft"
+                await session.commit()
+            return {
+                "bug_id": bug_id,
+                "title": detective_result.get("title"),
+                "root_cause": judge_verdict.get("final_root_cause"),
+                "judge_verdict": judge_verdict,
+                "formatted_report": "",
+                "evidence": evidence_list,
+                "jira_ticket": None,
+                "status": "needs_clarification",
+            }
+
         await notify("judge", "success", f"Judge Verdict: {judge_verdict.get('verdict')} - {judge_verdict.get('final_root_cause')[:80]}...", judge_verdict)
 
         # Update root cause with Judge's final decision
@@ -175,8 +398,14 @@ class AgentOrchestrator:
             b.status = "confirmed"
             await session.commit()
 
-        # 4. REPORTER (Writes report adhering to Tester's format)
-        await notify("reporter", "running", "Reporter is authoring the final bug report matching your custom template...")
+        # 4. REPORTER (Writes report strictly adhering to Project Report Format)
+        await notify(
+            "reporter",
+            "running",
+            "Reporter is authoring the final bug report following Project Report Format..."
+            if report_format
+            else "Reporter is authoring the final bug report in standard QA format...",
+        )
         formatted_report = await self.reporter.generate_report(
             bug_data=detective_result,
             judge_verdict=judge_verdict,
@@ -184,6 +413,7 @@ class AgentOrchestrator:
             project_info=project_info,
             project_id=project_id,
             bug_report_id=bug_id,
+            evidence_list=evidence_list,
         )
         async with async_session() as session:
             b = await session.get(BugReport, bug_id)
@@ -200,7 +430,8 @@ class AgentOrchestrator:
                 bug_report_id=bug_id,
                 broadcast_callback=broadcast_callback,
             )
-            final_status = "reported"
+            if ticket_result and ticket_result.get("key") and not ticket_result.get("error"):
+                final_status = "reported"
         else:
             await notify(
                 "sheriff",
@@ -224,8 +455,10 @@ class AgentOrchestrator:
         self,
         bug_report_id: int,
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        force_new: bool = False,
+        target_project_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Explicitly invoke Sheriff to create a Jira ticket in 'Backlog' for an existing bug report."""
+        """Explicitly invoke Sheriff to create a brand-new Jira ticket in 'Backlog' for a bug report."""
         notify = await self._make_notifier(broadcast_callback)
 
         async with async_session() as session:
@@ -238,53 +471,115 @@ class AgentOrchestrator:
             if not bug:
                 raise ValueError(f"Bug Report #{bug_report_id} not found")
 
-            if bug.jira_ticket_id:
-                return {
-                    "key": bug.jira_ticket_id,
-                    "url": bug.jira_ticket_url,
-                    "status": "Backlog",
-                    "reporter": self.default_reporter,
-                    "priority": bug.severity or "medium",
-                    "label": bug.label or "Front-End",
-                    "already_raised": True,
-                }
-
             project = await session.get(Project, bug.project_id)
             project_info = project.to_dict() if project else {"id": bug.project_id, "jira_project_key": "QA", "name": "Default"}
+            effective_proj_key = (target_project_key or project_info.get("jira_project_key") or "QA").strip().upper()
+
+            bug_id_val = bug.id
+            bug_proj_id = bug.project_id
+            bug_jira_key = bug.jira_ticket_id
+            bug_jira_url = bug.jira_ticket_url
+            bug_formatted = bug.formatted_report
+            bug_severity = bug.severity or "medium"
+            bug_label = bug.label or "Front-End"
+
+            evidence_list = []
+            seen_ev_keys = set()
+            for ev in (bug.evidence or []):
+                ev_key = (ev.file_path or "", ev.file_name or "")
+                if ev_key in seen_ev_keys:
+                    continue
+                seen_ev_keys.add(ev_key)
+                evidence_list.append({
+                    "type": ev.type,
+                    "file_path": ev.file_path,
+                    "file_name": ev.file_name,
+                    "stage": ev.stage,
+                    "description": ev.description,
+                })
 
             bug_data = {
                 "title": bug.title,
                 "description": bug.description,
                 "root_cause": bug.root_cause,
                 "steps_to_reproduce": bug.steps_to_reproduce.splitlines() if bug.steps_to_reproduce else [],
-                "severity": bug.severity or "medium",
-                "label": bug.label or "Front-End",
+                "severity": bug_severity,
+                "label": bug_label,
                 "module": bug.module or "General",
             }
-            evidence_list = [
-                {
-                    "type": ev.type,
-                    "file_path": ev.file_path,
-                    "file_name": ev.file_name,
-                    "stage": ev.stage,
-                    "description": ev.description,
-                }
-                for ev in (bug.evidence or [])
-            ]
-            formatted_report = bug.formatted_report or self.reporter._fallback_report(
+
+        # Outer read session closed before Coroner / Sheriff open write transactions (avoids SQLite locks)
+        if bug_jira_key and is_real_jira_issue_key(bug_jira_key, effective_proj_key) and not force_new:
+            if not evidence_list:
+                await notify("coroner", "running", f"Coroner is capturing missing evidence for Bug #{bug_id_val} before syncing {bug_jira_key}...")
+                evidence_list = await self.coroner.capture_evidence(
+                    bug_data=bug_data,
+                    project_info=project_info,
+                    stage="detection",
+                    bug_report_id=bug_id_val,
+                    project_id=bug_proj_id,
+                )
+                await notify("coroner", "success", f"Coroner captured {len(evidence_list)} evidence file(s)", evidence_list)
+
+            sync_res = await self.sheriff.sync_evidence_to_existing_ticket(
+                issue_key=bug_jira_key,
+                evidence_list=evidence_list,
+                formatted_report=bug_formatted,
                 bug_data=bug_data,
-                judge_verdict={
-                    "final_root_cause": bug.root_cause or bug.description or "Pending confirmation",
-                    "judge_notes": "Submitted via Sheriff on tester request.",
-                    "severity_adjustment": bug.severity or "medium",
-                },
                 project_info=project_info,
+                jira_settings=self.jira_settings,
+                bug_report_id=bug_id_val,
             )
+            all_attached = sync_res.get("all_attached") or sync_res.get("existing_attached") or []
+            return {
+                "key": bug_jira_key,
+                "url": bug_jira_url,
+                "status": "Backlog",
+                "project_key": effective_proj_key,
+                "reporter": self.default_reporter,
+                "priority": bug_severity,
+                "label": bug_label,
+                "already_raised": True,
+                "evidence_count": len(evidence_list),
+                "attached_count": len(all_attached),
+                "evidence_attached": all_attached,
+                "newly_attached": sync_res.get("newly_attached", []),
+                "failed_attachments": sync_res.get("failed_attachments", []),
+                "description_synced": bool(sync_res.get("description_synced")),
+            }
+
+        # Guarantee Coroner has collected evidence on the bug report before Sheriff raises to Jira
+        if not evidence_list:
+            await notify("coroner", "running", f"Coroner is capturing visual evidence for Bug #{bug_id_val} before Sheriff raises Jira ticket...")
+            captured_ev = await self.coroner.capture_evidence(
+                bug_data=bug_data,
+                project_info=project_info,
+                stage="detection",
+                bug_report_id=bug_id_val,
+                project_id=bug_proj_id,
+            )
+            evidence_list = captured_ev or []
+            await notify("coroner", "success", f"Coroner captured {len(evidence_list)} evidence file(s)", evidence_list)
+
+        _, active_report_format = await self.get_project_skills_context(bug_proj_id)
+        base_report = bug_formatted or self.reporter._fallback_report(
+            bug_data=bug_data,
+            judge_verdict={
+                "final_root_cause": bug_data.get("root_cause") or bug_data.get("description") or "Pending confirmation",
+                "judge_notes": "Submitted via Sheriff on tester request.",
+                "severity_adjustment": bug_severity,
+            },
+            project_info=project_info,
+            report_format_template=active_report_format,
+            evidence_list=evidence_list,
+            bug_report_id=bug_id_val,
+        )
+        formatted_report = ensure_evidence_in_report(base_report, evidence_list, bug_data)
 
         await notify(
             "sheriff",
             "running",
-            f"Sheriff is creating Jira ticket in 'Backlog' with label '{bug_data['label']}' assigned to {self.default_reporter}...",
+            f"Sheriff is creating Jira ticket in '{effective_proj_key}' Backlog with {len(evidence_list)} Coroner evidence file(s)...",
         )
         ticket_result = await self.sheriff.create_jira_ticket(
             bug_data=bug_data,
@@ -294,11 +589,28 @@ class AgentOrchestrator:
             jira_settings=self.jira_settings,
             bug_report_id=bug_report_id,
             reporter_name=self.default_reporter,
+            target_project_key=effective_proj_key,
+            notify_on_success=False,
         )
+
+        if ticket_result.get("error") or not ticket_result.get("key"):
+            err_msg = ticket_result.get("error") or "Unknown Jira ticket creation failure."
+            await notify(
+                "sheriff",
+                "failed",
+                f"Sheriff failed to create Jira ticket in '{effective_proj_key}': {err_msg}",
+                ticket_result,
+            )
+            return ticket_result
+
+        ev_attached_cnt = ticket_result.get("attached_count", 0)
+        ev_note = f" ({ev_attached_cnt} evidence file(s) attached)" if ev_attached_cnt else ""
+        if ticket_result.get("attachment_warning"):
+            ev_note += f" — Warning: {ticket_result['attachment_warning']}"
         await notify(
             "sheriff",
             "success",
-            f"Sheriff created ticket: {ticket_result['key']} in 'Backlog'",
+            f"Sheriff created ticket: {ticket_result['key']} in 'Backlog'{ev_note}",
             ticket_result,
         )
 
@@ -306,6 +618,9 @@ class AgentOrchestrator:
             bug_title=bug_data["title"],
             jira_key=ticket_result["key"],
             jira_url=ticket_result["url"],
+            project_name=project_info.get("name"),
+            module=bug_data.get("module") or "Jira Integration",
+            bug_id=bug_report_id,
         )
         return ticket_result
 
@@ -316,8 +631,10 @@ class AgentOrchestrator:
         bug_input: str,
         create_if_missing: bool = False,
         prefer_unraised: bool = False,
+        jira_key: Optional[str] = None,
+        allow_reported_fallback: bool = True,
     ) -> Optional[BugReport]:
-        """Find a referenced bug report, latest bug report for the project, or optionally create a draft."""
+        """Find a referenced bug report (by ID or Jira key), latest project bug, or optionally create a draft."""
         async with async_session() as session:
             if bug_report_id:
                 res = await session.execute(
@@ -327,32 +644,108 @@ class AgentOrchestrator:
                 )
                 return res.scalar_one_or_none()
 
-            if prefer_unraised:
+            if jira_key:
+                clean_key = jira_key.strip().upper()
                 res = await session.execute(
                     select(BugReport)
                     .options(selectinload(BugReport.evidence))
-                    .where(BugReport.project_id == project_id, BugReport.jira_ticket_id.is_(None))
-                    .order_by(BugReport.created_at.desc())
+                    .where(BugReport.project_id == project_id, BugReport.jira_ticket_id == clean_key)
                 )
-                unraised = res.scalars().first()
-                if unraised:
-                    return unraised
+                existing = res.scalar_one_or_none()
+                if existing:
+                    return existing
 
-            res = await session.execute(
-                select(BugReport)
-                .options(selectinload(BugReport.evidence))
-                .where(BugReport.project_id == project_id)
-                .order_by(BugReport.created_at.desc())
-            )
-            latest = res.scalars().first()
-            if latest:
-                return latest
+                jira_res = await self.asset_hub.run_asset_tool(
+                    project_id, "jira_get_issue", {"issue_key": clean_key}
+                )
+                if jira_res.get("ok") and jira_res.get("issue"):
+                    iss = jira_res["issue"]
+                    raw_st = (iss.get("status") or "").lower().replace(" ", "")
+                    mapped_status = (
+                        "in_qa"
+                        if raw_st in ("inqa", "in_qa")
+                        else ("resolved" if "deploy" in raw_st or "done" in raw_st else ("failed" if "fail" in raw_st else "reported"))
+                    )
+                    raw_prio = (iss.get("priority") or "medium").lower()
+                    if raw_prio not in ("lowest", "low", "medium", "high", "highest"):
+                        raw_prio = "medium"
+                    labels = iss.get("labels") or []
+                    bug = BugReport(
+                        project_id=project_id,
+                        jira_ticket_id=clean_key,
+                        jira_ticket_url=iss.get("url"),
+                        title=iss.get("summary") or f"Jira {clean_key}",
+                        description=iss.get("description") or bug_input or iss.get("summary") or "",
+                        status=mapped_status,
+                        severity=raw_prio,
+                        label=labels[0] if labels else "Front-End",
+                        module="Jira",
+                    )
+                    session.add(bug)
+                    await session.commit()
+                    res_loaded = await session.execute(
+                        select(BugReport)
+                        .options(selectinload(BugReport.evidence))
+                        .where(BugReport.id == bug.id)
+                    )
+                    return res_loaded.scalar_one_or_none()
 
-            if create_if_missing and bug_input.strip():
+                if not create_if_missing:
+                    return None
+
                 bug = BugReport(
                     project_id=project_id,
-                    title=f"Bug: {bug_input.strip()[:80]}",
-                    description=bug_input.strip(),
+                    jira_ticket_id=clean_key,
+                    title=f"Bug: {(bug_input or clean_key).strip()[:80]}",
+                    description=bug_input.strip() or f"Tracked Jira ticket {clean_key}",
+                    status="draft",
+                )
+                session.add(bug)
+                await session.commit()
+                res_loaded = await session.execute(
+                    select(BugReport)
+                    .options(selectinload(BugReport.evidence))
+                    .where(BugReport.id == bug.id)
+                )
+                return res_loaded.scalar_one_or_none()
+
+            if prefer_unraised:
+                proj_obj = await session.get(Project, project_id)
+                proj_key = (proj_obj.jira_project_key if proj_obj else None) or "QA"
+                res = await session.execute(
+                    select(BugReport)
+                    .options(selectinload(BugReport.evidence))
+                    .where(BugReport.project_id == project_id)
+                    .order_by(BugReport.created_at.desc(), BugReport.id.desc())
+                )
+                unraised = [
+                    candidate
+                    for candidate in res.scalars().all()
+                    if not candidate.jira_ticket_id or not is_real_jira_issue_key(candidate.jira_ticket_id, proj_key)
+                ]
+                for candidate in unraised:
+                    if (candidate.formatted_report or "").strip() or candidate.status in ("confirmed", "reported"):
+                        return candidate
+                if unraised:
+                    return unraised[0]
+
+            if allow_reported_fallback:
+                res = await session.execute(
+                    select(BugReport)
+                    .options(selectinload(BugReport.evidence))
+                    .where(BugReport.project_id == project_id)
+                    .order_by(BugReport.created_at.desc(), BugReport.id.desc())
+                )
+                latest = res.scalars().first()
+                if latest:
+                    return latest
+
+            if create_if_missing and (bug_input.strip() or jira_key):
+                bug = BugReport(
+                    project_id=project_id,
+                    title=f"Bug: {(bug_input or jira_key).strip()[:80]}",
+                    description=bug_input.strip() or f"Imported from Jira {jira_key}",
+                    jira_ticket_id=jira_key.strip().upper() if jira_key else None,
                     status="draft",
                 )
                 session.add(bug)
@@ -369,10 +762,26 @@ class AgentOrchestrator:
         bug_input: str = "",
         bug_report_id: Optional[int] = None,
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        jira_key: Optional[str] = None,
+        goal: str = "",
+        shared_state: Optional[Dict[str, Any]] = None,
+        update_jira: bool = True,
+        force_new: bool = False,
+        target_project_key: Optional[str] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Assign and execute a single specialized built-in agent on behalf of Desk Officer."""
         notify = await self._make_notifier(broadcast_callback)
         agent_key = target_agent.lower().strip()
+        shared = shared_state if shared_state is not None else {}
+        effective_attachments = attachments if attachments is not None else shared.get("attachments")
+        effective_bug_id = bug_report_id or shared.get("bug_id")
+        clean_goal = (goal or "").strip()
+        combined_input = (
+            f"Assigned Goal: {clean_goal}\n\n{bug_input}".strip()
+            if clean_goal and clean_goal not in (bug_input or "")
+            else (bug_input or clean_goal)
+        )
 
         async with async_session() as session:
             project = await session.get(Project, project_id)
@@ -381,28 +790,47 @@ class AgentOrchestrator:
             project_info = project.to_dict()
 
         skills_context, report_format = await self.get_project_skills_context(project_id)
+        local_repo = self.asset_hub._scan_local_repo(project_info.get("repo_url") or "")
+        if local_repo and local_repo.get("files"):
+            skills_context = (
+                f"{skills_context}\n\n[LOCAL REPO FILES ({local_repo['root']})]:\n"
+                + ", ".join(local_repo["files"][:30])
+            ).strip()
 
         if agent_key == "detective":
-            if bug_report_id:
-                bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=False)
+            if effective_bug_id or jira_key:
+                bug = await self._resolve_target_bug(
+                    project_id,
+                    effective_bug_id,
+                    combined_input,
+                    create_if_missing=False,
+                    jira_key=jira_key,
+                )
                 if not bug:
-                    return {"agent": "Detective", "status": "not_found", "message": f"Bug #{bug_report_id} was not found in this project."}
+                    ref = f"Jira {jira_key}" if jira_key else f"Bug #{effective_bug_id}"
+                    return {"agent": "Detective", "status": "not_found", "message": f"{ref} was not found in this project."}
                 bug_id = bug.id
-                effective_input = bug_input or bug.description or bug.title
+                effective_input = combined_input or bug.description or bug.title
             else:
                 async with async_session() as session:
                     bug = BugReport(
                         project_id=project_id,
                         title="Analyzing bug...",
-                        description=bug_input or "Investigating reported bug",
+                        description=combined_input or "Investigating reported bug",
                         status="draft",
                     )
                     session.add(bug)
                     await session.commit()
                     await session.refresh(bug)
                     bug_id = bug.id
-                effective_input = bug_input
+                effective_input = combined_input or "Investigate current application behavior and stored skills."
 
+            if effective_attachments and "[Attachment:" not in (effective_input or ""):
+                att_notes = "\n\n".join(format_attachment_text_block(a, max_chars=2500) for a in effective_attachments)
+                if att_notes:
+                    effective_input = f"{effective_input}\n\nAttached Files & Images:\n{att_notes}".strip()
+
+            await self._attach_user_images_as_evidence(bug_id, effective_attachments)
             await notify("detective", "running", "Detective is tracing the bug and investigating root cause...")
             detective_result = await self.detective.trace_bug(
                 bug_input=effective_input,
@@ -410,10 +838,14 @@ class AgentOrchestrator:
                 project_info=project_info,
                 project_id=project_id,
                 bug_report_id=bug_id,
+                attachments=effective_attachments,
+                report_format_template=report_format,
             )
             async with async_session() as session:
                 b = await session.get(BugReport, bug_id)
                 b.title = detective_result.get("title", b.title)
+                if detective_result.get("description"):
+                    b.description = detective_result["description"]
                 b.root_cause = detective_result.get("root_cause")
                 b.steps_to_reproduce = (
                     "\n".join(detective_result.get("steps_to_reproduce", []))
@@ -424,45 +856,90 @@ class AgentOrchestrator:
                 b.label = detective_result.get("label", "Front-End")
                 b.module = detective_result.get("module", "General")
                 await session.commit()
+            shared["bug_id"] = bug_id
+            shared["detective_result"] = detective_result
             await notify("detective", "success", f"Detective identified root cause for: {detective_result.get('title')}", detective_result)
             return {"agent": "Detective", "status": "success", "bug_id": bug_id, "result": detective_result}
 
         if agent_key == "coroner":
-            bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=True)
+            bug = await self._resolve_target_bug(
+                project_id,
+                effective_bug_id,
+                combined_input,
+                create_if_missing=True,
+                prefer_unraised=True,
+                jira_key=jira_key,
+                allow_reported_fallback=False,
+            )
             if not bug:
-                return {"agent": "Coroner", "status": "missing_context", "message": "Please describe the bug or reference a bug # first so Coroner knows what to capture."}
+                return {"agent": "Coroner", "status": "missing_context", "message": "Please describe the bug or reference a bug # / Jira key first so Coroner knows what to capture."}
+            det_res = shared.get("detective_result") or {}
             bug_data = {
-                "title": bug.title,
-                "description": bug.description or bug_input,
-                "root_cause": bug.root_cause or "Under investigation",
-                "steps_to_reproduce": bug.steps_to_reproduce.splitlines() if bug.steps_to_reproduce else [bug_input or bug.title],
-                "severity": bug.severity or "medium",
-                "label": bug.label or "Front-End",
-                "module": bug.module or "General",
-                "browser_actions": [],
+                "title": det_res.get("title") or bug.title,
+                "description": det_res.get("description") or bug.description or combined_input,
+                "root_cause": det_res.get("root_cause") or bug.root_cause or "Under investigation",
+                "steps_to_reproduce": det_res.get("steps_to_reproduce")
+                or (bug.steps_to_reproduce.splitlines() if bug.steps_to_reproduce else [combined_input or bug.title]),
+                "severity": det_res.get("severity") or bug.severity or "medium",
+                "label": det_res.get("label") or bug.label or "Front-End",
+                "module": det_res.get("module") or bug.module or "General",
+                "browser_actions": det_res.get("browser_actions", []),
             }
+            user_ev = await self._attach_user_images_as_evidence(bug.id, effective_attachments)
             await notify("coroner", "running", f"Coroner is capturing screenshot and video evidence for Bug #{bug.id}...")
-            evidence_list = await self.coroner.capture_evidence(
+            coroner_ev = await self.coroner.capture_evidence(
                 bug_data=bug_data,
                 project_info=project_info,
                 stage="detection",
                 bug_report_id=bug.id,
                 project_id=project_id,
             )
+            evidence_list = [
+                {
+                    "type": ev.type,
+                    "file_path": ev.file_path,
+                    "file_name": ev.file_name,
+                    "stage": ev.stage,
+                    "description": ev.description,
+                }
+                for ev in (bug.evidence or [])
+            ] + (user_ev or []) + (coroner_ev or [])
+            shared["bug_id"] = bug.id
+            shared["evidence_list"] = evidence_list
             await notify("coroner", "success", f"Coroner captured {len(evidence_list)} evidence files", evidence_list)
             return {"agent": "Coroner", "status": "success", "bug_id": bug.id, "evidence": evidence_list}
 
         if agent_key == "judge":
-            bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=True)
+            bug = await self._resolve_target_bug(
+                project_id,
+                effective_bug_id,
+                combined_input,
+                create_if_missing=True,
+                prefer_unraised=True,
+                jira_key=jira_key,
+                allow_reported_fallback=False,
+            )
             if not bug:
-                return {"agent": "Judge", "status": "missing_context", "message": "Please describe a bug or reference a bug # for Judge to verify."}
+                return {"agent": "Judge", "status": "missing_context", "message": "Please describe a bug or reference a bug # / Jira key for Judge to verify."}
+            user_ev = await self._attach_user_images_as_evidence(bug.id, effective_attachments)
+            det_res = shared.get("detective_result") or {}
+            ev_items = shared.get("evidence_list") or [
+                {"type": ev.type, "file_name": ev.file_name} for ev in (bug.evidence or [])
+            ] + user_ev
+            evidence_summary = ", ".join(
+                f"{e.get('type', 'file')}: {e.get('file_name', 'asset')}" for e in ev_items
+            )
             bug_data = {
-                "title": bug.title,
-                "description": bug.description or bug_input,
-                "root_cause": bug.root_cause or bug_input or "Initial analysis pending",
-                "steps_to_reproduce": bug.steps_to_reproduce or bug_input,
-                "severity": bug.severity or "medium",
-                "label": bug.label or "Front-End",
+                "title": det_res.get("title") or bug.title,
+                "environment": det_res.get("environment") or "",
+                "description": det_res.get("description") or bug.description or combined_input,
+                "expected_behavior": det_res.get("expected_behavior") or "",
+                "actual_behavior": det_res.get("actual_behavior") or "",
+                "root_cause": det_res.get("root_cause") or bug.root_cause or combined_input or "Initial analysis pending",
+                "steps_to_reproduce": det_res.get("steps_to_reproduce") or bug.steps_to_reproduce or combined_input,
+                "severity": det_res.get("severity") or bug.severity or "medium",
+                "label": det_res.get("label") or bug.label or "Front-End",
+                "evidence_summary": evidence_summary,
             }
             await notify("judge", "running", f"Judge is independently verifying Bug #{bug.id}...")
             judge_verdict = await self.judge.verify_root_cause(
@@ -471,28 +948,71 @@ class AgentOrchestrator:
                 project_info=project_info,
                 project_id=project_id,
                 bug_report_id=bug.id,
+                attachments=effective_attachments,
+                report_format_template=report_format,
             )
+            verdict_label = str(judge_verdict.get("verdict") or "CONFIRMED").upper()
+            is_confirmed = bool(judge_verdict.get("confirmed", True)) and verdict_label != "REJECTED"
             async with async_session() as session:
                 b = await session.get(BugReport, bug.id)
                 b.root_cause = judge_verdict.get("final_root_cause", b.root_cause)
-                b.status = "confirmed"
+                b.status = "confirmed" if is_confirmed else "draft"
                 await session.commit()
-            await notify("judge", "success", f"Judge Verdict: {judge_verdict.get('verdict')} - {judge_verdict.get('final_root_cause', '')[:80]}", judge_verdict)
-            return {"agent": "Judge", "status": "success", "bug_id": bug.id, "verdict": judge_verdict}
+            shared["bug_id"] = bug.id
+            shared["judge_verdict"] = judge_verdict
+            if is_confirmed:
+                await notify("judge", "success", f"Judge Verdict: {judge_verdict.get('verdict')} - {judge_verdict.get('final_root_cause', '')[:80]}", judge_verdict)
+            else:
+                await notify("judge", "failed", f"Judge REJECTED root cause: {judge_verdict.get('judge_notes') or judge_verdict.get('final_root_cause', '')}", judge_verdict)
+            return {"agent": "Judge", "status": "success" if is_confirmed else "needs_clarification", "bug_id": bug.id, "verdict": judge_verdict}
 
         if agent_key == "reporter":
-            bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=True)
+            bug = await self._resolve_target_bug(
+                project_id,
+                effective_bug_id,
+                combined_input,
+                create_if_missing=True,
+                prefer_unraised=True,
+                jira_key=jira_key,
+                allow_reported_fallback=False,
+            )
             if not bug:
-                return {"agent": "Reporter", "status": "missing_context", "message": "Please describe the bug or reference a bug # so Reporter can draft the report."}
+                return {"agent": "Reporter", "status": "missing_context", "message": "Please describe the bug or reference a bug # / Jira key so Reporter can draft the report."}
+            user_ev = await self._attach_user_images_as_evidence(bug.id, effective_attachments)
+            det_res = shared.get("detective_result") or {}
+            db_ev_items = [
+                {
+                    "type": ev.type,
+                    "file_path": ev.file_path,
+                    "file_name": ev.file_name,
+                    "stage": ev.stage,
+                    "description": ev.description,
+                }
+                for ev in (bug.evidence or [])
+            ]
+            combined_ev: List[Dict[str, Any]] = []
+            seen_rep_ev = set()
+            for item in db_ev_items + list(shared.get("evidence_list") or []) + list(user_ev or []):
+                k = (item.get("file_path") or "", item.get("file_name") or "")
+                if k in seen_rep_ev:
+                    continue
+                seen_rep_ev.add(k)
+                combined_ev.append(item)
+            ev_items = combined_ev
             bug_data = {
-                "title": bug.title,
-                "description": bug.description or bug_input,
-                "steps_to_reproduce": bug.steps_to_reproduce.splitlines() if bug.steps_to_reproduce else [],
-                "severity": bug.severity or "medium",
-                "label": bug.label or "Front-End",
-                "module": bug.module or "General",
+                "title": det_res.get("title") or bug.title,
+                "environment": det_res.get("environment") or "",
+                "description": det_res.get("description") or bug.description or combined_input,
+                "expected_behavior": det_res.get("expected_behavior") or "",
+                "actual_behavior": det_res.get("actual_behavior") or "",
+                "root_cause": det_res.get("root_cause") or bug.root_cause or "",
+                "steps_to_reproduce": det_res.get("steps_to_reproduce")
+                or (bug.steps_to_reproduce.splitlines() if bug.steps_to_reproduce else []),
+                "severity": det_res.get("severity") or bug.severity or "medium",
+                "label": det_res.get("label") or bug.label or "Front-End",
+                "module": det_res.get("module") or bug.module or "General",
             }
-            judge_verdict = {
+            judge_verdict = shared.get("judge_verdict") or {
                 "final_root_cause": bug.root_cause or bug.description or "Confirmed defect",
                 "judge_notes": "Authored by Reporter via Desk Officer assignment.",
                 "severity_adjustment": bug.severity or "medium",
@@ -505,17 +1025,25 @@ class AgentOrchestrator:
                 project_info=project_info,
                 project_id=project_id,
                 bug_report_id=bug.id,
+                evidence_list=ev_items,
             )
             async with async_session() as session:
                 b = await session.get(BugReport, bug.id)
                 b.formatted_report = formatted_report
                 await session.commit()
+            shared["bug_id"] = bug.id
+            shared["formatted_report"] = formatted_report
             await notify("reporter", "success", "Reporter completed formatted bug report", {"preview": formatted_report[:200]})
             return {"agent": "Reporter", "status": "success", "bug_id": bug.id, "formatted_report": formatted_report}
 
         if agent_key == "sheriff":
             bug = await self._resolve_target_bug(
-                project_id, bug_report_id, bug_input, create_if_missing=False, prefer_unraised=True
+                project_id,
+                effective_bug_id,
+                combined_input,
+                create_if_missing=False,
+                prefer_unraised=True,
+                jira_key=None,
             )
             if not bug:
                 return {
@@ -523,20 +1051,71 @@ class AgentOrchestrator:
                     "status": "missing_context",
                     "message": "There is no confirmed bug report ready to raise yet. Say **\"Create a bug report\"** first so the main workflow can investigate, capture evidence, and draft the report — then Sheriff will raise it to Jira **Backlog**.",
                 }
-            ticket_result = await self.raise_jira_ticket(bug_report_id=bug.id, broadcast_callback=broadcast_callback)
+            ticket_result = await self.raise_jira_ticket(
+                bug_report_id=bug.id,
+                broadcast_callback=broadcast_callback,
+                force_new=bool(force_new or shared.get("force_new_ticket")),
+                target_project_key=target_project_key or shared.get("target_project_key"),
+            )
+            shared["bug_id"] = bug.id
+            if ticket_result.get("error") or not ticket_result.get("key"):
+                return {
+                    "agent": "Sheriff",
+                    "status": "failed",
+                    "bug_id": bug.id,
+                    "message": ticket_result.get("error") or "Sheriff failed to create Jira ticket.",
+                    "jira_ticket": ticket_result,
+                }
             return {"agent": "Sheriff", "status": "success", "bug_id": bug.id, "jira_ticket": ticket_result}
 
         if agent_key == "watcher":
-            bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=False)
-            if not bug:
-                return {"agent": "Watcher", "status": "missing_context", "message": "No tracked bug report found to retest yet."}
-            result = await self.retest_and_sanity_pipeline(bug_report_id=bug.id, broadcast_callback=broadcast_callback)
-            return {"agent": "Watcher", "status": "success", "bug_id": bug.id, "result": result}
+            wants_sweep = (
+                not effective_bug_id
+                and not jira_key
+                and any(
+                    kw in (combined_input or "").lower()
+                    for kw in ("scan", "sweep", "audit", "everything", "all module", "all agent", "all log", "health", "monitor")
+                )
+            )
+            if not wants_sweep:
+                bug = await self._resolve_target_bug(
+                    project_id,
+                    effective_bug_id,
+                    combined_input,
+                    create_if_missing=False,
+                    jira_key=jira_key,
+                    allow_reported_fallback=bool(effective_bug_id or jira_key or "retest" in (combined_input or "").lower()),
+                )
+                if bug and (effective_bug_id or jira_key or "retest" in (combined_input or "").lower()):
+                    shared["bug_id"] = bug.id
+                    result = await self.retest_and_sanity_pipeline(
+                        bug_report_id=bug.id,
+                        broadcast_callback=broadcast_callback,
+                        update_jira=update_jira,
+                    )
+                    return {"agent": "Watcher", "status": "success", "mode": "retest", "bug_id": bug.id, "result": result}
+
+            await notify("watcher", "running", "Watcher is running a system-wide sweep across all modules, AI agents, and logs...")
+            sweep_res = await self.watcher.run_full_system_sweep(
+                jira_settings=self.jira_settings,
+                project_id=project_id,
+                include_app_health=True,
+                notify=True,
+            )
+            await notify("watcher", "success", sweep_res.get("summary", "Watcher system-wide sweep completed."), sweep_res)
+            return {"agent": "Watcher", "status": "success", "mode": "full_sweep", "sweep": sweep_res}
 
         if agent_key == "sanity":
-            bug = await self._resolve_target_bug(project_id, bug_report_id, bug_input, create_if_missing=False)
+            bug = await self._resolve_target_bug(
+                project_id,
+                effective_bug_id,
+                combined_input,
+                create_if_missing=False,
+                jira_key=jira_key,
+            )
             if not bug:
-                return {"agent": "Sanity Testers", "status": "missing_context", "message": "No tracked bug report found to run sanity regression checks against."}
+                return {"agent": "Sanity Testers", "status": "missing_context", "message": "No tracked bug report or Jira ticket found to run sanity regression checks against."}
+            shared["bug_id"] = bug.id
             await notify("sanity", "running", f"Sanity Testers checking impacted modules around Bug #{bug.id}...")
             sanity_result = await self.sanity_tester.run_sanity_checks(
                 resolved_bug=bug.to_dict(),
@@ -564,9 +1143,12 @@ class AgentOrchestrator:
                     include_sheriff=False,
                 )
                 reports.append(res)
+            if reports:
+                shared["bug_id"] = reports[-1]["bug_id"]
             return {
                 "agent": "Auto-Test",
                 "status": "success",
+                "bug_id": shared.get("bug_id"),
                 "discovered_count": len(discovered),
                 "processed_count": len(reports),
                 "reports": reports,
@@ -574,10 +1156,152 @@ class AgentOrchestrator:
 
         return {"agent": target_agent, "status": "unknown", "message": f"Unknown agent '{target_agent}'."}
 
+    async def organize_agents(
+        self,
+        project_id: int,
+        plan_steps: List[Any],
+        default_bug_input: str = "",
+        default_bug_id: Optional[int] = None,
+        default_jira_key: Optional[str] = None,
+        allow_sheriff: bool = False,
+        update_jira: bool = True,
+        default_force_new: bool = False,
+        default_jira_project_key: Optional[str] = None,
+        broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Organize and sequentially execute a custom multi-agent plan coordinated by Desk Officer.
+
+        Strict guardrail: Sheriff is filtered out unless ``allow_sheriff=True`` was explicitly requested.
+        """
+        start_time = datetime.utcnow()
+        notify = await self._make_notifier(broadcast_callback)
+        roster_names = {a["key"]: a["name"] for a in AGENT_ROSTER}
+        roster_names["auto_test"] = "Auto-Test Discovery"
+
+        normalized_steps: List[Dict[str, Any]] = []
+        blocked_agents: List[str] = []
+
+        for raw_step in plan_steps or []:
+            if isinstance(raw_step, str):
+                step = {"agent": raw_step.lower().strip(), "goal": ""}
+            elif isinstance(raw_step, dict):
+                step = {
+                    "agent": str(raw_step.get("agent") or raw_step.get("target_agent") or "").lower().strip(),
+                    "goal": str(raw_step.get("goal") or "").strip(),
+                    "bug_report_id": raw_step.get("bug_report_id"),
+                    "jira_key": raw_step.get("jira_key"),
+                }
+            else:
+                continue
+
+            akey = step["agent"]
+            if akey not in roster_names:
+                continue
+            if akey == "sheriff" and not allow_sheriff:
+                blocked_agents.append("sheriff")
+                continue
+            normalized_steps.append(step)
+
+        shared_state: Dict[str, Any] = {}
+        if default_bug_id:
+            shared_state["bug_id"] = default_bug_id
+        if default_force_new:
+            shared_state["force_new_ticket"] = True
+        if default_jira_project_key:
+            shared_state["target_project_key"] = default_jira_project_key
+        if attachments:
+            shared_state["attachments"] = attachments
+
+        steps_executed: List[Dict[str, Any]] = []
+        total = len(normalized_steps)
+
+        for idx, step in enumerate(normalized_steps, start=1):
+            akey = step["agent"]
+            alabel = roster_names.get(akey, akey.title())
+            goal_note = f" — {step['goal']}" if step.get("goal") else ""
+            await notify(
+                "desk_officer",
+                "running",
+                f"Organizing team step {idx}/{total}: assigning {alabel}{goal_note}",
+            )
+
+            res = await self.dispatch_agent(
+                target_agent=akey,
+                project_id=project_id,
+                bug_input=default_bug_input,
+                bug_report_id=step.get("bug_report_id") or shared_state.get("bug_id") or default_bug_id,
+                broadcast_callback=broadcast_callback,
+                jira_key=step.get("jira_key") or default_jira_key,
+                goal=step.get("goal", ""),
+                shared_state=shared_state,
+                update_jira=update_jira,
+                force_new=default_force_new,
+                target_project_key=default_jira_project_key,
+                attachments=attachments,
+            )
+            if res.get("bug_id"):
+                shared_state["bug_id"] = res["bug_id"]
+
+            steps_executed.append({
+                "step": idx,
+                "agent": akey,
+                "agent_name": res.get("agent") or alabel,
+                "goal": step.get("goal", ""),
+                "status": res.get("status", "success"),
+                "bug_id": res.get("bug_id") or shared_state.get("bug_id"),
+                "data": res,
+            })
+
+        sheriff_invoked = any(s["agent"] == "sheriff" and s["status"] == "success" for s in steps_executed)
+        if not sheriff_invoked:
+            await notify(
+                "sheriff",
+                "idle",
+                "Standing by — Sheriff will raise to Jira Backlog only when requested.",
+                {"bug_id": shared_state.get("bug_id")},
+            )
+
+        await notify(
+            "desk_officer",
+            "success",
+            f"Completed organized {len(steps_executed)}-agent execution plan.",
+            {"steps": [s["agent"] for s in steps_executed], "bug_id": shared_state.get("bug_id")},
+        )
+
+        await self.desk_officer.log_action(
+            action="desk_officer_organize_agents",
+            input_data={
+                "project_id": project_id,
+                "requested_steps": [s["agent"] for s in normalized_steps],
+                "allow_sheriff": allow_sheriff,
+            },
+            output_data={
+                "bug_id": shared_state.get("bug_id"),
+                "steps_executed": [s["agent"] for s in steps_executed],
+                "blocked_agents": blocked_agents,
+                "sheriff_invoked": sheriff_invoked,
+            },
+            status="success",
+            bug_report_id=shared_state.get("bug_id"),
+            project_id=project_id,
+            started_at=start_time,
+        )
+
+        return {
+            "status": "success" if steps_executed else "noop",
+            "bug_id": shared_state.get("bug_id"),
+            "jira_key": default_jira_key,
+            "steps_executed": steps_executed,
+            "blocked_agents": blocked_agents,
+            "sheriff_invoked": sheriff_invoked,
+        }
+
     async def retest_and_sanity_pipeline(
         self,
         bug_report_id: int,
         broadcast_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        update_jira: bool = True,
     ) -> Dict[str, Any]:
         """Triggered when ticket moves to 'In QA': Retests bug, transitions, and runs Sanity Testers."""
         notify = await self._make_notifier(broadcast_callback)
@@ -588,6 +1312,7 @@ class AgentOrchestrator:
             bug_report_id=bug_report_id,
             jira_settings=self.jira_settings,
             force_status="In QA",
+            update_jira=update_jira,
         )
 
         is_resolved = retest_outcome.get("is_resolved", False)
@@ -614,7 +1339,13 @@ class AgentOrchestrator:
                 bug_report_id=bug_report_id,
             )
 
-            await notify("sanity", "success", f"Sanity Testing complete: {sanity_result.get('summary')}", sanity_result)
+            regression = bool(sanity_result.get("regression_detected") or str(sanity_result.get("overall_status")).upper() == "FAILED")
+            await notify(
+                "sanity",
+                "failed" if regression else "success",
+                f"Sanity Testing complete: {sanity_result.get('summary')}",
+                sanity_result,
+            )
             return {
                 "retest": retest_outcome,
                 "sanity": sanity_result,

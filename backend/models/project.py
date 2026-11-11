@@ -15,6 +15,7 @@ class Project(Base):
     app_url = Column(String(500), nullable=True)
     repo_url = Column(String(500), nullable=True)
     description = Column(Text, nullable=True)
+    report_format = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
@@ -30,6 +31,6 @@ class Project(Base):
             "app_url": self.app_url,
             "repo_url": self.repo_url,
             "description": self.description,
+            "report_format": self.report_format,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
-

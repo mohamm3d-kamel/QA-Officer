@@ -1,4 +1,4 @@
-"""Agent Log model - tracks all agent actions for the logs page."""
+"""Agent Log model - tracks all agent actions, module telemetry, and system events."""
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
@@ -16,6 +16,11 @@ class AgentLog(Base):
     input_data = Column(Text, nullable=True)
     output_data = Column(Text, nullable=True)
     status = Column(String(20), default="running")  # running, success, failed
+    module = Column(String(120), nullable=True)
+    category = Column(String(50), nullable=True)  # agent_action, system_change, status_change, module_health, jira_sync, error, notification_delivery, watcher_sweep
+    level = Column(String(20), nullable=True)  # info, success, change, warning, error
+    jira_key = Column(String(50), nullable=True)
+    notified_channels = Column(String(120), nullable=True)
     started_at = Column(DateTime, default=datetime.utcnow)
     finished_at = Column(DateTime, nullable=True)
 
@@ -32,7 +37,11 @@ class AgentLog(Base):
             "input_data": self.input_data,
             "output_data": self.output_data,
             "status": self.status,
+            "module": self.module,
+            "category": self.category,
+            "level": self.level,
+            "jira_key": self.jira_key,
+            "notified_channels": self.notified_channels,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
         }
-

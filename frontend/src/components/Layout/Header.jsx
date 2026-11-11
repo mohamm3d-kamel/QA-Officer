@@ -1,18 +1,20 @@
 import { useLocation } from 'react-router-dom';
-import { Bell, Search } from 'lucide-react';
+import { Bell, Eye } from 'lucide-react';
 import useAppStore from '../../store/appStore';
 import { useState, useRef, useEffect } from 'react';
 
 const pageTitles = {
   '/': 'Dashboard',
   '/projects': 'Projects',
-  '/logs': 'Agent Logs',
+  '/logs': 'Watcher & Agent Logs',
   '/settings': 'Settings',
 };
 
 export default function Header() {
   const location = useLocation();
   const notifications = useAppStore((s) => s.notifications);
+  const clearNotifications = useAppStore((s) => s.clearNotifications);
+  const wsConnected = useAppStore((s) => s.wsConnected);
   const [showNotifs, setShowNotifs] = useState(false);
   const notifRef = useRef(null);
 
@@ -41,11 +43,30 @@ export default function Header() {
       </div>
 
       <div className="flex items-center gap-3">
+        {/* Live Watcher Telemetry Status */}
+        <div
+          className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-medium ${
+            wsConnected
+              ? 'bg-emerald-950/60 border-emerald-800/70 text-emerald-300'
+              : 'bg-slate-900 border-slate-700 text-slate-400'
+          }`}
+          title="Watcher real-time WebSocket stream"
+        >
+          <Eye className="w-3.5 h-3.5" />
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${
+              wsConnected ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
+            }`}
+          />
+          <span>{wsConnected ? 'Watcher Live' : 'Reconnecting...'}</span>
+        </div>
+
         {/* Notifications */}
         <div className="relative" ref={notifRef}>
           <button
             onClick={() => setShowNotifs(!showNotifs)}
             className="relative p-2 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-700/50 transition-colors"
+            title="Watcher Alerts & Notifications"
           >
             <Bell className="w-5 h-5" />
             {unread > 0 && (
@@ -56,9 +77,17 @@ export default function Header() {
           </button>
 
           {showNotifs && (
-            <div className="absolute right-0 top-full mt-2 w-80 max-h-96 overflow-y-auto glass-card shadow-2xl z-50 animate-fade-in">
-              <div className="p-3 border-b border-slate-700/50">
-                <h3 className="text-sm font-semibold text-white">Notifications</h3>
+            <div className="absolute right-0 top-full mt-2 w-96 max-h-96 overflow-y-auto glass-card shadow-2xl z-50 animate-fade-in">
+              <div className="p-3 border-b border-slate-700/50 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white">Watcher Notifications</h3>
+                {notifications.length > 0 && (
+                  <button
+                    onClick={clearNotifications}
+                    className="text-[11px] text-cyan-400 hover:underline"
+                  >
+                    Clear
+                  </button>
+                )}
               </div>
               {notifications.length === 0 ? (
                 <div className="p-6 text-center text-slate-500 text-sm">
@@ -66,7 +95,7 @@ export default function Header() {
                 </div>
               ) : (
                 <div className="divide-y divide-slate-700/30">
-                  {notifications.slice(0, 20).map((n) => (
+                  {notifications.slice(0, 25).map((n) => (
                     <div key={n.id} className="p-3 hover:bg-slate-700/30 transition-colors">
                       <div className="flex items-start gap-2">
                         <span
@@ -80,12 +109,14 @@ export default function Header() {
                               : 'bg-blue-400'
                           }`}
                         />
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium text-white truncate">{n.title}</p>
-                          <p className="text-xs text-slate-400 mt-0.5">{n.message}</p>
-                          <p className="text-[10px] text-slate-500 mt-1">
-                            {new Date(n.timestamp).toLocaleTimeString()}
-                          </p>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-semibold text-white truncate">{n.title}</p>
+                          <p className="text-xs text-slate-300 mt-0.5">{n.message}</p>
+                          <div className="flex items-center gap-2 text-[10px] text-slate-500 mt-1">
+                            <span>{new Date(n.timestamp).toLocaleTimeString()}</span>
+                            {n.module && <span>· {n.module}</span>}
+                            {n.jira_key && <span>· {n.jira_key}</span>}
+                          </div>
                         </div>
                       </div>
                     </div>

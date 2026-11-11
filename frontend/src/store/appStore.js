@@ -42,6 +42,59 @@ const useAppStore = create((set, get) => ({
       }
       return { messages: msgs };
     }),
+  upsertStreamChunk: (streamId, delta) =>
+    set((s) => {
+      if (!streamId || !delta) return s;
+      const idx = s.messages.findIndex((m) => m.streamId === streamId);
+      if (idx === -1) {
+        return {
+          messages: [
+            ...s.messages,
+            {
+              id: streamId,
+              streamId,
+              sender: 'agent',
+              agent: 'Desk Officer',
+              content: delta,
+              isStreaming: true,
+              timestamp: new Date().toISOString(),
+            },
+          ],
+        };
+      }
+      const msgs = [...s.messages];
+      msgs[idx] = {
+        ...msgs[idx],
+        content: (msgs[idx].content || '') + delta,
+        isStreaming: true,
+      };
+      return { messages: msgs };
+    }),
+  finalizeStreamMessage: (streamId, finalMessage) =>
+    set((s) => {
+      const idx = streamId ? s.messages.findIndex((m) => m.streamId === streamId) : -1;
+      if (idx === -1) {
+        return {
+          messages: [...s.messages, { ...finalMessage, isStreaming: false }],
+        };
+      }
+      const msgs = [...s.messages];
+      msgs[idx] = {
+        ...msgs[idx],
+        ...finalMessage,
+        isStreaming: false,
+      };
+      return { messages: msgs };
+    }),
+  endStreamIndicator: (streamId) =>
+    set((s) => {
+      if (!streamId) return s;
+      return {
+        messages: s.messages.map((m) =>
+          m.streamId === streamId ? { ...m, isStreaming: false } : m
+        ),
+      };
+    }),
 
   // Agent statuses
   agentStatuses: {},
@@ -65,9 +118,23 @@ const useAppStore = create((set, get) => ({
   bugs: [],
   setBugs: (bugs) => set({ bugs }),
 
-  // Logs
+  // Logs & Watcher Telemetry
   logs: [],
   setLogs: (logs) => set({ logs }),
+  wsConnected: false,
+  setWsConnected: (wsConnected) => set({ wsConnected }),
+  watcherEvents: [],
+  addWatcherEvent: (event) =>
+    set((s) => {
+      if (!event) return s;
+      const filtered = event.id
+        ? s.watcherEvents.filter((e) => e.id !== event.id)
+        : s.watcherEvents;
+      return {
+        watcherEvents: [event, ...filtered].slice(0, 120),
+      };
+    }),
+  clearWatcherEvents: () => set({ watcherEvents: [] }),
 
   // Notifications
   notifications: [],

@@ -1,6 +1,19 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Bot, PieChart, SidebarClose, SidebarOpen, RefreshCw, ArrowUpRight } from 'lucide-react';
+import {
+  Bot,
+  PieChart,
+  SidebarClose,
+  SidebarOpen,
+  RefreshCw,
+  ArrowUpRight,
+  Sparkles,
+  AlertCircle,
+  RotateCcw,
+  Upload,
+  SlidersHorizontal,
+} from 'lucide-react';
+import toast from 'react-hot-toast';
 import useAppStore from '../store/appStore';
 import api from '../services/api';
 import useWebSocket from '../hooks/useWebSocket';
@@ -10,6 +23,29 @@ import InputArea from '../components/Chat/InputArea';
 import AgentStatus from '../components/Chat/AgentStatus';
 import SkillPanel from '../components/Chat/SkillPanel';
 import AutoTestModal from '../components/Chat/AutoTestModal';
+import ProjectForm from '../components/Projects/ProjectForm';
+
+function buildWelcomeMessage(projectName) {
+  return {
+    id: 'init-1',
+    sender: 'agent',
+    agent: 'Desk Officer',
+    content:
+      `👋 Hello **Mohamed Kamel**! I am your **Desk Officer** AI assistant for **${projectName}**.\n\n` +
+      `- I have live access to all project assets: **Jira Cloud boards & issues, stored skills, bug reports, visual evidence, agent logs, and target app inspection**.\n` +
+      `- You can **attach, drag-and-drop, or paste (\`Ctrl+V\`) screenshots, images, PDFs, Word/Excel/PowerPoint docs, HAR network traces, logs, JSON, CSV, or code files** — I will analyze them visually & structurally.\n` +
+      `- I know all built-in agents (**Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers**) and can assign any individual agent or **organize a custom multi-agent sequence** whenever you ask.\n` +
+      `- Say **"Create a bug report"** when you're ready for the main workflow (**Detective → Coroner → Judge → Reporter**).\n` +
+      `- **Sheriff** stays on standby until you explicitly ask to raise the ticket — and when raised, it always lands in Jira **Backlog**.`,
+    suggested_actions: [
+      'Check my Jira In QA list',
+      'Show all project assets and built-in agents',
+      'Organize Detective, Coroner, and Reporter for a bug',
+      'Run Auto-Test discovery',
+    ],
+    timestamp: new Date().toISOString(),
+  };
+}
 
 export default function ChatPage() {
   const { projectId } = useParams();
@@ -20,106 +56,141 @@ export default function ChatPage() {
   const setSkills = useAppStore((s) => s.setSkills);
   const setBugs = useAppStore((s) => s.setBugs);
   const bugs = useAppStore((s) => s.bugs);
-  const messages = useAppStore((s) => s.messages);
   const setMessages = useAppStore((s) => s.setMessages);
   const addMessage = useAppStore((s) => s.addMessage);
+  const finalizeStreamMessage = useAppStore((s) => s.finalizeStreamMessage);
   const setChatLoading = useAppStore((s) => s.setChatLoading);
 
   const [isAutoTestOpen, setIsAutoTestOpen] = useState(false);
+  const [isProjectConfigOpen, setIsProjectConfigOpen] = useState(false);
   const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [raisingBugId, setRaisingBugId] = useState(null);
+  const [llmStatus, setLlmStatus] = useState(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [droppedFiles, setDroppedFiles] = useState([]);
 
-  // Initialize WebSocket for live updates
   const { isConnected } = useWebSocket();
 
-  // Load project details, skills, and bugs
+  const refreshLlmStatus = useCallback(async () => {
+    try {
+      const status = await api.getLlmStatus();
+      setLlmStatus(status);
+    } catch (err) {
+      console.error('Failed to check LLM status:', err);
+    }
+  }, []);
+
+  // Load project details, skills, bugs, persisted chat history, and AI status
   useEffect(() => {
     async function loadProjectContext() {
       try {
-        const proj = await api.getProject(projectId);
+        const [proj, projectSkills, projectBugs, history, aiStatus] = await Promise.all([
+          api.getProject(projectId),
+          api.getSkills(projectId),
+          api.getBugs(projectId),
+          api.getChatHistory(projectId),
+          api.getLlmStatus().catch(() => null),
+        ]);
+
         setSelectedProject(proj);
-
-        const projectSkills = await api.getSkills(projectId);
         setSkills(projectSkills);
-
-        const projectBugs = await api.getBugs(projectId);
         setBugs(projectBugs);
+        if (aiStatus) setLlmStatus(aiStatus);
 
-        // Seed Desk Officer welcome greeting if empty
-        if (messages.length === 0) {
-          setMessages([
-            {
-              id: 'init-1',
-              sender: 'agent',
-              agent: 'Desk Officer',
-              content:
-                `👋 Hello **Mohamed Kamel**! I am your **Desk Officer** for **${proj.name}**.\n\n` +
-                `- Let's discuss any bug details here first before starting the workflow (feel free to share symptoms, logs, steps, or ask about our built-in agents).\n` +
-                `- I know all built-in agents (**Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers**) and can assign any of them to start working on request.\n` +
-                `- Say **"Create a bug report"** when you're ready to run the main workflow (**Detective → Coroner → Judge → Reporter**).\n` +
-                `- **Sheriff** stays on standby until you explicitly ask to raise the ticket — and when raised, it goes into Jira **Backlog** (not To Do).`,
-              timestamp: new Date().toISOString(),
-            },
-          ]);
+        if (Array.isArray(history) && history.length > 0) {
+          setMessages(history);
+        } else {
+          setMessages([buildWelcomeMessage(proj.name)]);
         }
       } catch (err) {
         console.error('Failed to load project context:', err);
       }
     }
     if (projectId) loadProjectContext();
-  }, [projectId, setSelectedProject, setSkills, setBugs]);
+  }, [projectId, setSelectedProject, setSkills, setBugs, setMessages]);
 
   const handleSendMessage = async (text, attachments = []) => {
+    const cleanText = (text || '').trim();
+    if (!cleanText && attachments.length === 0) return;
+
     const historyPayload = useAppStore
       .getState()
-      .messages.filter((m) => !m.isStatus && m.content)
-      .slice(-14)
+      .messages.filter(
+        (m) => !m.isStatus && !m.isStreaming && (m.content || (Array.isArray(m.attachments) && m.attachments.length > 0))
+      )
+      .slice(-16)
       .map((m) => ({
         role: m.role,
         sender: m.sender,
         agent: m.agent,
-        content: m.content,
+        content: m.content || '',
+        ...(Array.isArray(m.attachments) && m.attachments.length > 0
+          ? {
+              attachments: m.attachments.map((a) => ({
+                stored_name: a.stored_name,
+                name: a.name,
+                mime_type: a.mime_type,
+                size_bytes: a.size_bytes,
+                is_image: a.is_image,
+                is_pdf: a.is_pdf,
+                width: a.width,
+                height: a.height,
+                page_count: a.page_count,
+                url: a.url,
+                summary: a.summary,
+                highlights: a.highlights,
+                extracted_text: a.extracted_text,
+              })),
+            }
+          : {}),
       }));
 
-    // Add user message
     const userMsg = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       sender: 'user',
-      content: text,
+      content: cleanText,
       attachments,
       timestamp: new Date().toISOString(),
     };
     addMessage(userMsg);
     setChatLoading(true);
 
+    const streamId = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
     try {
       const res = await api.sendMessage({
         project_id: parseInt(projectId),
-        message: text,
+        message: cleanText,
         attachments,
         history: historyPayload,
+        stream_id: streamId,
       });
 
-      // Add Desk Officer response message
-      addMessage({
+      finalizeStreamMessage(streamId, {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        streamId,
         sender: 'agent',
         agent: res.agent || 'Desk Officer',
         content: res.response,
         pipeline_result: res.pipeline_result,
+        suggested_actions: res.suggested_actions,
+        llm_mode: res.llm_mode,
+        llm_notice: res.llm_notice,
         timestamp: new Date().toISOString(),
       });
 
-      // Refresh bugs & skills lists
-      const [updatedBugs, updatedSkills] = await Promise.all([
+      const [updatedProject, updatedBugs, updatedSkills] = await Promise.all([
+        api.getProject(projectId),
         api.getBugs(projectId),
         api.getSkills(projectId),
       ]);
+      setSelectedProject(updatedProject);
       setBugs(updatedBugs);
       setSkills(updatedSkills);
+      refreshLlmStatus();
     } catch (err) {
       console.error('Failed to send message:', err);
-      addMessage({
+      finalizeStreamMessage(streamId, {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         sender: 'agent',
         agent: 'Desk Officer',
@@ -131,6 +202,16 @@ export default function ChatPage() {
     }
   };
 
+  const handleClearChat = async () => {
+    try {
+      await api.clearChatHistory(projectId);
+      setMessages([buildWelcomeMessage(selectedProject?.name || 'this project')]);
+      toast.success('Started a fresh Desk Officer chat');
+    } catch (err) {
+      toast.error('Could not clear chat history');
+    }
+  };
+
   const handleRaiseToJira = async (bugId) => {
     setRaisingBugId(bugId);
     try {
@@ -138,15 +219,32 @@ export default function ChatPage() {
       const updatedBugs = await api.getBugs(projectId);
       setBugs(updatedBugs);
       const ticket = res.jira_ticket;
+      const attachedFiles = ticket?.evidence_attached || [];
+      const attachedCount = ticket?.attached_count ?? attachedFiles.length;
+      const evSummary =
+        attachedCount > 0
+          ? ` with ${attachedCount} evidence file(s)${attachedFiles.length ? ` (${attachedFiles.join(', ')})` : ''}`
+          : '';
+      const syncDetail = ticket?.newly_attached?.length
+        ? ` — synced ${ticket.newly_attached.length} missing file(s)`
+        : '';
+      const warnDetail = ticket?.attachment_warning
+        ? `\n⚠️ ${ticket.attachment_warning}`
+        : '';
+      toast.success(`Raised Bug #${bugId} -> ${ticket?.key}${evSummary}`);
+      if (ticket?.attachment_warning) {
+        toast.error(ticket.attachment_warning);
+      }
       addMessage({
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         sender: 'agent',
         agent: 'Sheriff',
-        content: `🏷️ Raised Bug #${bugId} to Jira **${ticket?.status || 'Backlog'}**: [${ticket?.key}](${ticket?.url})`,
+        content: `🏷️ Raised Bug #${bugId} to Jira **${ticket?.status || 'Backlog'}**: [${ticket?.key}](${ticket?.url})${evSummary}${syncDetail}${warnDetail}`,
         timestamp: new Date().toISOString(),
       });
     } catch (err) {
       console.error('Raise to Jira error:', err);
+      toast.error(err?.message || `Failed to raise Bug #${bugId} to Jira`);
     } finally {
       setRaisingBugId(null);
     }
@@ -177,11 +275,58 @@ export default function ChatPage() {
             </span>
             <div className="flex items-center gap-1.5 text-xs text-slate-500">
               <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-red-500'}`} />
-              <span>{isConnected ? 'Real-time WebSocket Active' : 'Connecting...'}</span>
+              <span>{isConnected ? 'Live' : 'Connecting...'}</span>
             </div>
+            {llmStatus && (
+              <button
+                onClick={() => navigate('/settings')}
+                title={llmStatus.configured ? 'Live LLM Engine Active' : llmStatus.issue || 'Configure LLM API key or Ollama'}
+                className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium border transition-colors ${
+                  llmStatus.configured
+                    ? 'bg-emerald-950/60 border-emerald-800/60 text-emerald-300 hover:bg-emerald-950'
+                    : 'bg-amber-950/60 border-amber-800/60 text-amber-300 hover:bg-amber-900/60'
+                }`}
+              >
+                {llmStatus.configured ? (
+                  <Sparkles className="w-3 h-3" />
+                ) : (
+                  <AlertCircle className="w-3 h-3" />
+                )}
+                <span>
+                  {llmStatus.configured
+                    ? `${llmStatus.provider} · ${llmStatus.model}`
+                    : 'AI Offline · Setup LLM'}
+                </span>
+              </button>
+            )}
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setIsProjectConfigOpen(true)}
+              title={
+                selectedProject?.report_format
+                  ? 'Project Configuration (Custom Report Format active)'
+                  : 'Project Configuration & Report Format'
+              }
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-all border border-slate-700"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden lg:inline">Project Config</span>
+              {selectedProject?.report_format && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+              )}
+            </button>
+
+            <button
+              onClick={handleClearChat}
+              title="Start New Conversation"
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-all border border-slate-700"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">New Chat</span>
+            </button>
+
             <button
               onClick={() => setIsAutoTestOpen(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-cyan-600/20 hover:bg-cyan-600 text-cyan-400 hover:text-white border border-cyan-800/50 text-xs font-semibold transition-all shadow"
@@ -208,13 +353,64 @@ export default function ChatPage() {
           </div>
         </div>
 
+        {/* Helpful AI Setup Banner when no LLM API key is configured */}
+        {llmStatus && !llmStatus.configured && (
+          <div className="px-6 py-2 bg-amber-950/40 border-b border-amber-800/40 flex items-center justify-between gap-3 text-xs text-amber-200">
+            <span>
+              <strong>Offline Triage Mode:</strong> Add an OpenAI, Gemini, Anthropic, OpenRouter key or enable local Ollama in Settings for full generative AI chat.
+            </span>
+            <button
+              onClick={() => navigate('/settings')}
+              className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-600/40 text-amber-200 font-semibold whitespace-nowrap"
+            >
+              Open Settings →
+            </button>
+          </div>
+        )}
+
         {/* Chat Window */}
-        <div className="flex-1 overflow-hidden flex flex-col">
-          <ChatWindow />
+        <div
+          className="flex-1 overflow-hidden flex flex-col relative"
+          onDragOver={(e) => {
+            if (e.dataTransfer?.types?.includes('Files')) {
+              e.preventDefault();
+              setIsDraggingFile(true);
+            }
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget)) {
+              setIsDraggingFile(false);
+            }
+          }}
+          onDrop={(e) => {
+            if (e.dataTransfer?.files?.length) {
+              e.preventDefault();
+              setIsDraggingFile(false);
+              setDroppedFiles(Array.from(e.dataTransfer.files));
+            }
+          }}
+        >
+          {isDraggingFile && (
+            <div className="absolute inset-3 z-20 rounded-2xl border-2 border-dashed border-cyan-400 bg-slate-950/90 backdrop-blur-sm flex flex-col items-center justify-center gap-3 pointer-events-none">
+              <div className="w-14 h-14 rounded-2xl bg-cyan-500/15 border border-cyan-400/40 flex items-center justify-center">
+                <Upload className="w-7 h-7 text-cyan-400" />
+              </div>
+              <div className="text-sm font-semibold text-cyan-200">
+                Drop images, screenshots, PDFs, Office docs, HAR captures, or log files
+              </div>
+              <div className="text-xs text-slate-400">
+                Desk Officer will analyze them automatically (up to 20 MB per file)
+              </div>
+            </div>
+          )}
+          <ChatWindow onSuggestionClick={(suggested) => handleSendMessage(suggested)} />
           <InputArea
+            projectId={projectId}
             onSendMessage={handleSendMessage}
             onOpenAutoTest={() => setIsAutoTestOpen(true)}
             onOpenSummary={() => navigate(`/summary/${projectId}`)}
+            droppedFiles={droppedFiles}
+            onClearDroppedFiles={() => setDroppedFiles([])}
           />
         </div>
       </div>
@@ -222,13 +418,9 @@ export default function ChatPage() {
       {/* Right Sidebar: Pipeline + Stored Skills + Tracked Bugs */}
       {rightSidebarOpen && (
         <div className="w-96 border-l border-slate-800 bg-slate-900/90 overflow-y-auto p-4 space-y-5 animate-in slide-in-from-right duration-200">
-          {/* Agent Pipeline Stepper */}
           <AgentStatus />
-
-          {/* Stored Skills (Requirements & Report Format) */}
           <SkillPanel projectId={projectId} />
 
-          {/* Tracked Defects in this Project */}
           <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 shadow-lg backdrop-blur">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold text-slate-200">Tracked Defects ({bugs.length})</h3>
@@ -241,7 +433,12 @@ export default function ChatPage() {
                   No defects logged yet. Chat with Desk Officer or say "Create a bug report".
                 </div>
               ) : (
-                bugs.map((bug) => (
+                bugs.map((bug) => {
+                  const targetProjKey = (selectedProject?.jira_project_key || 'QA').toUpperCase();
+                  const hasRealTargetTicket =
+                    Boolean(bug.jira_ticket_id) &&
+                    new RegExp(`^${targetProjKey}-[1-9]\\d*$`).test(String(bug.jira_ticket_id).toUpperCase());
+                  return (
                   <div
                     key={bug.id}
                     className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800 text-xs space-y-1.5 hover:border-slate-700 transition-colors"
@@ -249,6 +446,9 @@ export default function ChatPage() {
                     <div className="flex items-center justify-between">
                       <span className="font-mono font-bold text-cyan-400">
                         {bug.jira_ticket_id || `Report #${bug.id}`}
+                        {bug.jira_ticket_id && !hasRealTargetTicket && (
+                          <span className="ml-1.5 text-[9px] font-normal text-amber-400">(unraised in {targetProjKey})</span>
+                        )}
                       </span>
                       <span
                         className={`text-[9px] uppercase font-semibold px-1.5 py-0.5 rounded ${
@@ -266,16 +466,26 @@ export default function ChatPage() {
                     </div>
                     <p className="font-medium text-slate-200 line-clamp-1">{bug.title}</p>
                     <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/60 text-[10px] text-slate-500">
-                      <span>{bug.label || 'Front-End'}</span>
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span className="truncate">{bug.label || 'Front-End'}</span>
+                        {(bug.evidence?.length || 0) > 0 && (
+                          <span
+                            title={`${bug.evidence.length} Coroner evidence file(s) collected`}
+                            className="px-1.5 py-0.5 rounded bg-purple-950/70 text-purple-300 border border-purple-800/60 font-mono whitespace-nowrap"
+                          >
+                            📸 {bug.evidence.length}
+                          </span>
+                        )}
+                      </div>
                       <div className="flex items-center gap-2">
-                        {!bug.jira_ticket_id && bug.status !== 'resolved' && (
+                        {!hasRealTargetTicket && bug.status !== 'resolved' && (
                           <button
                             onClick={() => handleRaiseToJira(bug.id)}
                             disabled={raisingBugId === bug.id}
                             className="text-blue-400 hover:underline font-semibold flex items-center gap-0.5 disabled:opacity-50"
                           >
                             <ArrowUpRight className="w-2.5 h-2.5" />
-                            <span>{raisingBugId === bug.id ? 'Raising...' : 'Raise to Backlog'}</span>
+                            <span>{raisingBugId === bug.id ? 'Raising...' : `Raise to ${targetProjKey} Backlog`}</span>
                           </button>
                         )}
                         {bug.status !== 'resolved' && (
@@ -290,14 +500,14 @@ export default function ChatPage() {
                       </div>
                     </div>
                   </div>
-                ))
+                );
+                })
               )}
             </div>
           </div>
         </div>
       )}
 
-      {/* Auto-Test Modal */}
       <AutoTestModal
         isOpen={isAutoTestOpen}
         onClose={() => setIsAutoTestOpen(false)}
@@ -306,6 +516,12 @@ export default function ChatPage() {
           const updatedBugs = await api.getBugs(projectId);
           setBugs(updatedBugs);
         }}
+      />
+
+      <ProjectForm
+        isOpen={isProjectConfigOpen}
+        onClose={() => setIsProjectConfigOpen(false)}
+        initialData={selectedProject}
       />
     </div>
   );

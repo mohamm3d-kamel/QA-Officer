@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { BookOpen, Plus, Trash2, FileText, CheckCircle, Upload } from 'lucide-react';
+import { BookOpen, Plus, Trash2 } from 'lucide-react';
 import useAppStore from '../../store/appStore';
 import api from '../../services/api';
 
@@ -7,6 +7,8 @@ export default function SkillPanel({ projectId }) {
   const skills = useAppStore((s) => s.skills);
   const addSkill = useAppStore((s) => s.addSkill);
   const removeSkill = useAppStore((s) => s.removeSkill);
+  const setSelectedProject = useAppStore((s) => s.setSelectedProject);
+  const updateProject = useAppStore((s) => s.updateProject);
 
   const [isAdding, setIsAdding] = useState(false);
   const [type, setType] = useState('requirement');
@@ -22,6 +24,13 @@ export default function SkillPanel({ projectId }) {
     try {
       const saved = await api.createSkill(projectId, { type, title, content });
       addSkill(saved);
+      if (type === 'report_format') {
+        const refreshed = await api.getProject(projectId).catch(() => null);
+        if (refreshed) {
+          updateProject(refreshed.id, refreshed);
+          setSelectedProject(refreshed);
+        }
+      }
       setTitle('');
       setContent('');
       setIsAdding(false);
@@ -58,7 +67,7 @@ export default function SkillPanel({ projectId }) {
       </div>
 
       <p className="text-xs text-slate-400 mb-3">
-        Requirements & report formats stored here reduce repetitive instructions for the AI agents.
+        Requirements &amp; report formats stored here guide all AI agents (also editable in Project Config).
       </p>
 
       {/* Add form */}
@@ -161,4 +170,3 @@ export default function SkillPanel({ projectId }) {
     </div>
   );
 }
-

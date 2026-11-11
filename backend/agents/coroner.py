@@ -43,6 +43,7 @@ class CoronerAgent(BaseAgent):
 
         # Try live browser capture first if URL is available
         captured_live = False
+        live_capture_note: Optional[str] = None
         if app_url:
             try:
                 engine = BrowserEngine(headless=True)
@@ -68,7 +69,7 @@ class CoronerAgent(BaseAgent):
                     "description": f"Screenshot of reproduction: {bug_data.get('title')}",
                 })
 
-                if video_path and os.path.exists(video_path):
+                if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 0:
                     captured_evidence.append({
                         "type": "video",
                         "file_path": video_path,
@@ -78,21 +79,27 @@ class CoronerAgent(BaseAgent):
                     })
                 captured_live = True
             except Exception as e:
+                live_capture_note = str(e)
                 logger.warning(f"Live browser capture failed: {e}. Generating high-fidelity evidence snapshot.")
 
         # If live browser is unavailable or didn't run, create visual proof snapshot image
+        fallback_capture_error: Optional[str] = None
         if not captured_live:
-            snapshot_path = await self._generate_visual_proof(bug_data, project_info, stage)
-            captured_evidence.append({
-                "type": "screenshot",
-                "file_path": snapshot_path,
-                "file_name": os.path.basename(snapshot_path),
-                "stage": stage,
-                "description": f"Captured snapshot of defect reproduction state: {bug_data.get('title')}",
-            })
+            try:
+                snapshot_path = await self._generate_visual_proof(bug_data, project_info, stage)
+                captured_evidence.append({
+                    "type": "screenshot",
+                    "file_path": snapshot_path,
+                    "file_name": os.path.basename(snapshot_path),
+                    "stage": stage,
+                    "description": f"Captured snapshot of defect reproduction state: {bug_data.get('title')}",
+                })
+            except Exception as snap_err:
+                fallback_capture_error = str(snap_err)
+                logger.error(f"Coroner fallback snapshot generation failed: {snap_err}")
 
         # Save to database
-        if bug_report_id:
+        if bug_report_id and captured_evidence:
             async with async_session() as session:
                 for ev in captured_evidence:
                     db_ev = Evidence(
@@ -106,13 +113,26 @@ class CoronerAgent(BaseAgent):
                     session.add(db_ev)
                 await session.commit()
 
+        capture_failed = not captured_evidence or bool(fallback_capture_error)
+        out_payload: Dict[str, Any] = {
+            "evidence_count": len(captured_evidence),
+            "files": [e["file_name"] for e in captured_evidence],
+            "captured_live": captured_live,
+        }
+        if live_capture_note:
+            out_payload["live_browser_fallback_reason"] = live_capture_note[:240]
+        if fallback_capture_error:
+            out_payload["error"] = fallback_capture_error[:240]
+
         await self.log_action(
             action="capture_bug_evidence",
-            input_data={"bug_title": bug_data.get("title"), "stage": stage},
-            output_data={"evidence_count": len(captured_evidence), "files": [e["file_name"] for e in captured_evidence]},
-            status="success",
+            input_data={"bug_title": bug_data.get("title"), "stage": stage, "module": bug_data.get("module")},
+            output_data=out_payload,
+            status="failed" if capture_failed else "success",
             bug_report_id=bug_report_id,
             project_id=project_id,
+            module=bug_data.get("module") or "Evidence & Browser",
+            level="error" if capture_failed else "success",
             started_at=start_time,
         )
         return captured_evidence
@@ -137,7 +157,7 @@ class CoronerAgent(BaseAgent):
         # Root Cause & Steps Box
         draw.rectangle([(30, 260), (width - 30, 680)], fill=(17, 24, 39), outline=(55, 65, 81))
         draw.text((50, 280), "ROOT CAUSE ANALYSIS:", fill=(245, 158, 11))
-        
+
         # Word wrap root cause
         rc = bug_data.get("root_cause", "Investigating...")
         rc_lines = [rc[i:i+110] for i in range(0, min(len(rc), 330), 110)]
@@ -165,4 +185,3 @@ class CoronerAgent(BaseAgent):
 
     async def run(self, *args, **kwargs) -> Any:
         return await self.capture_evidence(*args, **kwargs)
-

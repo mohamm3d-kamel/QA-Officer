@@ -1,6 +1,6 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FolderGit2, ExternalLink, MessageSquare, Trash2, Edit2, ShieldAlert } from 'lucide-react';
+import { FolderGit2, ExternalLink, MessageSquare, Trash2, Edit2, FileText } from 'lucide-react';
 import api from '../../services/api';
 import useAppStore from '../../store/appStore';
 
@@ -50,20 +50,32 @@ export default function ProjectList({ onEditProject }) {
                   <h3 className="text-sm font-semibold text-slate-100 group-hover:text-cyan-300 transition-colors">
                     {proj.name}
                   </h3>
-                  <span className="text-[11px] font-mono text-cyan-400 bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-900/50">
-                    JIRA: {proj.jira_project_key || 'QA'}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                    <span className="text-[11px] font-mono text-cyan-400 bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-900/50">
+                      JIRA: {proj.jira_project_key || 'QA'}
+                    </span>
+                    {proj.report_format && (
+                      <span
+                        title="Custom Project Report Format configured"
+                        className="inline-flex items-center gap-1 text-[10px] font-medium text-emerald-300 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-900/50"
+                      >
+                        <FileText className="w-2.5 h-2.5" />
+                        <span>Report Format</span>
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
 
-              <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div className="flex items-center gap-1 opacity-75 group-hover:opacity-100 transition-opacity">
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     if (onEditProject) onEditProject(proj);
                   }}
-                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
-                  title="Edit Project"
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-slate-800 transition-colors"
+                  title="Project Configuration & Report Format"
+                  aria-label={`Configure ${proj.name}`}
                 >
                   <Edit2 className="w-3.5 h-3.5" />
                 </button>
@@ -107,4 +119,3 @@ export default function ProjectList({ onEditProject }) {
     </div>
   );
 }
-

@@ -8,12 +8,19 @@ import LogsPage from './pages/LogsPage';
 import SummaryPage from './pages/SummaryPage';
 import SettingsPage from './pages/SettingsPage';
 import useAppStore from './store/appStore';
+import useWebSocket from './hooks/useWebSocket';
+
+function WebSocketBridge() {
+  useWebSocket();
+  return null;
+}
 
 export default function App() {
   const sidebarCollapsed = useAppStore((s) => s.sidebarCollapsed);
 
   return (
     <div className="flex h-screen overflow-hidden bg-surface-800">
+      <WebSocketBridge />
       <Sidebar />
       <div
         className={`flex flex-col flex-1 min-w-0 transition-all duration-300 ${
