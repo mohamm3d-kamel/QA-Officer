@@ -122,8 +122,9 @@ export default function LogsPage() {
         notify: true,
       });
       setLastSweep(sweep);
+      const inQaCount = (sweep.in_qa_checked || sweep.retested_tickets || []).length;
       toast.success(
-        `Watcher sweep complete: ${sweep.modules_monitored} module(s), ${sweep.agents_monitored} agent(s), ${sweep.logs_audited} log(s) audited.`
+        `Watcher sweep complete: ${sweep.modules_monitored} module(s), ${sweep.agents_monitored} agent(s), ${sweep.logs_audited} log(s) audited, ${inQaCount} In-QA check(s).`
       );
       await fetchLogsAndSummary({ silent: true });
     } catch (err) {
@@ -158,7 +159,7 @@ export default function LogsPage() {
             <span>Watcher Telemetry &amp; Agent Logs</span>
           </h1>
           <p className="text-xs text-slate-400 mt-1">
-            Full system audit trail across modules, AI agents, and logs — with Slack &amp; Email alerts dispatched strictly for Jira updates and AI agent failures.
+            Monitors all Jira &quot;In QA&quot; tickets (Coroner + Detective + Judge + Sanity Testers, alert-only without changing Jira status) and full system audit trail — dispatching Slack &amp; Email alerts strictly for Jira updates and AI agent failures.
           </p>
         </div>
 
@@ -212,8 +213,9 @@ export default function LogsPage() {
               <strong>Watcher Sweep Complete:</strong> Audited{' '}
               <strong>{lastSweep.modules_monitored}</strong> module(s),{' '}
               <strong>{lastSweep.agents_monitored}</strong> AI agent(s), and{' '}
-              <strong>{lastSweep.logs_audited}</strong> log(s) ({lastSweep.failures_count} failure(s),{' '}
-              {lastSweep.changes_count} change(s)). Channels:{' '}
+              <strong>{lastSweep.logs_audited}</strong> log(s), plus{' '}
+              <strong>{(lastSweep.in_qa_checked || lastSweep.retested_tickets || []).length}</strong>{' '}
+              In-QA check(s) ({lastSweep.failures_count} failure(s), {lastSweep.changes_count} change(s)). Channels:{' '}
               <code className="text-cyan-300">{lastSweep.notified_channels || 'internal log'}</code>
             </span>
           </div>

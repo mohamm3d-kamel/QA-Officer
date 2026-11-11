@@ -41,7 +41,12 @@ def sanitize_for_log(data: Any, max_len: int = 4000) -> Any:
         cleaned = {}
         for k, v in data.items():
             kl = str(k).lower()
-            if any(sk in kl for sk in _SECRET_KEYS):
+            if "environment_credentials" in kl and isinstance(v, str) and v.strip():
+                from services.environment_credentials import mask_environment_credentials
+
+                parsed_masked = mask_environment_credentials(v)
+                cleaned[k] = sanitize_for_log(parsed_masked, max_len=max_len) if parsed_masked else "<redacted>"
+            elif any(sk in kl for sk in _SECRET_KEYS):
                 cleaned[k] = "<redacted>" if v else ""
             else:
                 cleaned[k] = sanitize_for_log(v, max_len=max_len)
@@ -186,22 +191,26 @@ def _format_human_alert(
     ref_suffix = f" ({' · '.join(ref_parts)})" if ref_parts else ""
 
     status_tag = "FAILED" if status == "failed" else ("Update" if status != "success" else "Completed")
-    if action == "create_jira_ticket" and status == "success" and jira_key:
-        title = f"[{module}] Sheriff Created Jira Ticket: {jira_key}"
+    if action == "jira_in_qa_verified" and isinstance(output_data, dict) and output_data.get("alert_title"):
+        title = str(output_data["alert_title"])
+    elif action == "create_jira_ticket" and status == "success" and jira_key:
+        title = f"Sheriff Created Jira Ticket: {jira_key}"
     elif status == "failed":
-        title = f"[{module}] {agent_name} FAILED: {pretty_action}{ref_suffix}"
+        title = f"{agent_name} FAILED: {pretty_action}{ref_suffix}"
     else:
-        title = f"[{module}] {agent_name}: {pretty_action}{ref_suffix}"
+        title = f"{agent_name}: {pretty_action}{ref_suffix}"
 
     if summary_hint:
         message = summary_hint
+    elif action == "jira_in_qa_verified" and isinstance(output_data, dict) and output_data.get("alert_message"):
+        message = str(output_data["alert_message"])
     elif action == "create_jira_ticket" and status == "success" and jira_key and isinstance(output_data, dict):
         j_status = output_data.get("status", "Backlog")
         j_url = output_data.get("url") or ""
         att_cnt = output_data.get("attached_count", output_data.get("evidence_count", 0))
         message = (
             f"Sheriff created Jira ticket {jira_key} in {j_status}"
-            + (f" ({att_cnt} Coroner evidence file(s) attached)" if att_cnt else "")
+            + (f" ({att_cnt} evidence file(s) attached)" if att_cnt else "")
             + (f".\n{j_url}" if j_url else ".")
         )
     else:
@@ -307,6 +316,23 @@ async def _dispatch_notifications_and_ws(
             module=module,
         ):
             clean_details = sanitize_for_log(raw_output_data if raw_output_data is not None else raw_input_data)
+            if action in ("jira_issue_updated", "jira_status_drift_detected") and isinstance(clean_details, dict):
+                diffs = clean_details.get("diffs") if isinstance(clean_details.get("diffs"), dict) else {}
+                st_diff = diffs.get("status") if isinstance(diffs.get("status"), dict) else {}
+                old_st = (
+                    clean_details.get("old_status")
+                    or st_diff.get("old")
+                    or ("None (New Issue)" if clean_details.get("change_type") == "created_or_updated" else clean_details.get("status"))
+                    or "Unknown"
+                )
+                new_st = (
+                    clean_details.get("new_status")
+                    or clean_details.get("new_jira_status")
+                    or st_diff.get("new")
+                    or clean_details.get("status")
+                    or "Unknown"
+                )
+                clean_details = f"Old Status: {old_st}\nNew Status: {new_st}"
             res = await notifier.notify_event(
                 title=title,
                 message=message,
@@ -351,7 +377,9 @@ async def _dispatch_notifications_and_ws(
             async with async_session() as session:
                 row = await session.get(AgentLog, log_id)
                 if row:
-                    row.notified_channels = channels_str[:120]
+                    existing_chs = [c.strip() for c in (row.notified_channels or "").split(",") if c.strip()]
+                    merged_chs = ",".join(dict.fromkeys([*existing_chs, *channels_used]))
+                    row.notified_channels = merged_chs[:120]
                     await session.commit()
         except Exception as upd_err:
             logger.debug(f"Could not update notified_channels on log #{log_id}: {upd_err}")

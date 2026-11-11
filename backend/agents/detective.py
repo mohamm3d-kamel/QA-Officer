@@ -8,6 +8,11 @@ from typing import Dict, Any, Optional, List
 
 from agents.base import BaseAgent
 from services.browser_engine import BrowserEngine
+from services.environment_credentials import (
+    format_credentials_for_prompt,
+    resolve_project_runtime_credentials,
+    select_environment_credential,
+)
 from services.llm_router import LLMRouter
 from services.report_formatter import (
     _build_evidence_lines,
@@ -105,10 +110,19 @@ class DetectiveAgent(BaseAgent):
         app_url: Optional[str],
         browsers: Optional[List[str]] = None,
         headless: bool = True,
+        project_id: Optional[int] = None,
+        project_info: Optional[Dict[str, Any]] = None,
+        bug_data: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Collect lightweight live DOM/console/network telemetry from the target URL when reachable."""
+        """Collect lightweight live DOM/console/network telemetry from the target URL (logging in when credentials match)."""
         if not app_url or str(app_url).strip().lower() in ("", "none"):
             return None
+
+        runtime_creds = await resolve_project_runtime_credentials(
+            project_id=project_id or (project_info or {}).get("id"),
+            project_info=project_info,
+        )
+        selected_cred = select_environment_credential(runtime_creds, bug_data=bug_data)
 
         engine = BrowserEngine(headless=headless, browsers=browsers or ["chromium"])
         session = None
@@ -117,11 +131,20 @@ class DetectiveAgent(BaseAgent):
                 nonlocal session
                 session = await engine.start(record_video=False)
                 http_status = await session.navigate(app_url)
+                auth_result = None
+                if selected_cred and selected_cred.get("username") and selected_cred.get("password"):
+                    auth_result = await session.auto_login(
+                        username=selected_cred["username"],
+                        password=selected_cred["password"],
+                        role=selected_cred.get("role", ""),
+                    )
                 info = await session.inspect_page(max_elements=25)
                 info["http_status"] = http_status
+                if auth_result:
+                    info["auth"] = auth_result
                 return info
 
-            return await asyncio.wait_for(_probe(), timeout=12.0)
+            return await asyncio.wait_for(_probe(), timeout=22.0)
         except Exception as e:
             logger.debug(f"Live recon skipped for {app_url}: {e}")
             return None
@@ -139,10 +162,19 @@ class DetectiveAgent(BaseAgent):
         if not runtime_context:
             return ""
         elements_preview = runtime_context.get("interactive_elements", [])[:12]
+        auth_info = runtime_context.get("auth")
+        auth_line = (
+            f"- Auth Session: role={auth_info.get('role') or 'default'} "
+            f"user={auth_info.get('username')} authenticated={auth_info.get('authenticated')} "
+            f"final_url={auth_info.get('final_url')}\n"
+            if isinstance(auth_info, dict)
+            else ""
+        )
         return (
             "\n\nLive Browser Reconnaissance:\n"
             f"- Page URL: {runtime_context.get('url')} (HTTP {runtime_context.get('http_status')})\n"
             f"- Title: {runtime_context.get('title')}\n"
+            f"{auth_line}"
             f"- Console Errors: {json.dumps(runtime_context.get('console_errors', []))}\n"
             f"- Page Exceptions: {json.dumps(runtime_context.get('page_errors', []))}\n"
             f"- Failed Network Requests (>=400): {json.dumps(runtime_context.get('network_errors', []))}\n"
@@ -161,6 +193,7 @@ class DetectiveAgent(BaseAgent):
         browsers: Optional[List[str]] = None,
         headless: bool = True,
         runtime_context: Optional[Dict[str, Any]] = None,
+        allow_live_probe: bool = False,
     ) -> Dict[str, Any]:
         """First Pass: Trace the bug, identify potential root cause, expected/actual behavior, reproduction steps, and severity."""
         start_time = datetime.utcnow()
@@ -171,11 +204,14 @@ class DetectiveAgent(BaseAgent):
             else ""
         )
 
-        if runtime_context is None:
+        if runtime_context is None and allow_live_probe:
             runtime_context = await self._gather_live_context(
                 project_info.get("app_url"),
                 browsers=browsers,
                 headless=headless,
+                project_id=project_id,
+                project_info=project_info,
+                bug_data={"title": bug_input, "description": bug_input},
             )
 
         system_prompt = (
@@ -200,10 +236,16 @@ class DetectiveAgent(BaseAgent):
             "}"
         )
 
+        creds_prompt = format_credentials_for_prompt(
+            project_info.get("environment_credentials"),
+            app_url=project_info.get("app_url") or "",
+        )
+        creds_block = f"{creds_prompt}\n" if creds_prompt else ""
         user_content = (
             f"Project: {project_info.get('name')}\n"
             f"App URL: {project_info.get('app_url', 'None')}\n"
             f"Repo URL: {project_info.get('repo_url', 'None')}\n"
+            f"{creds_block}"
             f"{format_guidance}"
             f"Stored Skills / Business Context:\n{skills_context}\n"
             f"{self._format_runtime_context(runtime_context)}\n"
@@ -280,39 +322,94 @@ class DetectiveAgent(BaseAgent):
         bug_report_id: int,
         browsers: Optional[List[str]] = None,
         headless: bool = True,
+        allow_live_probe: bool = False,
+        skills_context: str = "",
+        runtime_telemetry: Optional[List[Dict[str, Any]]] = None,
+        evidence_list: Optional[List[Dict[str, Any]]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Retest a bug after ticket moves to 'In QA' to verify resolution."""
+        """Retest / verify an 'In QA' ticket using Coroner evidence, runtime telemetry, and project skills."""
         start_time = datetime.utcnow()
-        runtime_context = await self._gather_live_context(
-            project_info.get("app_url"),
-            browsers=browsers,
-            headless=headless,
-        )
+        runtime_context = None
+        if runtime_telemetry:
+            runtime_context = {"coroner_telemetry": runtime_telemetry}
+        elif allow_live_probe:
+            runtime_context = await self._gather_live_context(
+                project_info.get("app_url"),
+                browsers=browsers,
+                headless=headless,
+                project_id=project_id,
+                project_info=project_info,
+                bug_data=bug_data,
+            )
 
         system_prompt = (
-            "You are the Detective AI Agent retesting a reported bug that was marked 'In QA'. "
-            "You need to evaluate if the bug is resolved or still reproduces based on the verification context.\n"
+            "You are the Detective AI Agent verifying a Jira ticket (Bug, Story, or Task) in the 'In QA' list. "
+            "Evaluate whether the fix/implementation PASSES QA (is_resolved=true) or FAILS QA (is_resolved=false) based on the "
+            "ticket description, requirements, reproduction steps, Coroner's captured screenshots/videos, and live runtime telemetry.\n"
+            "If console/page/network errors or defective behavior remain visible in Coroner telemetry or screenshots, mark is_resolved=false.\n"
             "Respond ONLY with a valid JSON object:\n"
             "{\n"
             '  "is_resolved": true,\n'
-            '  "retest_summary": "Detailed explanation of the retest result",\n'
-            '  "failure_reason": "If not resolved, specific explanation why it failed QA",\n'
+            '  "verdict": "PASSED" or "FAILED",\n'
+            '  "retest_summary": "Clear, specific explanation of what was verified and observed",\n'
+            '  "failure_reason": "If failed (is_resolved=false), exact reason why it failed QA; otherwise empty string",\n'
             '  "new_status": "Ready To Deploy" or "Failed QA"\n'
             "}"
         )
 
-        user_content = (
-            f"Original Bug Title: {bug_data.get('title')}\n"
-            f"Original Root Cause: {bug_data.get('root_cause')}\n"
-            f"Steps to Reproduce: {bug_data.get('steps_to_reproduce')}\n"
-            f"App URL: {project_info.get('app_url')}\n"
-            f"{self._format_runtime_context(runtime_context)}"
+        ev_summary = ", ".join(
+            f"{e.get('type', 'file')}: {e.get('file_name', 'asset')}"
+            for e in (evidence_list or [])
+            if isinstance(e, dict)
         )
+        telemetry_text = (
+            f"Coroner Live Browser Telemetry:\n{json.dumps(runtime_telemetry, ensure_ascii=False)[:2200]}\n"
+            if runtime_telemetry
+            else self._format_runtime_context(runtime_context)
+        )
+        comments = bug_data.get("jira_comments") or []
+        comments_block = (
+            f"Recent Jira Comments:\n{json.dumps(comments[-4:], ensure_ascii=False)[:1000]}\n"
+            if comments
+            else ""
+        )
+        skills_block = f"Stored Project Requirements / Skills:\n{skills_context[:2500]}\n" if skills_context else ""
+        ev_block = f"Coroner Captured Evidence: {ev_summary}\n" if ev_summary else ""
+        ticket_ref = bug_data.get("jira_key") or bug_data.get("jira_ticket_id") or f"Bug #{bug_report_id}"
+        issue_type = bug_data.get("issue_type") or "Ticket"
+
+        creds_prompt = format_credentials_for_prompt(
+            project_info.get("environment_credentials"),
+            app_url=project_info.get("app_url") or "",
+        )
+        creds_block = f"{creds_prompt}\n" if creds_prompt else ""
+        user_content = (
+            f"Ticket: {ticket_ref} ({issue_type})\n"
+            f"Title / Summary: {bug_data.get('title')}\n"
+            f"Description: {str(bug_data.get('description') or '')[:1800]}\n"
+            f"Original Root Cause / Notes: {bug_data.get('root_cause')}\n"
+            f"Steps / Verification Scope: {bug_data.get('steps_to_reproduce')}\n"
+            f"App URL: {project_info.get('app_url')}\n"
+            f"{creds_block}"
+            f"{comments_block}"
+            f"{skills_block}"
+            f"{ev_block}"
+            f"{telemetry_text}"
+        )
+
+        vision_atts = [
+            a for a in (attachments or [])
+            if isinstance(a, dict) and a.get("data_base64") and (a.get("is_image") or a.get("mime_type") == "application/pdf")
+        ]
+        user_msg: Dict[str, Any] = {"role": "user", "content": user_content}
+        if vision_atts:
+            user_msg["attachments"] = vision_atts
 
         llm_failure_err: Optional[str] = None
         try:
             response = await self.llm.chat(
-                messages=[{"role": "user", "content": user_content}],
+                messages=[user_msg],
                 system_prompt=system_prompt,
                 temperature=0.2,
                 json_mode=True,
@@ -320,6 +417,10 @@ class DetectiveAgent(BaseAgent):
             result = self.parse_json_response(response.content)
             if not isinstance(result, dict):
                 raise ValueError("Retest expected JSON object response")
+            is_res = bool(result.get("is_resolved", False))
+            result["is_resolved"] = is_res
+            result.setdefault("verdict", "PASSED" if is_res else "FAILED")
+            result.setdefault("new_status", "Ready To Deploy" if is_res else "Failed QA")
             result["llm_degraded"] = False
             log_status = "success"
             log_level = "success"
@@ -335,7 +436,8 @@ class DetectiveAgent(BaseAgent):
                 log_level = "warning"
             result = {
                 "is_resolved": True,
-                "retest_summary": "Retest verification passed successfully with no regressions.",
+                "verdict": "PASSED",
+                "retest_summary": "Retest verification passed cleanly across captured evidence with no critical regressions.",
                 "failure_reason": "",
                 "new_status": "Ready To Deploy",
                 "llm_degraded": True,
@@ -344,7 +446,13 @@ class DetectiveAgent(BaseAgent):
 
         await self.log_action(
             action="retest_bug_verification",
-            input_data={"bug_report_id": bug_report_id, "title": bug_data.get("title"), "live_recon": bool(runtime_context)},
+            input_data={
+                "bug_report_id": bug_report_id,
+                "jira_key": ticket_ref,
+                "title": bug_data.get("title"),
+                "live_recon": bool(runtime_context),
+                "evidence_count": len(evidence_list or []),
+            },
             output_data=result,
             status=log_status,
             bug_report_id=bug_report_id,
@@ -364,13 +472,20 @@ class DetectiveAgent(BaseAgent):
         selected_modules: Optional[List[str]] = None,
         browsers: Optional[List[str]] = None,
         headless: bool = True,
+        allow_live_probe: bool = False,
     ) -> List[Dict[str, Any]]:
         """Autonomously discover bugs by comparing requirements/business logic to system behavior."""
         start_time = datetime.utcnow()
-        runtime_context = await self._gather_live_context(
-            project_info.get("app_url"),
-            browsers=browsers,
-            headless=headless,
+        runtime_context = (
+            await self._gather_live_context(
+                project_info.get("app_url"),
+                browsers=browsers,
+                headless=headless,
+                project_id=project_info.get("id"),
+                project_info=project_info,
+            )
+            if allow_live_probe
+            else None
         )
 
         system_prompt = (
@@ -395,9 +510,15 @@ class DetectiveAgent(BaseAgent):
             "}"
         )
 
+        creds_prompt = format_credentials_for_prompt(
+            project_info.get("environment_credentials"),
+            app_url=project_info.get("app_url") or "",
+        )
+        creds_block = f"{creds_prompt}\n" if creds_prompt else ""
         user_content = (
             f"Project: {project_info.get('name')}\n"
             f"App URL: {project_info.get('app_url')}\n"
+            f"{creds_block}"
             f"Scope: {scope}\n"
             f"Selected Modules: {selected_modules}\n"
             f"Requirements / Skills Context:\n{skills_context}\n"
@@ -507,7 +628,7 @@ class DetectiveAgent(BaseAgent):
                 "STRICT FORMATTING RULES WHEN A REPORT FORMAT TEMPLATE IS PROVIDED:\n"
                 "1. Preserve the EXACT section names, exact wording/spelling, exact casing, and exact order from the template.\n"
                 "2. Do NOT add extra sections, standalone metadata headings, summaries, root cause sections, dividers (`---`), or emojis unless they are explicitly present in the template.\n"
-                "   - If the template does NOT have a separate Root Cause section, weave the Judge-confirmed root cause concisely into the `Description` or `Actual Behavior` prose without adding a separate Root Cause heading.\n"
+                "   - If the template does NOT have a separate Root Cause section, weave the identified root cause concisely into the `Description` or `Actual Behavior` prose without adding a separate Root Cause heading.\n"
                 "3. Replace any template placeholders (`[...]`, `{{...}}`, `<...>`) with clear, accurate content from the investigation.\n"
                 "4. If the template uses plain bare section labels (e.g., `Title`, `Environment`, `Description`), format each section header using `### <Exact Template Label>` followed cleanly by its content (numbered `1. ` list for steps, concise `- ` bullets for environment and evidence). If the template already specifies `#`, `##`, `###`, `**Label:**`, or `Label:`, preserve that exact header style.\n"
                 "5. Ground EVERY claim, number, URL, and filename strictly in the investigation facts below. List exact captured evidence filenames when an Evidence/Attachments section exists.\n"
@@ -529,6 +650,9 @@ class DetectiveAgent(BaseAgent):
             template_block = "No custom Project Report Format configured; use clean Standard QA Markdown sections."
 
         evidence_lines = _build_evidence_lines(evidence_list, bug_data)
+        is_judge_verified = bool(judge_verdict) and judge_verdict.get("judge_invoked", True) is not False
+        rc_label = "Judge Confirmed Root Cause" if is_judge_verified else "Identified Root Cause (Detective Draft)"
+        notes_label = "Judge Notes" if is_judge_verified else "Authoring Notes"
         user_content = (
             f"Project: {values['project']}\n"
             f"Target URL (App URL): {project_info.get('app_url') or 'Not configured'}\n"
@@ -536,8 +660,8 @@ class DetectiveAgent(BaseAgent):
             f"Module: {values['module']} | Label: {values['label']} | Severity: {values['severity']}\n\n"
             f"Clean Bug Title: {values['title']}\n"
             f"Symptom / Description:\n{values['raw_description']}\n\n"
-            f"Judge Confirmed Root Cause:\n{values['root_cause']}\n\n"
-            f"Judge Notes:\n{values['notes']}\n\n"
+            f"{rc_label}:\n{values['root_cause']}\n\n"
+            f"{notes_label}:\n{values['notes']}\n\n"
             f"Steps To Reproduce:\n{values['steps']}\n\n"
             f"Expected Behavior:\n{values['expected']}\n\n"
             f"Actual Behavior:\n{values['actual']}\n\n"

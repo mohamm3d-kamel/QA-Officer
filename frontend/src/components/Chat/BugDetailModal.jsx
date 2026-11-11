@@ -200,7 +200,7 @@ export default function BugDetailModal({
           {bug.root_cause && (
             <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 space-y-1.5">
               <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-400">
-                Verified Root Cause
+                {bug.status === 'confirmed' ? 'Judge Verified Root Cause' : 'Detective Root Cause Analysis'}
               </div>
               <p className="text-sm text-slate-200 leading-relaxed">{bug.root_cause}</p>
             </div>
@@ -210,7 +210,7 @@ export default function BugDetailModal({
           {evidenceList.length > 0 && (
             <div className="space-y-3">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                Coroner Visual Evidence ({evidenceList.length})
+                Visual Evidence ({evidenceList.length})
               </h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {evidenceList.map((ev, idx) => {

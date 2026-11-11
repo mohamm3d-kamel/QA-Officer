@@ -161,34 +161,60 @@ def _format_dispatch_reply(desk_reply: str, target_agent: str, result: Dict[str,
             f"**Jira Ticket:** [{ticket.get('key')}]({ticket.get('url')})\n"
             f"**Jira Status:** {placement}\n"
             f"**Priority:** `{ticket.get('priority')}` | **Label:** `{ticket.get('label')}` | **Reporter:** `{ticket.get('reporter')}`\n"
-            f"**Coroner Evidence Attached:** **{attached_cnt}** file(s) ({ev_str}){sync_note}{warn_line}"
+            f"**Evidence Attached:** **{attached_cnt}** file(s) ({ev_str}){sync_note}{warn_line}"
         )
 
     if target_agent == "watcher":
         if result.get("mode") == "full_sweep":
             sw = result.get("sweep") or {}
+            in_qa_items = sw.get("in_qa_checked") or sw.get("retested_tickets") or []
             lines = [
                 f"{desk_reply}\n",
                 "### 👁️ Watcher System-Wide Sweep Complete",
                 f"- **Projects Audited:** `{sw.get('projects_count', 0)}` | **Modules Monitored:** `{sw.get('modules_monitored', 0)}`",
                 f"- **AI Agents Active:** `{sw.get('agents_monitored', 0)}` | **Logs Audited:** `{sw.get('logs_audited', 0)}`",
+                f"- **In-QA Tickets Checked (4 Agents, Alert-Only):** `{len(in_qa_items)}`",
                 f"- **Successes:** `{sw.get('success_count', 0)}` | **Changes:** `{sw.get('changes_count', 0)}` | **Failures Flagged:** `{sw.get('failures_count', 0)}`",
                 f"- **Notifications Dispatched:** `{sw.get('notified_channels') or 'ws'}`",
             ]
+            if in_qa_items:
+                lines.append("\n**In-QA Verification Results (Jira status unchanged):**")
+                for titem in in_qa_items[:10]:
+                    tkey = titem.get("jira_key") or titem.get("ticket_key") or f"Bug #{titem.get('bug_id')}"
+                    tver = titem.get("verdict") or ("PASSED" if titem.get("is_resolved") else "FAILED")
+                    ev_cnt = titem.get("evidence_count")
+                    if ev_cnt is None:
+                        ev_cnt = len(titem.get("evidence") or [])
+                    lines.append(f"  - `{tkey}`: **{tver}** (Evidence: `{ev_cnt}` file(s), Jira status unchanged)")
             if sw.get("failures_detected"):
                 lines.append("\n**Recent Failures Flagged:**")
                 for fitem in sw["failures_detected"][:5]:
                     lines.append(f"  - `{fitem.get('agent')}` (`{fitem.get('module')}`): `{fitem.get('action')}`")
             return "\n".join(lines)
-        retest = result.get("result", {}).get("retest", {})
-        sanity = result.get("result", {}).get("sanity")
+        res_data = result.get("result") or {}
+        if result.get("status") == "not_found":
+            return f"{desk_reply}\n\n⚠️ {result.get('message', 'Ticket not found.')}"
+        tlabel = res_data.get("jira_key") or result.get("jira_key") or f"Bug #{bug_id}"
+        verdict = res_data.get("verdict") or ("PASSED" if res_data.get("is_resolved") else "FAILED")
+        judge_res = res_data.get("judge") or {}
+        sanity_res = res_data.get("sanity") or {}
+        ev_list = res_data.get("evidence") or []
+        ev_names = ", ".join(f"`{e.get('file_name')}`" for e in ev_list if e.get("file_name")) or "`None`"
+        jira_note = (
+            f"Updated to `{res_data.get('new_status')}`"
+            if res_data.get("jira_updated")
+            else "Unchanged in `In QA` (Alert-only)"
+        )
         lines = [
             f"{desk_reply}\n",
-            f"### 👁️ Watcher Retest (Bug #{bug_id})",
-            f"**Outcome:** `{retest.get('new_status')}`",
+            f"### 👁️ Watcher In-QA Verification ({tlabel})",
+            f"**Verdict:** `{verdict}` | **Jira Status:** {jira_note}",
         ]
-        if sanity:
-            lines.append(f"**Sanity Testers:** {sanity.get('summary')}")
+        if judge_res:
+            lines.append(f"**Judge:** `{judge_res.get('verdict', 'CONFIRMED')}` — {judge_res.get('judge_notes') or judge_res.get('final_root_cause') or ''}")
+        if sanity_res:
+            lines.append(f"**Sanity Testers:** `{sanity_res.get('overall_status', 'PASSED')}` — {sanity_res.get('summary', '')}")
+        lines.append(f"**Coroner Evidence:** **{len(ev_list)}** file(s) ({ev_names})")
         return "\n".join(lines)
 
     if target_agent == "sanity":
@@ -277,7 +303,7 @@ def _format_organized_plan_reply(desk_reply: str, org_result: Dict[str, Any]) ->
                 attached_cnt = ticket.get("attached_count", len(attached_files))
                 newly = ticket.get("newly_attached") or []
                 ev_part = (
-                    f" with **{attached_cnt}** Coroner evidence file(s) ("
+                    f" with **{attached_cnt}** evidence file(s) ("
                     + ", ".join(f"`{f}`" for f in attached_files)
                     + ")"
                     if attached_cnt
@@ -293,14 +319,23 @@ def _format_organized_plan_reply(desk_reply: str, org_result: Dict[str, Any]) ->
         elif akey == "watcher":
             if data.get("mode") == "full_sweep":
                 sw = data.get("sweep") or {}
+                in_qa_cnt = len(sw.get("in_qa_checked") or sw.get("retested_tickets") or [])
                 lines.append(
                     f"{step['step']}. {icon} **{aname}**: Audited {sw.get('modules_monitored', 0)} module(s), "
-                    f"{sw.get('agents_monitored', 0)} agent(s), {sw.get('logs_audited', 0)} log(s) "
-                    f"({sw.get('failures_count', 0)} failure(s))."
+                    f"{sw.get('agents_monitored', 0)} agent(s), {sw.get('logs_audited', 0)} log(s), "
+                    f"{in_qa_cnt} In-QA ticket(s) ({sw.get('failures_count', 0)} failure(s))."
                 )
             else:
-                retest = (data.get("result") or {}).get("retest") or {}
-                lines.append(f"{step['step']}. {icon} **{aname}**: Retest outcome `{retest.get('new_status') or retest.get('status')}`.")
+                res_data = data.get("result") or {}
+                verdict = res_data.get("verdict") or ("PASSED" if res_data.get("is_resolved") else "FAILED")
+                ev_cnt = len(res_data.get("evidence") or [])
+                jdg_v = (res_data.get("judge") or {}).get("verdict", "CONFIRMED")
+                san_v = (res_data.get("sanity") or {}).get("overall_status", "PASSED")
+                jira_state = "Jira updated" if res_data.get("jira_updated") else "Jira status unchanged"
+                lines.append(
+                    f"{step['step']}. {icon} **{aname}**: Verdict `{verdict}` "
+                    f"(Judge `{jdg_v}`, Sanity `{san_v}`, Evidence `{ev_cnt}` file(s), {jira_state})."
+                )
         elif akey == "sanity":
             san = data.get("sanity") or {}
             lines.append(f"{step['step']}. {icon} **{aname}**: `{san.get('overall_status', 'PASSED')}` — {san.get('summary', '')}")
@@ -309,8 +344,17 @@ def _format_organized_plan_reply(desk_reply: str, org_result: Dict[str, Any]) ->
                 f"{step['step']}. {icon} **{aname}**: Discovered {data.get('discovered_count', 0)} defect(s), processed {data.get('processed_count', 0)} report(s)."
             )
 
+    standby_agents = []
+    if not org_result.get("coroner_invoked"):
+        standby_agents.append("Coroner")
+    if not org_result.get("judge_invoked"):
+        standby_agents.append("Judge")
     if blocked or not org_result.get("sheriff_invoked"):
-        lines.append("\n**Sheriff Status:** Standing by — Jira tickets are raised into `Backlog` only when you explicitly ask.")
+        standby_agents.append("Sheriff")
+    if standby_agents:
+        lines.append(
+            f"\n**Standing By:** {', '.join(standby_agents)} — run only when you explicitly ask."
+        )
 
     return "\n".join(lines)
 
@@ -647,7 +691,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 msg = (
                     "✅ I have updated **Project Configuration → Report Format** with your template:\n\n"
                     f"```\n{cleaned_content}\n```\n\n"
-                    "Detective and Judge will strictly follow this format as-is for all bug reports in this project."
+                    "Detective will strictly follow this format as-is for all bug reports in this project (and Judge will verify against it when requested)."
                 )
             else:
                 msg = f"📋 Requirement stored as a project skill: **{skill.title}**. All agents will now use this context."
@@ -661,15 +705,25 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 **llm_meta,
             }
 
-        # 2. Main Workflow triggered explicitly (e.g. "Create a bug report")
+        # 2. Main Workflow triggered explicitly (e.g. "Create a bug report" -> Detective default; Coroner/Judge/Sheriff on demand)
         if action == "run_main_workflow":
             include_sheriff = bool(decision.get("also_raise_jira", False))
+            include_coroner = bool(decision.get("also_run_coroner", False))
+            include_judge = bool(decision.get("also_run_judge", False))
+            live_probe = bool(decision.get("also_live_probe", False))
+            ran_parts = ["Detective"]
+            if include_coroner:
+                ran_parts.append("Coroner")
+            if include_judge:
+                ran_parts.append("Judge")
+            if include_sheriff:
+                ran_parts.append("Sheriff")
             await broadcast_ws({
                 "type": "agent_status",
                 "project_id": data.project_id,
                 "agent": "desk_officer",
                 "status": "success",
-                "message": "Dispatched main workflow (Detective → Coroner → Judge).",
+                "message": f"Dispatched bug reporting workflow ({' → '.join(ran_parts)}).",
             })
 
             pipeline_result = await orchestrator.process_bug_pipeline(
@@ -677,6 +731,9 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 project_id=data.project_id,
                 broadcast_callback=broadcast_ws,
                 include_sheriff=include_sheriff,
+                include_coroner=include_coroner,
+                include_judge=include_judge,
+                live_probe=live_probe,
                 bug_report_id=decision.get("bug_report_id"),
                 attachments=decision.get("attachments"),
             )
@@ -705,6 +762,10 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                     **llm_meta,
                 }
 
+            coroner_invoked = bool(pipeline_result.get("coroner_invoked"))
+            judge_invoked = bool(pipeline_result.get("judge_invoked"))
+            ev_list = pipeline_result.get("evidence", []) or []
+
             jira_ticket = pipeline_result.get("jira_ticket")
             if jira_ticket and jira_ticket.get("key") and not jira_ticket.get("error"):
                 att_files = jira_ticket.get("evidence_attached") or []
@@ -723,7 +784,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                     f"{att_line}"
                 )
                 tail_line = "The Watcher Agent is monitoring this ticket for the `In QA` transition."
-                workflow_actions = ["Ask Watcher to retest this bug", "Show me all built-in agents"]
+                workflow_actions = ["Ask Watcher to retest this bug"]
             elif jira_ticket and jira_ticket.get("error"):
                 jira_line = (
                     f"**Jira Ticket Creation Failed (`{jira_ticket.get('project_key')}`):** {jira_ticket.get('error')}\n"
@@ -731,7 +792,6 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 tail_line = ""
                 workflow_actions = [
                     f"Tell Sheriff to raise bug #{pipeline_result['bug_id']} to Backlog",
-                    "Show me all built-in agents",
                 ]
             else:
                 jira_line = (
@@ -741,8 +801,34 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 tail_line = ""
                 workflow_actions = [
                     f"Tell Sheriff to raise bug #{pipeline_result['bug_id']} to Backlog",
-                    "Show me all built-in agents",
                 ]
+
+            if not coroner_invoked:
+                workflow_actions.append(f"Have Coroner capture evidence for bug #{pipeline_result['bug_id']}")
+            if not judge_invoked:
+                workflow_actions.append(f"Ask Judge to verify bug #{pipeline_result['bug_id']}")
+            workflow_actions = workflow_actions[:3]
+
+            rc_heading = "**Judge Confirmed Root Cause:**" if judge_invoked else "**Root Cause (Detective Analysis):**"
+            if coroner_invoked:
+                ev_line = f"**Evidence:** {len(ev_list)} file(s) captured by Coroner.\n"
+            elif ev_list:
+                ev_line = f"**Evidence:** {len(ev_list)} uploaded file(s) attached (Coroner on standby).\n"
+            else:
+                ev_line = "**Evidence:** None captured (Coroner on standby until asked).\n"
+
+            standby_parts = []
+            if not coroner_invoked:
+                standby_parts.append("**Coroner**")
+            if not judge_invoked:
+                standby_parts.append("**Judge**")
+            if not (jira_ticket and jira_ticket.get("key") and not jira_ticket.get("error")):
+                standby_parts.append("**Sheriff**")
+            standby_line = (
+                f"**Standing By:** {', '.join(standby_parts)} (will run only when you explicitly ask).\n"
+                if standby_parts
+                else ""
+            )
 
             degraded_note = (
                 "\n\n> ⚠️ *Fallback mode active: configure a valid LLM API key in Settings for full AI analysis.*"
@@ -753,9 +839,10 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             summary_response = (
                 f"### 🎯 Bug Report #{pipeline_result['bug_id']} Created!\n\n"
                 f"**Title:** {pipeline_result.get('title')}\n"
-                f"**Judge Confirmed Root Cause:** {pipeline_result.get('root_cause')}\n"
+                f"{rc_heading} {pipeline_result.get('root_cause')}\n"
                 f"{jira_line}"
-                f"**Evidence:** {len(pipeline_result.get('evidence', []))} file(s) captured by Coroner.\n\n"
+                f"{ev_line}"
+                f"{standby_line}\n"
                 f"**Formatted Bug Report (Detective):**\n\n{pipeline_result.get('formatted_report', '')}\n"
                 + (f"\n{tail_line}" if tail_line else "")
                 + degraded_note
@@ -769,7 +856,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 "agent": "Desk Officer",
                 "response": summary_response,
                 "pipeline_result": pipeline_result,
-                "evidence": pipeline_result.get("evidence", []),
+                "evidence": ev_list,
                 **llm_meta,
             }
 
@@ -777,6 +864,9 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
         if action == "organize_agents":
             plan_steps = decision.get("agent_plan") or []
             allow_sheriff = bool(decision.get("also_raise_jira", False))
+            allow_coroner = bool(decision.get("also_run_coroner", False))
+            allow_judge = bool(decision.get("also_run_judge", False))
+            live_probe = bool(decision.get("also_live_probe", False))
             await broadcast_ws({
                 "type": "agent_status",
                 "project_id": data.project_id,
@@ -791,6 +881,9 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 default_bug_id=decision.get("bug_report_id"),
                 default_jira_key=decision.get("jira_key"),
                 allow_sheriff=allow_sheriff,
+                allow_coroner=allow_coroner,
+                allow_judge=allow_judge,
+                live_probe=live_probe,
                 default_force_new=bool(decision.get("force_new_ticket", False)),
                 default_jira_project_key=decision.get("jira_project_key"),
                 broadcast_callback=broadcast_ws,
@@ -805,10 +898,12 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             if org_result.get("sheriff_invoked"):
                 llm_meta["suggested_actions"] = ["Ask Watcher to retest this bug", "Show me all built-in agents"]
             elif org_result.get("bug_id"):
-                llm_meta["suggested_actions"] = [
-                    f"Tell Sheriff to raise bug #{org_result['bug_id']} to Backlog",
-                    "Check my Jira In QA list",
-                ]
+                actions_list = [f"Tell Sheriff to raise bug #{org_result['bug_id']} to Backlog"]
+                if not org_result.get("coroner_invoked"):
+                    actions_list.append(f"Have Coroner capture evidence for bug #{org_result['bug_id']}")
+                if not org_result.get("judge_invoked"):
+                    actions_list.append(f"Ask Judge to verify bug #{org_result['bug_id']}")
+                llm_meta["suggested_actions"] = actions_list[:3]
             await _persist_chat_message(db, data.project_id, "agent", reply_text, agent="Desk Officer", metadata=llm_meta)
             return {
                 "type": "agents_organized",
@@ -828,16 +923,19 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 "status": "success",
                 "message": f"Assigned {target_agent.replace('_', ' ').title()} to handle request.",
             })
+            shared_state = {"include_coroner": True} if decision.get("also_run_coroner") else None
             dispatch_result = await orchestrator.dispatch_agent(
                 target_agent=target_agent,
                 project_id=data.project_id,
                 bug_input=decision.get("bug_summary") or text,
                 bug_report_id=decision.get("bug_report_id"),
                 jira_key=decision.get("jira_key"),
+                shared_state=shared_state,
                 force_new=bool(decision.get("force_new_ticket", False)),
                 target_project_key=decision.get("jira_project_key"),
                 broadcast_callback=broadcast_ws,
                 attachments=decision.get("attachments"),
+                live_probe=bool(decision.get("also_live_probe", False)),
             )
             llm_degraded = bool(
                 decision_degraded

@@ -53,13 +53,15 @@ def _migrate_agent_logs_columns(sync_conn):
 
 
 def _migrate_projects_columns(sync_conn):
-    """Idempotently add report_format column to projects and backfill from stored report_format skills."""
+    """Idempotently add project configuration columns (report_format, environment_credentials) to existing SQLite DBs."""
     res = sync_conn.execute(text("PRAGMA table_info(projects)"))
     existing_cols = {row[1] for row in res.fetchall()}
     added_col = False
     if "report_format" not in existing_cols:
         sync_conn.execute(text("ALTER TABLE projects ADD COLUMN report_format TEXT"))
         added_col = True
+    if "environment_credentials" not in existing_cols:
+        sync_conn.execute(text("ALTER TABLE projects ADD COLUMN environment_credentials TEXT"))
 
     if added_col:
         proj_rows = sync_conn.execute(text("SELECT id, report_format FROM projects")).fetchall()

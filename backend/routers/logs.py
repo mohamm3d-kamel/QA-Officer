@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.coroner import CoronerAgent
 from agents.detective import DetectiveAgent
+from agents.judge import JudgeAgent
+from agents.sanity_tester import SanityTesterAgent
 from agents.watcher import WatcherAgent
 from database import get_db
 from models.agent_log import AgentLog
@@ -194,6 +196,8 @@ async def trigger_watcher_scan(
         detective=DetectiveAgent(llm),
         coroner=CoronerAgent(),
         notification_service=NotificationService.from_settings(all_settings),
+        judge=JudgeAgent(llm),
+        sanity_tester=SanityTesterAgent(llm),
     )
     sweep = await watcher.run_full_system_sweep(
         jira_settings=all_settings,

@@ -138,7 +138,7 @@ export default function Header() {
                         />
                         <div className="min-w-0 flex-1">
                           <p className="text-xs font-semibold text-white truncate">{n.title}</p>
-                          <p className="text-xs text-slate-300 mt-0.5">{n.message}</p>
+                          <p className="text-xs text-slate-300 mt-0.5 whitespace-pre-line">{n.message}</p>
                           <div className="flex items-center gap-2 text-[10px] text-slate-500 mt-1">
                             <span>{new Date(n.timestamp).toLocaleTimeString()}</span>
                             {n.module && <span>· {n.module}</span>}

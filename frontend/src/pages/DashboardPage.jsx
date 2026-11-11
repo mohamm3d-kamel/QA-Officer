@@ -98,7 +98,7 @@ export default function DashboardPage() {
             Welcome, <span className="text-cyan-400">{reporterName}</span>
           </h1>
           <p className="text-sm text-slate-400 leading-relaxed">
-            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand, Detective traces root cause and drafts formatted reports matching your template, Coroner captures live proof, Judge independently confirms, Sheriff raises tickets to Jira Backlog when requested, and Watcher alerts Slack &amp; Email on Jira updates and AI agent failures.
+            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand; Detective investigates root cause and drafts formatted reports matching your template by default; Coroner (live proof), Judge (verification), and Sheriff (Jira Backlog) run on request during bug reporting; and Watcher monitors Jira &quot;In QA&quot; tickets with Coroner, Detective, Judge, and Sanity Testers (always) to send clear Pass/Fail + Evidence alerts without altering Jira status.
           </p>
 
           <div className="flex items-center gap-3 pt-2">

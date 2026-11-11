@@ -175,11 +175,9 @@ export default function AutoTestModal({ isOpen, onClose, projectId, onComplete }
 
           <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 text-[11px] text-slate-400 space-y-1">
             <div className="text-slate-300 font-medium">Pipeline Actions:</div>
-            <div>• Detective investigates root cause & reproduces defect</div>
-            <div>• Coroner captures screenshot & video evidence</div>
-            <div>• Judge confirms findings independently</div>
-            <div>• Detective writes clean report matching your Project Report Format</div>
-            <div>• Sheriff stands by until asked, then logs to Jira &apos;Backlog&apos;</div>
+            <div>• Detective analyzes requirements to uncover defects &amp; root cause</div>
+            <div>• Detective writes clean bug reports matching your Project Report Format</div>
+            <div>• Coroner (visual capture), Judge (verification), and Sheriff (Jira Backlog) remain on standby until you explicitly ask</div>
           </div>
         </div>
 

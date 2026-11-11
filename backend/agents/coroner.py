@@ -9,6 +9,10 @@ from PIL import Image, ImageDraw
 
 from agents.base import BaseAgent
 from services.browser_engine import BrowserEngine
+from services.environment_credentials import (
+    resolve_project_runtime_credentials,
+    select_environment_credential,
+)
 from database import async_session
 from models.evidence import Evidence
 import config
@@ -45,6 +49,15 @@ class CoronerAgent(BaseAgent):
         browser_actions = bug_data.get("browser_actions", [])
         target_browsers = browsers or ["chromium"]
 
+        runtime_creds = await resolve_project_runtime_credentials(
+            project_id=project_id or project_info.get("id"),
+            project_info=project_info,
+        )
+        selected_cred = select_environment_credential(
+            runtime_creds,
+            bug_data=bug_data,
+        )
+
         # Try live browser capture across enabled engines
         captured_live = False
         live_capture_note: Optional[str] = None
@@ -57,9 +70,32 @@ class CoronerAgent(BaseAgent):
                     session = await engine.start(record_video=record_vid, browser_name=browser_name)
                     nav_status = await session.navigate(app_url)
 
+                    auth_result = None
+                    if selected_cred and selected_cred.get("username") and selected_cred.get("password"):
+                        auth_result = await session.auto_login(
+                            username=selected_cred["username"],
+                            password=selected_cred["password"],
+                            role=selected_cred.get("role", ""),
+                        )
+
+                    effective_actions = browser_actions
+                    if auth_result and auth_result.get("authenticated") and browser_actions:
+                        login_urls = {
+                            str(app_url).strip().rstrip("/").lower(),
+                            str(auth_result.get("before_url") or "").strip().rstrip("/").lower(),
+                        }
+                        effective_actions = [
+                            step for step in browser_actions
+                            if not (
+                                isinstance(step, dict)
+                                and step.get("action") == "navigate"
+                                and str(step.get("url") or "").strip().rstrip("/").lower() in login_urls
+                            )
+                        ]
+
                     step_results = []
-                    if browser_actions:
-                        step_results = await session.execute_steps(browser_actions)
+                    if effective_actions:
+                        step_results = await session.execute_steps(effective_actions)
 
                     screenshot_path = await session.take_screenshot(
                         description=f"[{browser_name}] Evidence for bug: {bug_data.get('title', 'Bug')}"
@@ -68,6 +104,8 @@ class CoronerAgent(BaseAgent):
                     runtime_telemetry.append({
                         "browser": browser_name,
                         "http_status": nav_status,
+                        "final_url": telemetry.get("url"),
+                        **({"auth": auth_result} if auth_result else {}),
                         "step_results": step_results,
                         "console_errors": telemetry.get("console_errors", []),
                         "page_errors": telemetry.get("page_errors", []),
@@ -168,6 +206,7 @@ class CoronerAgent(BaseAgent):
                 "stage": stage,
                 "module": bug_data.get("module"),
                 "browsers": target_browsers,
+                **({"auth_role": selected_cred.get("role")} if selected_cred else {}),
             },
             output_data=out_payload,
             status=log_status,

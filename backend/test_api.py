@@ -137,7 +137,7 @@ async def run_api_tests():
             assert res_big.status_code == 413, f"Expected 413 Payload Too Large, got {res_big.status_code}"
             print("✅ [4/9] Skill .docx extraction & 5 MB upload limit (413) verified")
 
-            # 5. Chat endpoint -> conversational triage & main workflow -> evidence + llm_degraded
+            # 5. Chat endpoint -> conversational triage & Detective-only default workflow (Coroner/Judge/Sheriff idle) + on-demand Coroner & Judge
             res_chat = await client.post(
                 "/api/chat",
                 json={
@@ -166,10 +166,48 @@ async def run_api_tests():
             pipe_json = res_pipe.json()
             assert pipe_json["type"] == "pipeline_complete"
             assert pipe_json["llm_degraded"] is True
-            ev_list = pipe_json.get("evidence", [])
+            pr = pipe_json["pipeline_result"]
+            assert pr["coroner_invoked"] is False, "Coroner must remain idle unless asked"
+            assert pr["judge_invoked"] is False, "Judge must remain idle unless asked"
+            assert pr["status"] == "draft", f"Expected 'draft' before Judge runs, got {pr['status']}"
+            assert pipe_json.get("evidence", []) == [], "No Coroner evidence should be auto-captured by default"
+            bug_id = pr["bug_id"]
+
+            # Verify dashboard confirmed_bugs is still 0 before Judge is asked
+            res_dash_pre = await client.get("/api/reports/dashboard")
+            assert res_dash_pre.status_code == 200
+            assert res_dash_pre.json()["confirmed_bugs"] == 0
+
+            # Explicit on-demand Coroner & Judge dispatch
+            res_cor = await client.post(
+                "/api/chat",
+                json={
+                    "project_id": proj_id,
+                    "message": f"Have Coroner capture evidence for bug #{bug_id}",
+                    "history": [],
+                },
+            )
+            assert res_cor.status_code == 200, res_cor.text
+            cor_json = res_cor.json()
+            assert cor_json["type"] == "agent_dispatched"
+            assert cor_json["assigned_agent"] == "coroner"
+            ev_list = cor_json.get("evidence", [])
             assert len(ev_list) >= 1 and ev_list[0].get("id"), f"Expected evidence with id, got {ev_list}"
-            bug_id = pipe_json["pipeline_result"]["bug_id"]
-            print(f"✅ [5/9] POST /api/chat pipeline response includes evidence (id={ev_list[0]['id']}) & llm_degraded=True")
+
+            res_judge = await client.post(
+                "/api/chat",
+                json={
+                    "project_id": proj_id,
+                    "message": f"Ask Judge to verify bug #{bug_id}",
+                    "history": [],
+                },
+            )
+            assert res_judge.status_code == 200, res_judge.text
+            judge_json = res_judge.json()
+            assert judge_json["type"] == "agent_dispatched"
+            assert judge_json["assigned_agent"] == "judge"
+            assert judge_json["data"]["status"] == "success"
+            print(f"✅ [5/9] POST /api/chat default Detective-only workflow + on-demand Coroner (ev={ev_list[0]['id']}) & Judge verified")
 
             # 6. Evidence serving + path traversal protection
             ev_id = ev_list[0]["id"]

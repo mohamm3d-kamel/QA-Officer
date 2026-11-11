@@ -135,6 +135,188 @@ class BrowserSession:
             logger.warning(f"Navigation to {url} had issues: {e}")
             return None
 
+    async def auto_login(
+        self,
+        username: str,
+        password: str,
+        role: str = "",
+        timeout_ms: int = 10000,
+    ) -> dict:
+        """Detect a visible login form, fill credentials, submit, and return sanitized status."""
+        if not username or not password:
+            return {
+                "attempted": False,
+                "authenticated": False,
+                "role": role,
+                "username": username,
+                "final_url": self.page.url,
+                "reason": "missing_credentials",
+            }
+
+        before_url = self.page.url
+        wait_form_ms = 3500 if any(k in before_url.lower() for k in ("login", "signin", "auth")) else 1200
+        try:
+            await self.page.wait_for_selector('input[type="password"]', state="visible", timeout=wait_form_ms)
+        except Exception:
+            pass
+
+        pw_locator = None
+        try:
+            pw_candidates = self.page.locator('input[type="password"]')
+            cnt = await pw_candidates.count()
+            for i in range(cnt):
+                cand = pw_candidates.nth(i)
+                if await cand.is_visible():
+                    pw_locator = cand
+                    break
+        except Exception:
+            pw_locator = None
+
+        if pw_locator is None:
+            return {
+                "attempted": False,
+                "authenticated": "login" not in self.page.url.lower(),
+                "role": role,
+                "username": username,
+                "final_url": self.page.url,
+                "reason": "no_login_form",
+            }
+
+        user_selectors = [
+            'input[name="email"]',
+            'input[type="email"]',
+            'input[name*="email" i]',
+            'input[id*="email" i]',
+            'input[name*="user" i]',
+            'input[id*="user" i]',
+            'input[autocomplete="email"]',
+            'input[autocomplete="username"]',
+            'input[type="text"]',
+        ]
+        user_locator = None
+        for sel in user_selectors:
+            try:
+                loc = self.page.locator(sel)
+                cnt = await loc.count()
+                for i in range(cnt):
+                    cand = loc.nth(i)
+                    if await cand.is_visible():
+                        user_locator = cand
+                        break
+                if user_locator is not None:
+                    break
+            except Exception:
+                continue
+
+        if user_locator is None:
+            return {
+                "attempted": False,
+                "authenticated": False,
+                "role": role,
+                "username": username,
+                "final_url": self.page.url,
+                "reason": "username_input_not_found",
+            }
+
+        error_count_before = len(self.network_errors)
+        try:
+            await user_locator.fill(username)
+            await pw_locator.fill(password)
+
+            submit_selectors = [
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'button:has-text("Login")',
+                'button:has-text("Log in")',
+                'button:has-text("Sign in")',
+                'button:has-text("Submit")',
+            ]
+            submit_btn = None
+            for sel in submit_selectors:
+                try:
+                    loc = self.page.locator(sel)
+                    cnt = await loc.count()
+                    for i in range(cnt):
+                        cand = loc.nth(i)
+                        if await cand.is_visible():
+                            submit_btn = cand
+                            break
+                    if submit_btn is not None:
+                        break
+                except Exception:
+                    continue
+
+            if submit_btn is not None:
+                await submit_btn.click(timeout=8000)
+            else:
+                await pw_locator.press("Enter")
+
+            authenticated = False
+            steps = max(1, int(timeout_ms / 300))
+            for _ in range(steps):
+                await asyncio.sleep(0.3)
+                cur_url = self.page.url
+                pw_still_visible = False
+                try:
+                    pw_now = self.page.locator('input[type="password"]')
+                    for i in range(await pw_now.count()):
+                        if await pw_now.nth(i).is_visible():
+                            pw_still_visible = True
+                            break
+                except Exception:
+                    pw_still_visible = False
+
+                if not pw_still_visible or (cur_url != before_url and "login" not in cur_url.lower()):
+                    authenticated = True
+                    await asyncio.sleep(0.8)
+                    break
+
+            error_hint = ""
+            if not authenticated:
+                try:
+                    err_text = await self.page.evaluate(
+                        """() => {
+                            const els = Array.from(document.querySelectorAll('[role="alert"], .error, .alert-danger, .toast-error'));
+                            for (const el of els) {
+                                const txt = (el.innerText || '').trim();
+                                if (txt) return txt.slice(0, 180);
+                            }
+                            return '';
+                        }"""
+                    )
+                    if err_text:
+                        error_hint = err_text
+                except Exception:
+                    pass
+                if not error_hint and len(self.network_errors) > error_count_before:
+                    last_err = self.network_errors[-1]
+                    error_hint = f"HTTP {last_err.get('status')} on {last_err.get('url', '')[:120]}"
+
+            logger.info(
+                f"Auto-login ({role or 'default'}) on {before_url} -> {self.page.url} "
+                f"(authenticated={authenticated})"
+            )
+            return {
+                "attempted": True,
+                "authenticated": authenticated,
+                "role": role,
+                "username": username,
+                "before_url": before_url,
+                "final_url": self.page.url,
+                **({"error_hint": error_hint} if error_hint else {}),
+            }
+        except Exception as exc:
+            logger.warning(f"Auto-login failed for {username}: {exc}")
+            return {
+                "attempted": True,
+                "authenticated": False,
+                "role": role,
+                "username": username,
+                "before_url": before_url,
+                "final_url": self.page.url,
+                "error_hint": str(exc)[:180],
+            }
+
     async def inspect_page(self, max_elements: int = 35) -> dict:
         """Capture DOM structure, interactive selectors, and runtime console/network telemetry."""
         title = ""

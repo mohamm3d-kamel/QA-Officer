@@ -400,10 +400,10 @@ class SheriffAgent(BaseAgent):
         # Offline / Local simulation ONLY when live Jira credentials are NOT configured
         if not ticket_result:
             rand_id = uuid.uuid4().hex[:4].upper()
-            sim_key = f"{jira_key}-{rand_id}"
+            sim_key = f"{jira_key}-SIM{rand_id}"
             ticket_result = {
                 "key": sim_key,
-                "url": f"{base_url.rstrip('/')}/browse/{sim_key}" if base_url else f"https://jira.local/browse/{sim_key}",
+                "url": f"https://jira.local/browse/{sim_key}",
                 "status": "Backlog",
                 "project_key": jira_key,
                 "reporter": reporter,

@@ -35,6 +35,7 @@ JIRA_UPDATE_ACTIONS = frozenset({
     "jira_ticket_created",
     "jira_status_changed",
     "jira_transitioned",
+    "jira_in_qa_verified",
     "jira_retest_resolved",
     "jira_retest_failed",
     "jira_poll_failed",
@@ -99,6 +100,7 @@ def is_jira_update_event(
             "create_jira_ticket",
             "sync_ticket_evidence",
             "jira_status_changed",
+            "jira_in_qa_verified",
             "jira_retest_resolved",
             "jira_retest_failed",
             "jira_status_drift_detected",
@@ -161,6 +163,108 @@ def is_watcher_reportable_event(
         level=level,
         category=category,
     )
+
+
+def format_in_qa_alert_content(
+    jira_key: Optional[str],
+    jira_url: Optional[str],
+    bug_title: str,
+    issue_type: Optional[str],
+    passed: bool,
+    detective_result: Optional[Dict[str, Any]] = None,
+    judge_result: Optional[Dict[str, Any]] = None,
+    sanity_result: Optional[Dict[str, Any]] = None,
+    evidence_list: Optional[List[Dict[str, Any]]] = None,
+    telemetry_list: Optional[List[Dict[str, Any]]] = None,
+    jira_status: str = "In QA",
+    bug_id: Optional[int] = None,
+) -> tuple[str, str, Dict[str, Any]]:
+    """Format a clear, understandable Passed/Failed + Evidence alert for Jira 'In QA' verification."""
+    det = detective_result or {}
+    jdg = judge_result or {}
+    san = sanity_result or {}
+    ev_items = list(evidence_list or [])
+    tel_items = list(telemetry_list or [])
+
+    ticket_label = jira_key or (f"Bug #{bug_id}" if bug_id else "QA Ticket")
+    verdict_word = "PASSED" if passed else "FAILED"
+    short_title = (bug_title or ticket_label).strip()[:75]
+    title = f"QA {verdict_word}: {ticket_label} — {short_title}"
+
+    det_passed = bool(det.get("is_resolved", False))
+    det_tag = "PASSED" if det_passed else "FAILED"
+    det_note = (
+        (det.get("retest_summary") if det_passed else (det.get("failure_reason") or det.get("retest_summary")))
+        or ("Issue verified fixed." if det_passed else "Defect still reproduces in test check.")
+    ).strip()[:240]
+
+    judge_verdict = str(jdg.get("verdict") or "CONFIRMED").strip().upper()
+    judge_notes = str(jdg.get("judge_notes") or jdg.get("final_root_cause") or "Reviewed evidence.").strip()[:240]
+
+    sanity_status = str(san.get("overall_status") or "PASSED").strip().upper()
+    sanity_reg = bool(san.get("regression_detected") or sanity_status == "FAILED")
+    sanity_tag = "FAILED (Regression)" if sanity_reg else sanity_status
+    sanity_summary = str(san.get("summary") or "Impacted areas checked.").strip()[:240]
+
+    ev_names = [
+        str(e.get("file_name") or e.get("filename") or "").strip()
+        for e in ev_items
+        if (e.get("file_name") or e.get("filename"))
+    ]
+    ev_preview = ", ".join(ev_names[:6]) + (f" (+{len(ev_names) - 6} more)" if len(ev_names) > 6 else "")
+    tel_notes: List[str] = []
+    for t in tel_items[:3]:
+        if isinstance(t, dict):
+            br = t.get("browser") or "browser"
+            hs = t.get("http_status")
+            ce = len(t.get("console_errors") or [])
+            pe = len(t.get("page_errors") or [])
+            ne = len(t.get("network_errors") or [])
+            tel_notes.append(
+                f"{br}: HTTP {hs if hs is not None else 'n/a'}, {ce} console err, {pe} page err, {ne} net >=400"
+            )
+
+    if ev_names and tel_notes:
+        evidence_line = f"{len(ev_names)} file(s) [{ev_preview}] | Live Telemetry: {'; '.join(tel_notes)}"
+    elif ev_names:
+        evidence_line = f"{len(ev_names)} file(s) [{ev_preview}]"
+    elif tel_notes:
+        evidence_line = f"Live Telemetry: {'; '.join(tel_notes)}"
+    else:
+        evidence_line = "No screenshot/video files captured"
+
+    ev_short = ev_preview or (f"{len(ev_items)} file(s)" if ev_items else "none")
+    summary_line = (
+        f"Ticket {ticket_label} is {verdict_word} "
+        f"(Detective: {det_tag} | Judge: {judge_verdict} | Sanity Testers: {sanity_tag}) "
+        f"— Evidence: {ev_short} | Jira status unchanged ({jira_status})"
+    )
+
+    type_part = f" ({issue_type})" if issue_type else ""
+    url_part = f"\nLink: {jira_url}" if jira_url else ""
+    message = (
+        f"{summary_line}\n\n"
+        f"Ticket: {ticket_label}{type_part} — {bug_title}{url_part}\n"
+        f"Verdict: {verdict_word} (Alert-only — Jira status remains '{jira_status}')\n"
+        f"• Detective: {det_tag} — {det_note}\n"
+        f"• Judge: {judge_verdict} — {judge_notes}\n"
+        f"• Sanity Testers: {sanity_tag} — {sanity_summary}\n"
+        f"• Coroner Evidence: {evidence_line}"
+    )
+
+    details = {
+        "ticket_id": ticket_label,
+        "issue_type": issue_type,
+        "jira_url": jira_url,
+        "verdict": verdict_word,
+        "jira_status_unchanged": jira_status,
+        "detective": {"verdict": det_tag, "summary": det_note},
+        "judge": {"verdict": judge_verdict, "notes": judge_notes},
+        "sanity_testers": {"status": sanity_tag, "regression_detected": sanity_reg, "summary": sanity_summary},
+        "evidence_files": ev_names,
+        "telemetry": tel_notes,
+    }
+    return title[:140], message[:2400], details
 
 
 def _as_bool(val: Any, default: bool = False) -> bool:
@@ -326,26 +430,6 @@ class NotificationService:
         accent, pill_bg, label = badge_colors.get(level, badge_colors["info"])
         timestamp = meta.get("timestamp") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        meta_rows_html = []
-        meta_lines_text = []
-        for k_label, key in (
-            ("Project", "project_name"),
-            ("Module", "module"),
-            ("Agent", "agent_name"),
-            ("Category", "category"),
-            ("Status", "status"),
-            ("Bug Ref", "bug_ref"),
-            ("Jira Key", "jira_key"),
-            ("Timestamp", "timestamp"),
-        ):
-            val = timestamp if key == "timestamp" else meta.get(key)
-            if val:
-                meta_lines_text.append(f"{k_label}: {val}")
-                meta_rows_html.append(
-                    f'<tr><td style="padding:4px 10px 4px 0;color:#64748b;font-size:12px;font-weight:600;">{html.escape(k_label)}</td>'
-                    f'<td style="padding:4px 0;color:#0f172a;font-size:12px;font-family:monospace;">{html.escape(str(val))}</td></tr>'
-                )
-
         details_str = ""
         if meta.get("details"):
             raw_det = meta["details"]
@@ -356,10 +440,9 @@ class NotificationService:
             details_str = details_str[:2400]
 
         plain_parts = [f"[QA Officer | {label}] {title}", "", message]
-        if meta_lines_text:
-            plain_parts.extend(["", "--- Context ---", *meta_lines_text])
         if details_str:
             plain_parts.extend(["", "--- Details ---", details_str])
+        plain_parts.extend(["", f"QA Officer Watcher • {timestamp}"])
         plain_text = "\n".join(plain_parts)
 
         details_html = ""
@@ -383,11 +466,10 @@ class NotificationService:
     <div style="padding:22px;">
       <h2 style="margin:0 0 10px 0;font-size:18px;color:#0f172a;">{html.escape(title)}</h2>
       <p style="margin:0 0 16px 0;font-size:14px;line-height:1.55;color:#334155;white-space:pre-wrap;">{html.escape(message)}</p>
-      {f'<table style="width:100%;border-collapse:collapse;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px;"><tbody>{"".join(meta_rows_html)}</tbody></table>' if meta_rows_html else ''}
       {details_html}
     </div>
     <div style="padding:12px 22px;background:#f8fafc;border-top:1px solid #e2e8f0;font-size:11px;color:#64748b;">
-      Sent automatically by QA Officer System-Wide Watcher
+      Sent automatically by QA Officer System-Wide Watcher • {html.escape(str(timestamp))}
     </div>
   </div>
 </body>
@@ -498,22 +580,6 @@ class NotificationService:
         header_text = f"{emoji} {title}".replace("\n", " ")[:145]
         meta = metadata or {}
 
-        fields = []
-        for lbl, key in (
-            ("Project", "project_name"),
-            ("Module", "module"),
-            ("Agent", "agent_name"),
-            ("Status", "status"),
-            ("Category", "category"),
-            ("Ref", "bug_ref"),
-        ):
-            val = meta.get(key)
-            if val:
-                fields.append({"type": "mrkdwn", "text": f"*{lbl}:* `{str(val)[:80]}`"})
-
-        if meta.get("jira_key"):
-            fields.append({"type": "mrkdwn", "text": f"*Jira:* `{meta['jira_key']}`"})
-
         details_block = ""
         if meta.get("details"):
             raw_det = meta["details"]
@@ -536,8 +602,6 @@ class NotificationService:
                 "text": {"type": "mrkdwn", "text": main_text},
             },
         ]
-        if fields:
-            blocks.append({"type": "section", "fields": fields[:10]})
         ts_str = meta.get("timestamp") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         blocks.append(
             {
@@ -770,5 +834,53 @@ class NotificationService:
             action="jira_status_changed",
             bug_id=bug_id,
             jira_key=jira_key,
+            force=False,
+        )
+
+    async def notify_in_qa_verification(
+        self,
+        bug_title: str,
+        jira_key: Optional[str],
+        jira_url: Optional[str] = None,
+        issue_type: Optional[str] = None,
+        passed: bool = True,
+        detective_result: Optional[Dict[str, Any]] = None,
+        judge_result: Optional[Dict[str, Any]] = None,
+        sanity_result: Optional[Dict[str, Any]] = None,
+        evidence_list: Optional[List[Dict[str, Any]]] = None,
+        telemetry_list: Optional[List[Dict[str, Any]]] = None,
+        jira_status: str = "In QA",
+        project_name: Optional[str] = None,
+        module: Optional[str] = None,
+        bug_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Send understandable alert-only Pass/Fail + Evidence summary without mutating Jira status."""
+        title, message, details = format_in_qa_alert_content(
+            jira_key=jira_key,
+            jira_url=jira_url,
+            bug_title=bug_title,
+            issue_type=issue_type,
+            passed=passed,
+            detective_result=detective_result,
+            judge_result=judge_result,
+            sanity_result=sanity_result,
+            evidence_list=evidence_list,
+            telemetry_list=telemetry_list,
+            jira_status=jira_status,
+            bug_id=bug_id,
+        )
+        return await self.notify_event(
+            title=title,
+            message=message,
+            level="success" if passed else "error",
+            category="jira_sync",
+            status="success" if passed else "failed",
+            project_name=project_name,
+            module=module or "QA Verification",
+            agent_name="Watcher",
+            action="jira_in_qa_verified",
+            bug_id=bug_id,
+            jira_key=jira_key,
+            details=None,
             force=False,
         )

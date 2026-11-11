@@ -10,6 +10,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
@@ -23,6 +24,15 @@ from models.evidence import Evidence
 from models.project import Project
 from models.skill import Skill
 from services.browser_engine import BrowserEngine
+from services.environment_credentials import (
+    format_credentials_for_prompt,
+    mask_environment_credentials,
+    merge_environment_credentials,
+    parse_environment_credentials,
+    resolve_project_runtime_credentials,
+    select_environment_credential,
+    serialize_environment_credentials,
+)
 from services.jira_client import JiraClient, is_real_jira_issue_key
 
 logger = logging.getLogger(__name__)
@@ -91,6 +101,13 @@ class ProjectAssetHub:
             "browsers": {
                 "enabled": browsers or ["chromium"],
                 "headless": self.settings.get("browser_headless", "true") == "true",
+            },
+            "environment_credentials": {
+                "count": len(parse_environment_credentials(project_info.get("environment_credentials"))),
+                "roles": [
+                    c.get("role") or c.get("username")
+                    for c in parse_environment_credentials(project_info.get("environment_credentials"))
+                ],
             },
         }
 
@@ -209,8 +226,13 @@ class ProjectAssetHub:
             "integrations": integrations,
         }
 
-    async def inspect_app_url(self, target_url: str, headless: bool = True) -> Dict[str, Any]:
-        """Perform read-only Playwright inspection of app_url or a target page."""
+    async def inspect_app_url(
+        self,
+        target_url: str,
+        headless: bool = True,
+        credential: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Perform read-only Playwright inspection of app_url or a target page (auto-logging in when matching credentials are provided)."""
         url = (target_url or "").strip()
         if not url:
             return {"error": "No target URL or project app_url is configured."}
@@ -221,6 +243,7 @@ class ProjectAssetHub:
         session = None
         console_errors: List[str] = []
         network_errors: List[Dict[str, Any]] = []
+        auth_result: Optional[Dict[str, Any]] = None
         try:
             session = await engine.start(record_video=False)
             session.page.on(
@@ -234,7 +257,14 @@ class ProjectAssetHub:
                 else None,
             )
             await session.navigate(url, wait_until="domcontentloaded")
-            await session.page.wait_for_timeout(1500)
+            await session.page.wait_for_timeout(1200)
+
+            if credential and credential.get("username") and credential.get("password"):
+                auth_result = await session.auto_login(
+                    username=credential["username"],
+                    password=credential["password"],
+                    role=credential.get("role", ""),
+                )
 
             page_info = await session.page.evaluate(
                 """() => {
@@ -265,6 +295,7 @@ class ProjectAssetHub:
                 "visible_text_preview": page_info.get("bodyText", ""),
                 "console_errors": console_errors,
                 "network_errors": network_errors,
+                **({"auth": auth_result} if auth_result else {}),
             }
         except Exception as e:
             return {"ok": False, "requested_url": url, "error": str(e)}
@@ -494,36 +525,53 @@ class ProjectAssetHub:
             from services.report_formatter import strip_report_format_preamble
             from services.watcher_bus import record_system_event
 
-            updates = {}
+            updates: Dict[str, Any] = {}
             for field in ("name", "jira_project_key", "jira_base_url", "app_url", "repo_url", "description", "report_format"):
                 if field in params and params[field] is not None:
                     val = str(params[field]).strip()
                     updates[field] = strip_report_format_preamble(val) if field == "report_format" else val
-            if not updates:
+
+            has_creds_param = "environment_credentials" in params and params["environment_credentials"] is not None
+            if not updates and not has_creds_param:
                 return {"tool": tool, "ok": False, "error": "No valid project configuration fields supplied."}
+
+            updated_fields = list(updates.keys()) + (["environment_credentials"] if has_creds_param else [])
             async with async_session() as session:
                 proj = await session.get(Project, project_id)
                 if not proj:
                     return {"tool": tool, "ok": False, "error": f"Project #{project_id} not found."}
                 for k, v in updates.items():
                     setattr(proj, k, v)
+                if has_creds_param:
+                    merged_creds = merge_environment_credentials(
+                        params["environment_credentials"],
+                        proj.environment_credentials,
+                    )
+                    proj.environment_credentials = serialize_environment_credentials(merged_creds)
                 await session.commit()
                 await session.refresh(proj)
                 proj_dict = proj.to_dict()
+
+            safe_log_values = dict(updates)
+            if has_creds_param:
+                safe_log_values["environment_credentials"] = mask_environment_credentials(
+                    proj_dict.get("environment_credentials")
+                )
+
             await record_system_event(
                 action="project_updated_via_desk_tool",
-                summary=f"Desk Officer updated project '{proj_dict.get('name')}' config: {', '.join(updates.keys())}",
+                summary=f"Desk Officer updated project '{proj_dict.get('name')}' config: {', '.join(updated_fields)}",
                 module="Projects",
                 category="system_change",
                 status="success",
                 level="change",
                 agent_name="Desk Officer",
                 project_id=project_id,
-                output_data={"updated_fields": list(updates.keys()), "values": updates},
+                output_data={"updated_fields": updated_fields, "values": safe_log_values},
                 notify=False,
                 notify_ui_bell=False,
             )
-            return {"tool": tool, "ok": True, "project": proj_dict, "updated_fields": list(updates.keys())}
+            return {"tool": tool, "ok": True, "project": proj_dict, "updated_fields": updated_fields}
 
         if tool == "list_agent_logs":
             agent_filter = (params.get("agent") or "").strip().lower()
@@ -567,7 +615,19 @@ class ProjectAssetHub:
         if tool == "inspect_app_url":
             url = (params.get("url") or project_info.get("app_url") or "").strip()
             headless = snapshot["integrations"]["browsers"]["headless"]
-            res = await self.inspect_app_url(url, headless=headless)
+            cred = None
+            app_origin = urlparse((project_info.get("app_url") or "").strip()).netloc.lower()
+            target_origin = urlparse(url).netloc.lower()
+            if params.get("login", True) and app_origin and target_origin == app_origin:
+                runtime_creds = await resolve_project_runtime_credentials(
+                    project_id=project_id,
+                    project_info=project_info,
+                )
+                cred = select_environment_credential(
+                    runtime_creds,
+                    preferred_role=(params.get("role") or "").strip() or None,
+                )
+            res = await self.inspect_app_url(url, headless=headless, credential=cred)
             return {"tool": tool, **res}
 
         if tool == "read_repo_file":
@@ -655,15 +715,31 @@ class ProjectAssetHub:
             for bid in list(dict.fromkeys(bug_matches))[:2]:
                 results.append(await self.run_asset_tool(project_id, "get_bug_details", {"bug_id": int(bid)}, snapshot))
 
-        # 4. Explicit live URL / app inspection request (when user asks to inspect/check/open/visit app_url)
+        # 4. Explicit live URL / browser inspection request (only when user explicitly asks to inspect live app/URL)
         explicit_url_match = re.search(r"https?://[^\s)]+", message)
-        wants_browser_inspect = bool(
+        explicit_url_probe = bool(
             re.search(
-                r"\b(inspect|check|open|visit|browse|load|verify|see|look\s+at)\b[^.!?\n]{0,45}\b(app|site|website|page|url|login|screen|app_url|staging)\b",
+                r"\b(?:inspect|browse|visit|probe|open|load|check|scan)\s+(?:the\s+|live\s+)?(?:app(?:_url)?|site|website|url|page|https?://[^\s)]+)"
+                r"|\b(?:playwright|live\s+browser|headless\s+browser)\b[^.!?\n]{0,40}\b(?:inspect|check|open|visit|probe|test|verify)\b"
+                r"|\b(?:inspect|check|test|verify)\b[^.!?\n]{0,40}\b(?:in\s+(?:the\s+)?(?:live\s+)?browser|live\s+(?:app|site|url|page))\b",
                 lower,
             )
         )
-        if explicit_url_match or wants_browser_inspect:
+        is_bug_symptom_note = bool(
+            re.search(
+                r"\b(?:when\s+i|whenever|after\s+opening|before\s+opening|fails?\s+to|cannot\s+open|can'?t\s+open|returns?\s+[45]\d{2}|thrown?|exception|bug\s*report|expected\s+behavior|actual\s+behavior)\b",
+                lower,
+            )
+        )
+        has_force_live_kw = bool(
+            re.search(
+                r"\b(?:live\s+browser|playwright|inspect_app_url|inspect\s+https?://|inspect\s+(?:the\s+)?(?:live\s+)?(?:app_url|url|site|website))\b",
+                lower,
+            )
+        )
+        if (explicit_url_probe and (not is_bug_symptom_note or has_force_live_kw)) or (
+            explicit_url_match and has_force_live_kw
+        ):
             target = explicit_url_match.group(0) if explicit_url_match else (snapshot["project"].get("app_url") or "")
             if target:
                 results.append(await self.run_asset_tool(project_id, "inspect_app_url", {"url": target}, snapshot))
@@ -686,6 +762,12 @@ class ProjectAssetHub:
         lines.append(f"- App URL: {proj.get('app_url') or 'Not set'}")
         lines.append(f"- Repo URL: {proj.get('repo_url') or 'Not set'}")
         lines.append(f"- Configured Jira Project Key: {proj.get('jira_project_key') or 'QA'} | Jira URL: {proj.get('jira_base_url') or integ['jira'].get('base_url') or 'Not set'}")
+        creds_prompt = format_credentials_for_prompt(
+            proj.get("environment_credentials"),
+            app_url=proj.get("app_url") or "",
+        )
+        if creds_prompt:
+            lines.append(creds_prompt)
         if proj.get("description"):
             lines.append(f"- Domain / Business Description:\n{proj['description'][:2200]}")
         from services.report_formatter import strip_report_format_preamble
@@ -809,8 +891,9 @@ class ProjectAssetHub:
                             f"  Evidence: {[{'id': e['id'], 'type': e['type'], 'file_name': e['file_name']} for e in b.get('evidence', [])]}"
                         )
                 elif tname == "inspect_app_url":
+                    auth_part = f" auth={res.get('auth')}" if res.get("auth") else ""
                     lines.append(
-                        f"- [inspect_app_url] url={res.get('final_url')} title={res.get('title')!r} "
+                        f"- [inspect_app_url] url={res.get('final_url')} title={res.get('title')!r}{auth_part} "
                         f"headings={res.get('headings')} buttons={res.get('buttons')} inputs={res.get('inputs')[:10]} "
                         f"console_errors={res.get('console_errors')} network_errors={res.get('network_errors')} "
                         f"text_preview={res.get('visible_text_preview', '')[:350]!r}"

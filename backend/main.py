@@ -41,6 +41,8 @@ async def watcher_background_worker():
     logger.info("Watcher Background Worker started.")
     from agents.detective import DetectiveAgent
     from agents.coroner import CoronerAgent
+    from agents.judge import JudgeAgent
+    from agents.sanity_tester import SanityTesterAgent
     from agents.watcher import WatcherAgent
     from services.llm_router import LLMRouter
     from services.notification_service import NotificationService
@@ -52,7 +54,7 @@ async def watcher_background_worker():
                 res = await session.execute(select(Settings))
                 settings_dict = {s.key: s.value for s in res.scalars().all()}
 
-            interval = int(settings_dict.get("watcher_interval_minutes", "60") or 60)
+            interval = int(settings_dict.get("watcher_interval_minutes", "5") or 5)
             enabled = settings_dict.get("watcher_enabled", "true") == "true"
 
             if enabled:
@@ -64,8 +66,16 @@ async def watcher_background_worker():
                 )
                 detective = DetectiveAgent(llm)
                 coroner = CoronerAgent()
+                judge = JudgeAgent(llm)
+                sanity_tester = SanityTesterAgent(llm)
                 notifier = NotificationService.from_settings(settings_dict)
-                watcher = WatcherAgent(detective, coroner, notifier)
+                watcher = WatcherAgent(
+                    detective,
+                    coroner,
+                    notifier,
+                    judge=judge,
+                    sanity_tester=sanity_tester,
+                )
 
                 logger.info(f"Watcher running system-wide sweep (interval: {interval}m)...")
                 await watcher.poll_all_active_projects(settings_dict)
@@ -108,7 +118,7 @@ async def seed_initial_data():
             default_report_format = (
                 "# Bug Report: [Title]\n\n"
                 "## 1. Summary\n[Summary of the defect]\n\n"
-                "## 2. Root Cause (Judge Confirmed)\n[Verified Root Cause]\n\n"
+                "## 2. Root Cause Analysis\n[Root Cause Analysis]\n\n"
                 "## 3. Steps to Reproduce\n1. [Step 1]\n2. [Step 2]\n\n"
                 "## 4. Expected vs Actual\n**Expected:** ...\n**Actual:** ...\n\n"
                 "## 5. Visual Evidence\n[Attached screenshot / video recording]"

@@ -544,10 +544,39 @@ class JiraClient:
                 "labels": fields.get("labels", []),
                 "assignee": (fields.get("assignee") or {}).get("displayName") if fields.get("assignee") else None,
                 "reporter": (fields.get("reporter") or {}).get("displayName") if fields.get("reporter") else None,
+                "created": fields.get("created"),
+                "updated": fields.get("updated"),
                 "comments": comments,
                 "attachments": attachments,
                 "url": f"{self.base_url}/browse/{data['key']}",
             }
+
+    async def get_latest_status_transition(
+        self, issue_key: str
+    ) -> Optional[Tuple[Optional[str], Optional[str]]]:
+        """Return (old_status, new_status) from Jira changelog if any status transition exists."""
+        try:
+            async with self._get_client() as client:
+                response = await client.get(
+                    f"{self.api_url}/issue/{issue_key}",
+                    params={"fields": "status", "expand": "changelog"},
+                )
+                if not response.is_success:
+                    return None
+                data = response.json()
+                histories = (data.get("changelog") or {}).get("histories") or []
+                latest_ts = ""
+                latest_pair: Optional[Tuple[Optional[str], Optional[str]]] = None
+                for hist in histories:
+                    ts = str(hist.get("created") or "")
+                    for item in hist.get("items") or []:
+                        if str(item.get("field") or "").lower() == "status":
+                            if latest_pair is None or ts >= latest_ts:
+                                latest_ts = ts
+                                latest_pair = (item.get("fromString"), item.get("toString"))
+                return latest_pair
+        except Exception:
+            return None
 
     async def list_projects(self, max_results: int = 50) -> List[Dict[str, Any]]:
         """List accessible Jira Cloud projects."""

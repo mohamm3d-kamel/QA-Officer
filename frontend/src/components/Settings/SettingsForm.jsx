@@ -104,7 +104,7 @@ export default function SettingsForm() {
     jira_email: '',
     jira_api_token: '',
     default_reporter: 'Mohamed Kamel',
-    watcher_interval_minutes: '60',
+    watcher_interval_minutes: '5',
     watcher_enabled: 'true',
     watcher_monitor_modules: 'true',
     watcher_monitor_agents: 'true',
@@ -631,7 +631,7 @@ export default function SettingsForm() {
                 Watcher Telemetry &amp; Audit Scope
               </h3>
               <p className="text-[11px] text-slate-400">
-                Records system-wide audit logs across modules and AI agents. External Slack &amp; Email alerts trigger strictly for Jira updates and AI agent failures.
+                Monitors ALL Jira &quot;In QA&quot; tickets with Coroner, Detective, Judge, and Sanity Testers (always) — alert-only without changing Jira status — and records system audit logs. External Slack &amp; Email alerts fire strictly for Jira updates and AI agent failures.
               </p>
             </div>
           </div>
@@ -1010,7 +1010,7 @@ export default function SettingsForm() {
                     className="mt-0.5 rounded text-cyan-500"
                   />
                   <span>
-                    <strong className="text-slate-100">Jira Updates</strong> — Ticket created in Backlog, Jira transitions (<code className="text-cyan-300">In QA</code>, <code className="text-emerald-300">Ready To Deploy</code>, <code className="text-red-300">Failed QA</code>), board status drift &amp; evidence sync
+                    <strong className="text-slate-100">Jira Updates</strong> — <code className="text-cyan-300">In QA</code> 4-agent Pass/Fail + Evidence verification alerts (alert-only, Jira status unchanged), tickets created in Backlog, board updates &amp; status drift
                   </span>
                 </label>
 

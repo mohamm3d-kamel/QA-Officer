@@ -1,6 +1,6 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FolderGit2, ExternalLink, MessageSquare, Trash2, Edit2, FileText } from 'lucide-react';
+import { FolderGit2, ExternalLink, MessageSquare, Trash2, Edit2, FileText, KeyRound } from 'lucide-react';
 import toast from 'react-hot-toast';
 import api from '../../services/api';
 import useAppStore from '../../store/appStore';
@@ -64,6 +64,21 @@ export default function ProjectList({ onEditProject }) {
                       >
                         <FileText className="w-2.5 h-2.5" />
                         <span>Report Format</span>
+                      </span>
+                    )}
+                    {Array.isArray(proj.environment_credentials) && proj.environment_credentials.length > 0 && (
+                      <span
+                        title={`Configured roles: ${proj.environment_credentials
+                          .map((c) => c.role || c.username)
+                          .filter(Boolean)
+                          .join(', ')}`}
+                        className="inline-flex items-center gap-1 text-[10px] font-medium text-amber-300 bg-amber-950/60 px-1.5 py-0.5 rounded border border-amber-900/50"
+                      >
+                        <KeyRound className="w-2.5 h-2.5" />
+                        <span>
+                          {proj.environment_credentials.length}{' '}
+                          {proj.environment_credentials.length === 1 ? 'Role' : 'Roles'}
+                        </span>
                       </span>
                     )}
                   </div>

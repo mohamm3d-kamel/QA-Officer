@@ -26,7 +26,7 @@ from routers.reports import generate_summary_report
 
 
 async def run_e2e_tests():
-    before_evidence = set(config.EVIDENCE_DIR.glob("*"))
+    before_evidence = {p for p in config.EVIDENCE_DIR.rglob("*") if p.is_file()}
     print("=" * 60)
     print("  🧪 QA OFFICER — COMPLETE E2E VERIFICATION TEST")
     print("=" * 60)
@@ -153,8 +153,20 @@ async def run_e2e_tests():
             "and author the formatted bug report."
         )
 
-        # 5. Test Main Workflow Trigger ('Create a bug report') WITHOUT Sheriff raising Jira
-        print("\n[Step 4] Testing 'Create a bug report' Main Workflow (Sheriff stays on standby)...")
+        # 4b. Test implicit "Investigate this bug" routes to Detective ONLY (Coroner idle until asked)
+        triage_inv_only = await orchestrator.desk_officer.triage_and_route(
+            message="Investigate this bug",
+            project_info=project_info,
+            skills_context=skills_context,
+            recent_bugs=[],
+            conversation_history=chat_history,
+            project_id=1,
+        )
+        assert triage_inv_only["action"] == "assign_agent", f"Expected assign_agent(detective), got {triage_inv_only}"
+        assert triage_inv_only["target_agent"] == "detective"
+
+        # 5. Test Main Workflow Trigger ('Create a bug report') -> Detective ONLY (Coroner, Judge, Sheriff stay idle)
+        print("\n[Step 4] Testing 'Create a bug report' Default Workflow (Detective only; Coroner/Judge/Sheriff idle)...")
         triage_workflow = await orchestrator.desk_officer.triage_and_route(
             message="Create a bug report",
             project_info=project_info,
@@ -165,6 +177,8 @@ async def run_e2e_tests():
         )
         assert triage_workflow["action"] == "run_main_workflow"
         assert triage_workflow["also_raise_jira"] is False, "Sheriff must NOT auto-raise Jira!"
+        assert triage_workflow.get("also_run_coroner") is False, "Coroner must NOT auto-run!"
+        assert triage_workflow.get("also_run_judge") is False, "Judge must NOT auto-run!"
 
         events_received = []
 
@@ -177,22 +191,72 @@ async def run_e2e_tests():
             project_id=1,
             broadcast_callback=test_broadcast,
             include_sheriff=triage_workflow["also_raise_jira"],
+            include_coroner=triage_workflow.get("also_run_coroner", False),
+            include_judge=triage_workflow.get("also_run_judge", False),
+            live_probe=triage_workflow.get("also_live_probe", False),
         )
 
         bug_id = pipeline_result["bug_id"]
         assert pipeline_result["jira_ticket"] is None, "Sheriff should NOT raise ticket until asked!"
-        assert pipeline_result["status"] == "confirmed"
+        assert pipeline_result["coroner_invoked"] is False, "Coroner must remain idle unless asked!"
+        assert pipeline_result["judge_invoked"] is False, "Judge must remain idle unless asked!"
+        assert pipeline_result["status"] == "draft", f"Expected draft bug status when Judge idle, got {pipeline_result['status']}"
         assert pipeline_result["formatted_report"], "Detective output should include a formatted bug report"
         assert pipeline_result.get("llm_degraded") is True, "Offline/test LLM key should flag llm_degraded=True"
-        assert len(pipeline_result.get("evidence", [])) >= 1, "Coroner should produce evidence"
-        ev_first = pipeline_result["evidence"][0]
+        assert pipeline_result.get("evidence", []) == [], "Coroner must NOT capture evidence until requested"
+        idle_agents = {e.get("agent") for e in events_received if e.get("status") == "idle"}
+        assert {"coroner", "judge", "sheriff"}.issubset(idle_agents), f"Expected idle notifications for Coroner/Judge/Sheriff, got {idle_agents}"
+        async with async_session() as session:
+            pre_logs = (await session.execute(select(AgentLog).where(AgentLog.project_id == 1))).scalars().all()
+            pre_agents = {l.agent_name for l in pre_logs}
+            assert "Coroner" not in pre_agents, f"Coroner must not appear in AgentLog before requested: {pre_agents}"
+            assert "Judge" not in pre_agents, f"Judge must not appear in AgentLog before requested: {pre_agents}"
+
+        print(f"\n✅ Default Bug Reporting Complete! Created Bug Report #{bug_id} (Status: {pipeline_result['status']})")
+        print(f"   • Title: {pipeline_result['title']}")
+        print(f"   • Detective Root Cause: {pipeline_result['root_cause']}")
+        print("   • Coroner / Judge / Sheriff: All standing by (idle until requested)")
+
+        # 5b. Test Explicit On-Demand Coroner & Judge Activation
+        print(f"\n[Step 4b] Testing Explicit On-Demand Coroner & Judge for Bug #{bug_id}...")
+        triage_coroner = await orchestrator.desk_officer.triage_and_route(
+            message=f"Have Coroner capture evidence for bug #{bug_id}",
+            project_info=project_info,
+            skills_context=skills_context,
+            recent_bugs=[{"id": bug_id, "title": pipeline_result["title"], "status": "draft", "jira_ticket_id": None}],
+            conversation_history=chat_history,
+            project_id=1,
+        )
+        assert triage_coroner["action"] == "assign_agent" and triage_coroner["target_agent"] == "coroner"
+        coroner_dispatch = await orchestrator.dispatch_agent(
+            target_agent="coroner",
+            project_id=1,
+            bug_report_id=bug_id,
+            broadcast_callback=test_broadcast,
+        )
+        cor_ev = coroner_dispatch.get("evidence", [])
+        assert len(cor_ev) >= 1, "On-demand Coroner should produce evidence"
+        ev_first = cor_ev[0]
         assert isinstance(ev_first.get("id"), int) and ev_first["id"] > 0, "Coroner must attach DB id onto evidence items"
         assert Path(ev_first["file_path"]).is_file(), "Coroner evidence file must exist on disk"
-        print(f"\n✅ Main Workflow Complete! Created Bug Report #{bug_id} (Status: {pipeline_result['status']})")
-        print(f"   • Title: {pipeline_result['title']}")
-        print(f"   • Judge Confirmed Root Cause: {pipeline_result['root_cause']}")
-        print(f"   • Coroner Evidence: {len(pipeline_result['evidence'])} file(s) (id={ev_first['id']})")
-        print("   • Sheriff Ticket: Not raised yet (awaiting explicit request)")
+
+        triage_judge = await orchestrator.desk_officer.triage_and_route(
+            message=f"Ask Judge to verify bug #{bug_id}",
+            project_info=project_info,
+            skills_context=skills_context,
+            recent_bugs=[{"id": bug_id, "title": pipeline_result["title"], "status": "draft", "jira_ticket_id": None}],
+            conversation_history=chat_history,
+            project_id=1,
+        )
+        assert triage_judge["action"] == "assign_agent" and triage_judge["target_agent"] == "judge"
+        judge_dispatch = await orchestrator.dispatch_agent(
+            target_agent="judge",
+            project_id=1,
+            bug_report_id=bug_id,
+            broadcast_callback=test_broadcast,
+        )
+        assert judge_dispatch["status"] == "success" and judge_dispatch["verdict"]["confirmed"] is True
+        print(f"✅ On-Demand Coroner (ev_id={ev_first['id']}) & Judge Verification Confirmed Bug #{bug_id}!")
 
         # 6. Test Explicit Sheriff Raise -> Must go to 'Backlog' (NOT 'To Do')
         print("\n[Step 5] Testing Explicit Sheriff Raise -> Ticket Status Must Be 'Backlog'...")
@@ -257,10 +321,9 @@ async def run_e2e_tests():
     finally:
         await engine.dispose()
         # Cleanup evidence artifacts generated only by this E2E run
-        after_evidence = set(config.EVIDENCE_DIR.glob("*"))
+        after_evidence = {p for p in config.EVIDENCE_DIR.rglob("*") if p.is_file()}
         for p in after_evidence - before_evidence:
-            if p.is_file():
-                p.unlink(missing_ok=True)
+            p.unlink(missing_ok=True)
         if TEST_DB_FILE.exists():
             TEST_DB_FILE.unlink()
 

@@ -5,8 +5,9 @@ has full visibility into all project assets (live Jira Cloud boards/tickets, sto
 bug reports, visual evidence, execution logs, app URL inspection, and local repo files),
 knows all built-in QA Officer agents and can assign or organize any multi-agent sequence
 on request, streams real LLM responses token-by-token when configured, provides context-aware
-local QA triage when offline, triggers the main workflow on explicit request,
-and enforces that Sheriff never raises Jira tickets unless explicitly asked.
+local QA triage when offline, triggers the main bug-reporting workflow on explicit request
+(running Detective by default while keeping Coroner, Judge, and Sheriff idle until requested),
+and enforces that Coroner, Judge, and Sheriff never run unless explicitly asked.
 """
 import json
 import logging
@@ -22,6 +23,10 @@ from services.attachment_processor import (
 )
 from services.jira_client import is_real_jira_issue_key
 from services.llm_router import LLMRouter
+from services.environment_credentials import (
+    format_credentials_for_prompt,
+    parse_environment_credentials,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,37 +36,37 @@ AGENT_ROSTER: List[Dict[str, str]] = [
         "key": "detective",
         "name": "Detective",
         "role": "Root Cause Investigator & Bug Report Author",
-        "description": "Traces bug symptoms, live browser telemetry, runtime errors, logs, and business requirements to identify root cause, reproduction steps, severity, label, and affected module; authors clean, verified Markdown bug reports adhering strictly to the project's configured Report Format template as-is; and retests fixes or runs autonomous discovery.",
+        "description": "Default bug investigator and report author. Traces bug symptoms, code, logs, attachments, and business requirements (only opens a live browser when you ask to inspect a URL) to identify root cause, reproduction steps, severity, label, and affected module; authors clean Markdown bug reports strictly adhering to Project Configuration -> Report Format as-is; and retests fixes or runs autonomous discovery.",
     },
     {
         "key": "coroner",
         "name": "Coroner",
-        "role": "Evidence Collector & Recorder",
-        "description": "Runs automated Playwright browser sessions to capture screenshots and video recordings (or diagnostic snapshots) during bug reproduction and failed QA retests.",
+        "role": "Evidence Collector (On Request / Watcher In-QA)",
+        "description": "Idle by default during interactive bug creation unless explicitly requested; automatically engaged by Watcher when checking Jira 'In QA' tickets. Launches automated Playwright browser sessions to capture screenshots, video recordings, and runtime telemetry.",
     },
     {
         "key": "judge",
         "name": "Judge",
-        "role": "Independent Root Cause Verifier",
-        "description": "Independently reviews and confirms, revises, or rejects the Detective's identified root cause and severity before Detective finalizes the bug report.",
+        "role": "Independent Verifier (On Request / Watcher In-QA)",
+        "description": "Idle by default during interactive bug creation unless explicitly requested; automatically engaged by Watcher when checking Jira 'In QA' tickets. Independently verifies Detective's findings and evidence to issue CONFIRMED, REVISED, or REJECTED.",
     },
     {
         "key": "sheriff",
         "name": "Sheriff",
-        "role": "Jira Ticket Commander",
-        "description": "Raises the Jira Cloud bug ticket into the Backlog (never To Do) with Coroner evidence attachments, priority, label, and reporter — ONLY when explicitly requested.",
+        "role": "Jira Ticket Commander (On Request)",
+        "description": "Raises the Jira Cloud bug ticket into the Backlog (never To Do) with attached evidence, priority, label, and reporter — ONLY when explicitly requested.",
     },
     {
         "key": "watcher",
         "name": "Watcher",
-        "role": "Jira Update & Agent Failure Sentinel",
-        "description": "Monitors Jira tickets ('In QA', status transitions, and Jira updates) and AI agent failures — triggering Detective retesting and dispatching real-time Slack and Email alerts strictly for Jira updates and AI agent failures.",
+        "role": "Jira 'In QA' 4-Agent & Failure Sentinel",
+        "description": "Monitors ALL Jira Cloud tickets in the 'In QA' list (Bugs, Stories, Tasks — including tickets created directly in Jira) and AI agent failures. For each 'In QA' ticket, Watcher engages Coroner, Detective, Judge, and Sanity Testers (always) and dispatches alert-only Pass/Fail + Evidence notifications (Slack, Email, UI Bell) without changing Jira status.",
     },
     {
         "key": "sanity",
         "name": "Sanity Testers",
         "role": "Impacted Area & Regression Verifier",
-        "description": "Evaluates adjacent and affected modules after a bug is resolved to verify zero regressions.",
+        "description": "Evaluates adjacent and affected modules for regressions. During Watcher 'In QA' verification, Sanity Testers ALWAYS runs regardless of whether Judge verdict is CONFIRMED or REJECTED.",
     },
 ]
 
@@ -327,6 +332,55 @@ class DeskOfficerAgent(BaseAgent):
         return False
 
     @classmethod
+    def _user_explicitly_requested_coroner(cls, text: str) -> bool:
+        lower = text.strip().lower()
+        if cls._is_question_about_agent(lower):
+            return False
+        if re.match(r"^(verify|inspect|check|audit|show|list)\b", lower) and not re.search(
+            r"\b(then|and)\s+(assign|dispatch|tell|have|run|trigger|capture|take|record|create)\b", lower
+        ):
+            return False
+
+        coroner_pat = (
+            r"\b(assign|dispatch|tell|ask|have|let|run|start|trigger|use|call|send|activate|invoke|organize|orchestrate|coordinate|include|enable|add|make)\b[^.!?\n]{0,45}\bcoroner\b"
+            r"|\bcoroner\b[^.!?\n]{0,40}\b(capture|record|screenshot|video|evidence|reproduce|run|work|start)\b"
+            r"|\b(?:with|plus|and|via|using|by)\s+(?:the\s+)?coroner\b"
+            r"|\b(capture|take|record|collect|grab)\b[^.!?\n]{0,30}\b(visual\s+evidence|screenshots?|screen\s*shots?|video\s+(?:recording|evidence)|playwright\s+evidence)\b"
+        )
+        return bool(re.search(coroner_pat, lower) and not cls._has_negation_near(lower, coroner_pat, check_suffix=True))
+
+    @classmethod
+    def _user_explicitly_requested_judge(cls, text: str) -> bool:
+        lower = text.strip().lower()
+        if cls._is_question_about_agent(lower):
+            return False
+        if re.match(r"^(verify|inspect|check|audit|show|list)\b", lower) and not re.search(
+            r"\b(then|and)\s+(assign|dispatch|tell|have|run|trigger|create)\b", lower
+        ) and "judge" not in lower:
+            return False
+
+        domain_guard = r"(?!\s+(?:page|screen|button|form|field|tab|modal|card|score|api|endpoint|panel|list|table)\b)"
+        judge_pat = (
+            rf"\b(assign|dispatch|tell|ask|have|let|run|start|trigger|use|call|send|activate|invoke|organize|orchestrate|coordinate|include|enable|add|make)\b[^.!?\n]{{0,45}}\bjudge\b{domain_guard}"
+            rf"|\bjudge\b{domain_guard}[^.!?\n]{{0,40}}\b(verify|confirm|review|validate|check|approve|reject|run|work|start)\b"
+            rf"|\b(?:with|plus|and|via|using|by)\s+(?:the\s+)?judge\b{domain_guard}"
+        )
+        return bool(re.search(judge_pat, lower) and not cls._has_negation_near(lower, judge_pat, check_suffix=True))
+
+    @classmethod
+    def _user_explicitly_requested_live_browser(cls, text: str) -> bool:
+        lower = text.strip().lower()
+        if cls._is_question_about_agent(lower):
+            return False
+        live_pat = (
+            r"\b(playwright|headless\s+browser|live\s+browser|"
+            r"(?:please\s+|can\s+you\s+|go\s+)?(?:inspect|check|visit|open|browse|crawl)\s+(?:the\s+)?(?:live\s+)?(?:app\s+url|app_url|website|webpage|site|live\s+app)|"
+            r"browse\s+to\s+(?:the\s+)?(?:app|url|site|website))\b"
+            r"|\b(?:inspect|visit|probe|crawl|browse)\s+https?://[^\s]+"
+        )
+        return bool(re.search(live_pat, lower) and not cls._has_negation_near(lower, live_pat, check_suffix=True))
+
+    @classmethod
     def _user_requested_main_workflow(cls, text: str) -> bool:
         lower = text.strip().lower()
         if cls._is_question_about_agent(lower):
@@ -367,18 +421,29 @@ class DeskOfficerAgent(BaseAgent):
         return bool(re.search(inv_pat, lower) and not cls._has_negation_near(lower, inv_pat, check_suffix=True))
 
     @classmethod
-    def _build_investigation_plan(cls) -> List[Dict[str, Any]]:
-        """Default collaborative investigation team: Detective (trace/root cause) + Coroner (visual reproduction)."""
-        return [
+    def _build_investigation_plan(
+        cls,
+        include_coroner: bool = False,
+        include_judge: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Investigation team: Detective by default; Coroner and Judge included ONLY on explicit request."""
+        plan: List[Dict[str, Any]] = [
             {
                 "agent": "detective",
                 "goal": "Investigate symptoms, trace root cause, and identify reproduction steps",
             },
-            {
+        ]
+        if include_coroner:
+            plan.append({
                 "agent": "coroner",
                 "goal": "Reproduce the issue and capture visual screenshot/video evidence",
-            },
-        ]
+            })
+        if include_judge:
+            plan.append({
+                "agent": "judge",
+                "goal": "Independently verify root cause and severity",
+            })
+        return plan
 
     @classmethod
     def _detect_agent_plan(cls, text: str) -> List[Dict[str, Any]]:
@@ -407,6 +472,8 @@ class DeskOfficerAgent(BaseAgent):
 
         mentions: List[tuple[int, str]] = []
         wants_jira = cls._user_explicitly_requested_jira(text)
+        wants_coroner = cls._user_explicitly_requested_coroner(text)
+        wants_judge = cls._user_explicitly_requested_judge(text)
 
         for agent_key, pat in agent_patterns:
             for m in re.finditer(pat, text, re.IGNORECASE):
@@ -414,6 +481,10 @@ class DeskOfficerAgent(BaseAgent):
                 win_end = min(len(text), m.end() + 60)
                 snippet = text[win_start:win_end]
                 if cls._has_negation_near(snippet, pat, check_suffix=True):
+                    continue
+                if agent_key == "coroner" and not wants_coroner:
+                    continue
+                if agent_key == "judge" and not wants_judge:
                     continue
                 if agent_key == "sheriff" and not wants_jira:
                     continue
@@ -451,7 +522,14 @@ class DeskOfficerAgent(BaseAgent):
             re.IGNORECASE,
         )
 
+        wants_coroner = cls._user_explicitly_requested_coroner(text)
+        wants_judge = cls._user_explicitly_requested_judge(text)
+
         for agent_key, pat in agent_patterns:
+            if agent_key == "coroner" and not wants_coroner:
+                continue
+            if agent_key == "judge" and not wants_judge:
+                continue
             if re.search(pat, lower) and not cls._has_negation_near(lower, pat, check_suffix=True):
                 if agent_key == "auto_test" or dispatch_verb.search(lower):
                     return agent_key
@@ -993,9 +1071,15 @@ class DeskOfficerAgent(BaseAgent):
             ev = asset_snapshot.get("evidence") or []
             integ = asset_snapshot.get("integrations") or {}
             jira_cfg = integ.get("jira") or {}
+            env_creds = parse_environment_credentials(project_info.get("environment_credentials"))
+            creds_summary = ", ".join(
+                f"{c.get('role') or 'Role'} ({c.get('username')})"
+                for c in env_creds[:6]
+            ) or "None"
             return (
                 f"### Project Assets Inventory — **{project_info.get('name')}**\n"
                 f"- **App URL:** `{project_info.get('app_url') or 'Not set'}` | **Repo URL:** `{project_info.get('repo_url') or 'Not set'}`\n"
+                f"- **Environment Credentials ({len(env_creds)}):** {creds_summary}\n"
                 f"- **Jira Cloud:** `{'Connected' if jira_cfg.get('live_configured') else 'Not configured'}` (Project Key: `{project_info.get('jira_project_key') or 'QA'}`)\n"
                 f"- **Stored Skills ({len(skills)}):** {', '.join(f'#{s['id']} {s['title']}' for s in skills[:6]) or 'None'}\n"
                 f"- **Tracked Bug Reports ({len(bugs)}):** {', '.join(f'#{b['id']} ({b['status']})' for b in bugs[:6]) or 'None'}\n"
@@ -1102,7 +1186,7 @@ class DeskOfficerAgent(BaseAgent):
                 return (
                     f"Yes — **Project Configuration -> Report Format** for **{proj_name}** is currently set to:\n\n"
                     f"```\n{active_rf}\n```\n\n"
-                    "Detective and Judge follow this exact structure as-is during bug report creation."
+                    "Detective strictly follows this exact structure as-is during bug report creation (and Judge verifies against it when requested)."
                 ), ["Create a bug report", "Show all project assets and built-in agents"]
             return (
                 f"No custom **Report Format** is set in **{proj_name}** Project Configuration yet (currently using Standard QA Markdown format). "
@@ -1234,7 +1318,7 @@ class DeskOfficerAgent(BaseAgent):
 
         if len(user_turns) == 0:
             parts.append(
-                "When ready, say **\"Create a bug report\"** (`Detective → Coroner → Judge`, with **Detective** authoring the formatted report and **Sheriff** standing by) or ask me to assign/organize specific agents."
+                "When ready, say **\"Create a bug report\"** (**Detective** will investigate and author the formatted report; **Coroner**, **Judge**, and **Sheriff** remain on standby until you explicitly ask) or ask me to assign/organize specific agents."
             )
 
         actions = self._extract_suggested_actions("chat", "none", recent_bugs, has_bug_context=True)
@@ -1269,6 +1353,9 @@ class DeskOfficerAgent(BaseAgent):
                 "jira_project_key": jira_project_key,
                 "force_new_ticket": False,
                 "also_raise_jira": False,
+                "also_run_coroner": False,
+                "also_run_judge": False,
+                "also_live_probe": False,
                 "skill_type": skill_type,
                 "skill_title": "Custom Bug Report Format" if skill_type == "report_format" else message.split("\n")[0][:60],
                 "suggested_actions": ["Assign Detective to investigate", "Create a bug report"],
@@ -1280,11 +1367,21 @@ class DeskOfficerAgent(BaseAgent):
         agent_plan = self._detect_agent_plan(message)
         wants_workflow = self._user_requested_main_workflow(message)
         wants_jira = self._user_explicitly_requested_jira(message)
+        wants_coroner = self._user_explicitly_requested_coroner(message)
+        wants_judge = self._user_explicitly_requested_judge(message)
+        wants_live_browser = self._user_explicitly_requested_live_browser(message)
         explicit_agent = self._detect_explicit_agent_assignment(message)
+        raw_wants_inv = self._user_requested_investigation(message)
+        if raw_wants_inv and not agent_plan and not wants_workflow and not wants_jira and explicit_agent in ("coroner", "judge"):
+            agent_plan = self._build_investigation_plan(
+                include_coroner=(explicit_agent == "coroner" or wants_coroner),
+                include_judge=(explicit_agent == "judge" or wants_judge),
+            )
+            explicit_agent = None
         wants_investigation = (
             False
             if (agent_plan or wants_workflow or wants_jira or explicit_agent)
-            else self._user_requested_investigation(message)
+            else raw_wants_inv
         )
         direct_bug_id = self._extract_bug_report_id(message)
         bugs_by_id = {b.get("id"): b for b in recent_bugs if b.get("id")}
@@ -1357,6 +1454,9 @@ class DeskOfficerAgent(BaseAgent):
                     "jira_project_key": jira_project_key,
                     "force_new_ticket": False,
                     "also_raise_jira": False,
+                    "also_run_coroner": False,
+                    "also_run_judge": False,
+                    "also_live_probe": False,
                     "skill_type": None,
                     "skill_title": None,
                     "attachments": [],
@@ -1366,14 +1466,20 @@ class DeskOfficerAgent(BaseAgent):
                 }
 
         if wants_investigation and not agent_plan and not explicit_agent:
-            agent_plan = self._build_investigation_plan()
+            if wants_coroner or wants_judge:
+                agent_plan = self._build_investigation_plan(
+                    include_coroner=wants_coroner,
+                    include_judge=wants_judge,
+                )
+            else:
+                explicit_agent = "detective"
 
         if agent_plan:
             names_map = {a["key"]: a["name"] for a in AGENT_ROSTER}
             names_map["auto_test"] = "Auto-Test"
             plan_labels = " → ".join(names_map.get(s["agent"], s["agent"].title()) for s in agent_plan)
             intro = (
-                f"Understood! Assigning our investigation team (**{plan_labels}**) to trace the root cause and capture visual evidence."
+                f"Understood! Assigning our investigation team (**{plan_labels}**) now."
                 if wants_investigation
                 else f"Understood! Organizing the requested agent sequence: **{plan_labels}**."
             )
@@ -1395,6 +1501,9 @@ class DeskOfficerAgent(BaseAgent):
                 "jira_project_key": jira_project_key,
                 "force_new_ticket": force_new_ticket,
                 "also_raise_jira": wants_jira,
+                "also_run_coroner": wants_coroner or any(s["agent"] == "coroner" for s in agent_plan),
+                "also_run_judge": wants_judge or any(s["agent"] == "judge" for s in agent_plan),
+                "also_live_probe": wants_live_browser,
                 "skill_type": None,
                 "skill_title": None,
                 "attachments": active_attachments,
@@ -1404,15 +1513,34 @@ class DeskOfficerAgent(BaseAgent):
             }
 
         if wants_workflow:
+            active_extras = []
+            if wants_coroner:
+                active_extras.append("**Coroner**")
+            if wants_judge:
+                active_extras.append("**Judge**")
+            if wants_jira:
+                active_extras.append("**Sheriff**")
+            standby_list = [
+                name
+                for name, enabled in (("**Coroner**", wants_coroner), ("**Judge**", wants_judge), ("**Sheriff**", wants_jira))
+                if not enabled
+            ]
+            lead_text = (
+                "Understood! Starting bug reporting now with **Detective**"
+                + (
+                    f" plus {', '.join(active_extras)}"
+                    if active_extras
+                    else " (root cause investigation + formatted bug report)"
+                )
+                + ". "
+            )
+            standby_text = (
+                (", ".join(standby_list) + " will remain on standby until you explicitly ask.")
+                if standby_list
+                else ""
+            )
             return {
-                "reply": (
-                    "Understood! Starting the main QA workflow now (**Detective → Coroner → Judge**, with **Detective** authoring the formatted report). "
-                    + (
-                        "Since you also asked to raise it, **Sheriff** will log the ticket to Jira **Backlog** afterward."
-                        if wants_jira
-                        else "**Sheriff** will stay on standby until you explicitly ask to raise the ticket to Jira **Backlog**."
-                    )
-                ),
+                "reply": (lead_text + standby_text).strip(),
                 "action": "run_main_workflow",
                 "target_agent": "none",
                 "agent_plan": [],
@@ -1422,6 +1550,9 @@ class DeskOfficerAgent(BaseAgent):
                 "jira_project_key": jira_project_key,
                 "force_new_ticket": force_new_ticket,
                 "also_raise_jira": wants_jira,
+                "also_run_coroner": wants_coroner,
+                "also_run_judge": wants_judge,
+                "also_live_probe": wants_live_browser,
                 "skill_type": None,
                 "skill_title": None,
                 "attachments": active_attachments,
@@ -1445,6 +1576,9 @@ class DeskOfficerAgent(BaseAgent):
                 "jira_project_key": jira_project_key,
                 "force_new_ticket": force_new_ticket,
                 "also_raise_jira": explicit_agent == "sheriff",
+                "also_run_coroner": wants_coroner or explicit_agent == "coroner",
+                "also_run_judge": wants_judge or explicit_agent == "judge",
+                "also_live_probe": wants_live_browser,
                 "skill_type": None,
                 "skill_title": None,
                 "attachments": active_attachments,
@@ -1475,6 +1609,9 @@ class DeskOfficerAgent(BaseAgent):
             "jira_project_key": jira_project_key,
             "force_new_ticket": False,
             "also_raise_jira": False,
+            "also_run_coroner": False,
+            "also_run_judge": False,
+            "also_live_probe": False,
             "skill_type": None,
             "skill_title": None,
             "attachments": [],
@@ -1550,11 +1687,21 @@ class DeskOfficerAgent(BaseAgent):
         det_plan = self._detect_agent_plan(message)
         wants_workflow = self._user_requested_main_workflow(message)
         wants_jira = self._user_explicitly_requested_jira(message)
+        wants_coroner = self._user_explicitly_requested_coroner(message)
+        wants_judge = self._user_explicitly_requested_judge(message)
+        wants_live_browser = self._user_explicitly_requested_live_browser(message)
         explicit_agent = self._detect_explicit_agent_assignment(message)
+        raw_wants_inv = self._user_requested_investigation(message)
+        if not is_question and raw_wants_inv and not det_plan and not wants_workflow and not wants_jira and explicit_agent in ("coroner", "judge"):
+            det_plan = self._build_investigation_plan(
+                include_coroner=(explicit_agent == "coroner" or wants_coroner),
+                include_judge=(explicit_agent == "judge" or wants_judge),
+            )
+            explicit_agent = None
         wants_investigation = (
             False
             if (is_question or det_plan or wants_workflow or wants_jira or explicit_agent)
-            else self._user_requested_investigation(message)
+            else raw_wants_inv
         )
 
         if is_question:
@@ -1567,8 +1714,10 @@ class DeskOfficerAgent(BaseAgent):
                     action = "organize_agents"
                     if not cleaned_plan:
                         cleaned_plan = det_plan
-            elif wants_workflow and action == "chat":
+            elif wants_workflow and action in ("chat", "organize_agents"):
                 action = "run_main_workflow"
+                target_agent = "none"
+                cleaned_plan = []
             elif explicit_agent:
                 # Override when LLM stayed in 'chat' OR proposed a Sheriff-less plan for a Jira request
                 if action == "chat" or (explicit_agent == "sheriff" and action == "organize_agents" and not any(s.get("agent") == "sheriff" for s in cleaned_plan)):
@@ -1577,24 +1726,52 @@ class DeskOfficerAgent(BaseAgent):
                     if explicit_agent == "sheriff":
                         cleaned_plan = []
             elif wants_investigation and action == "chat":
-                action = "organize_agents"
-                cleaned_plan = self._build_investigation_plan()
+                if wants_coroner or wants_judge:
+                    action = "organize_agents"
+                    cleaned_plan = self._build_investigation_plan(
+                        include_coroner=wants_coroner,
+                        include_judge=wants_judge,
+                    )
+                else:
+                    action = "assign_agent"
+                    target_agent = "detective"
+                    cleaned_plan = []
 
-        # Strict guardrail: Sheriff NEVER runs unless user explicitly asked
+        # Strict guardrails: Coroner, Judge, and Sheriff NEVER run unless user explicitly asked
         also_raise_jira = bool(parsed_meta.get("also_raise_jira", False)) and wants_jira
         if wants_jira and action in ("run_main_workflow", "organize_agents"):
             also_raise_jira = True
         if action == "assign_agent" and target_agent == "sheriff" and wants_jira:
             also_raise_jira = True
 
+        if not wants_coroner:
+            cleaned_plan = [s for s in cleaned_plan if s["agent"] != "coroner"]
+            if target_agent == "coroner":
+                action = "chat"
+                target_agent = "none"
+        if not wants_judge:
+            cleaned_plan = [s for s in cleaned_plan if s["agent"] != "judge"]
+            if target_agent == "judge":
+                action = "chat"
+                target_agent = "none"
         if not wants_jira:
             cleaned_plan = [s for s in cleaned_plan if s["agent"] != "sheriff"]
+            if target_agent == "sheriff":
+                action = "chat"
+                target_agent = "none"
 
-        if action == "organize_agents" and not cleaned_plan:
-            action = "chat"
-        if target_agent == "sheriff" and not wants_jira:
-            action = "chat"
-            target_agent = "none"
+        if action == "organize_agents":
+            if not cleaned_plan:
+                action = "chat"
+                target_agent = "none"
+            elif len(cleaned_plan) == 1:
+                action = "assign_agent"
+                target_agent = cleaned_plan[0]["agent"]
+                cleaned_plan = []
+
+        also_run_coroner = bool(wants_coroner)
+        also_run_judge = bool(wants_judge)
+        also_live_probe = bool(wants_live_browser)
 
         jira_project_key = self._extract_jira_project_key(message, parsed_meta, project_info, asset_snapshot)
         raw_jira_key = parsed_meta.get("jira_key") or self._extract_jira_key(message)
@@ -1643,7 +1820,7 @@ class DeskOfficerAgent(BaseAgent):
         if not is_question and not det_plan:
             is_inv_plan = action == "organize_agents" and (
                 wants_investigation
-                or [s.get("agent") for s in cleaned_plan] == ["detective", "coroner"]
+                or any(s.get("agent") == "detective" for s in cleaned_plan)
             )
             is_det_or_workflow = action == "run_main_workflow" or (action == "assign_agent" and target_agent == "detective") or is_inv_plan
             active_draft_for_continuation = bool(
@@ -1668,6 +1845,9 @@ class DeskOfficerAgent(BaseAgent):
                     target_agent = "none"
                     cleaned_plan = []
                     also_raise_jira = False
+                    also_run_coroner = False
+                    also_run_judge = False
+                    also_live_probe = False
                     bug_id = None
                     if not llm_originally_chose_chat:
                         visible_reply = clarify_reply
@@ -1707,6 +1887,9 @@ class DeskOfficerAgent(BaseAgent):
             "jira_project_key": jira_project_key,
             "force_new_ticket": force_new_ticket,
             "also_raise_jira": also_raise_jira,
+            "also_run_coroner": also_run_coroner,
+            "also_run_judge": also_run_judge,
+            "also_live_probe": also_live_probe,
             "skill_type": None,
             "skill_title": None,
             "attachments": active_attachments,
@@ -1856,6 +2039,10 @@ class DeskOfficerAgent(BaseAgent):
                 )
                 or "None logged yet."
             )
+            env_creds_prompt = format_credentials_for_prompt(
+                project_info.get("environment_credentials"),
+                app_url=project_info.get("app_url") or "",
+            )
             asset_block = (
                 f"Active Project:\n"
                 f"- Name: {project_info.get('name')}\n"
@@ -1863,6 +2050,7 @@ class DeskOfficerAgent(BaseAgent):
                 f"- Repo URL: {project_info.get('repo_url') or 'Not specified'}\n"
                 f"- Jira Project Key: {project_info.get('jira_project_key') or 'QA'}\n"
                 f"- Description: {project_info.get('description') or 'N/A'}\n"
+                f"{env_creds_prompt}\n"
                 f"- Project Report Format:\n{strip_report_format_preamble(project_info.get('report_format')) or 'Standard QA Markdown Format'}\n\n"
                 f"Stored Project Skills / Requirements / Report Format:\n{skills_context[:2500] or 'None stored yet.'}\n\n"
                 f"Recent Tracked Bugs:\n{bugs_str}"
@@ -1882,10 +2070,10 @@ class DeskOfficerAgent(BaseAgent):
             "- get_bug_details: {\"bug_id\": 1} — full local bug report, root cause, reproduction steps, formatted report, logs.\n"
             "- list_evidence: {\"bug_id\": optional} — list screenshot/video assets with URLs.\n"
             "- list_skills / save_skill / delete_skill — manage project skills (CALL save_skill/delete_skill ONLY when user explicitly asks to add/delete a skill).\n"
-            "- update_project_config: {\"jira_project_key\": \"SCRUM\", \"report_format\": \"...\"} — update project metadata or Project Configuration -> Report Format (ONLY call when user explicitly asks to update settings or set/change the report format).\n"
+            "- update_project_config: {\"app_url\": optional, \"jira_project_key\": \"SCRUM\", \"environment_credentials\": optional, \"report_format\": \"...\"} — update project metadata, target URL, role credentials, or Project Configuration -> Report Format (ONLY call when user explicitly asks to update settings or set/change the report format).\n"
             "- list_agent_logs: {\"agent\": optional, \"module\": optional, \"status\": optional} — inspect recent execution & telemetry logs across all agents and modules.\n"
             "- watcher_scan: {\"all_projects\": false, \"include_app_health\": true} — run a live Watcher scan for Jira updates and AI agent failures.\n"
-            "- inspect_app_url: {\"url\": optional} — run live headless Playwright inspection of app_url or target URL.\n"
+            "- inspect_app_url: {\"url\": optional} — run live headless Playwright inspection of app_url or target URL (ONLY call when the user explicitly asks to inspect, open, or browse a live URL/website; never call speculatively for passive bug reports).\n"
             "- read_repo_file: {\"path\": \"relative/path\"} — read a source file if repo_url is a local folder.\n\n"
             "BEHAVIOR & GROUNDING RULES:\n"
             "1. You HAVE FULL LIVE ACCESS to all project assets shown above and the agent team. NEVER falsely say you lack access to Jira, skills, bugs, evidence, logs, or agents.\n"
@@ -1893,10 +2081,10 @@ class DeskOfficerAgent(BaseAgent):
             "3. CLARIFY FIRST BEFORE DISPATCHING: Whenever the user describes a bug or asks to investigate / create a bug report with vague or missing details (unclear steps/trigger, missing expected vs. actual behavior, or no affected route/endpoint/Bug #/Jira key), keep action='chat' and ask concise clarifying questions FIRST before dispatching any agents. If a previous bug report was already created or raised earlier in chat, treat any new vague bug mention as a fresh defect requiring clarification rather than reusing the finished bug's details.\n"
             "4. Keep action='chat' during bug triage discussions, greetings, asset/Jira inspection queries (like 'check my Jira In QA list'), and questions about agents or how you organize them.\n"
             "5. CRITICAL EXECUTION RULE: Writing prose like 'I am triggering Sheriff/Detective' while setting action='chat' DOES NOT run any agent! To actually execute agents, you MUST set action='assign_agent' (single agent), action='organize_agents' (agent sequence), or action='run_main_workflow'.\n"
-            "6. INVESTIGATION ASSIGNMENT: When details are clear and the user asks to investigate/debug/trace/reproduce a bug (without limiting to just one named agent), set action='organize_agents' with agent_plan=[{\"agent\":\"detective\",\"goal\":\"Investigate root cause and steps\"},{\"agent\":\"coroner\",\"goal\":\"Capture screenshot/video evidence\"}]. If they explicitly ask for just one agent (e.g. 'Assign Detective'), set action='assign_agent'.\n"
-            "7. REPORT COLLABORATION ('create a bug report'): Once details are clear (or a draft investigation already exists), set action='run_main_workflow' so Detective -> Coroner -> Judge collaborate end-to-end and Detective authors the final formatted report strictly following the project's configured Report Format as-is (leaving Sheriff on standby). If the user explicitly asks to set or update the project's report format, call update_project_config with `report_format` (or let save_skill handle it).\n"
+            "6. INVESTIGATION ASSIGNMENT: When details are clear and the user asks to investigate/debug/trace/reproduce a bug (without explicitly asking for Coroner or Judge), set action='assign_agent', target_agent='detective'. Only include 'coroner' or 'judge' in agent_plan if the user EXPLICITLY asks for them.\n"
+            "7. REPORT CREATION DEFAULT ('create a bug report'): Once details are clear (or a draft investigation already exists), set action='run_main_workflow'. By default this runs Detective ONLY (root cause investigation + authoring the formatted bug report strictly following Project Configuration -> Report Format as-is), leaving Coroner, Judge, and Sheriff on standby until explicitly requested. Do NOT add Coroner or Judge unless the user explicitly asks for them, and do NOT launch a headless browser unless explicitly requested. If the user explicitly asks to set or update the project's report format, call update_project_config with `report_format` (or let save_skill handle it).\n"
             "8. RAISING THE REPORT ('raise the report', 'raise bug #...', 'create ticket in SCRUM', 'tell Sheriff...'): Set action='assign_agent', target_agent='sheriff', bug_report_id=<target bug ID>, also_raise_jira=true, jira_project_key='SCRUM' (plus force_new_ticket=true when replacing a simulated/wrong-project key).\n"
-            "9. STRICT SHERIFF RULE: NEVER include 'sheriff' in target_agent/agent_plan or set also_raise_jira=true unless the user EXPLICITLY asks to raise/push/submit/create the ticket in Jira/Backlog. Sheriff always creates a brand-new Jira ticket in 'Backlog' (never 'To Do') and never modifies old existing Jira tickets.\n"
+            "9. STRICT ON-DEMAND RULE DURING BUG CREATION (CORONER, JUDGE, SHERIFF): During interactive bug creation or triage, NEVER include 'coroner', 'judge', or 'sheriff' in target_agent/agent_plan or enable them unless the user EXPLICITLY asks for Coroner/visual evidence/screenshot capture, Judge/verification, or Sheriff/Jira Backlog ticket creation. (Note: Watcher autonomously engages Coroner, Detective, Judge, and Sanity Testers on Jira 'In QA' tickets in alert-only mode without modifying Jira status.) Sheriff always creates a brand-new Jira ticket in 'Backlog' (never 'To Do') and never modifies old existing Jira tickets.\n"
             "10. Backlog note: `jira_search` with `status: \"Backlog\"` searches both 'Backlog' workflow status and Scrum Board Backlog items (sprint EMPTY, status 'To Do'). Treat SIMULATED_OR_WRONG_PROJECT keys like QA-D715 as unraised on SCRUM.\n"
             "11. VISUAL & FILE ANALYSIS: When images, screenshots, PDFs, Office documents (DOCX/XLSX/PPTX), HAR network traces, logs, JSON, CSV, or code files are attached, inspect BOTH the visual pixels/pages AND extracted text thoroughly. Point out specific UI elements, visible error messages, layout issues, failing HTTP requests/status codes, stack trace lines, or anomalies directly grounded in the attachment. Keep action='chat' when the user asks you to examine, explain, or analyze an uploaded file/image unless they also explicitly ask to run agents or create/raise a report.\n\n"
             "OUTPUT FORMAT:\n"
@@ -2015,6 +2203,9 @@ class DeskOfficerAgent(BaseAgent):
                 "target_agent": decision["target_agent"],
                 "agent_plan": [s.get("agent") for s in (decision.get("agent_plan") or [])],
                 "also_raise_jira": decision["also_raise_jira"],
+                "also_run_coroner": decision.get("also_run_coroner", False),
+                "also_run_judge": decision.get("also_run_judge", False),
+                "also_live_probe": decision.get("also_live_probe", False),
                 "bug_report_id": decision["bug_report_id"],
                 "jira_key": decision.get("jira_key"),
                 "jira_project_key": decision.get("jira_project_key"),

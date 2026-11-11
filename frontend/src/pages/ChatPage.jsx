@@ -36,8 +36,8 @@ function buildWelcomeMessage(projectName, reporterName) {
       `- I have live access to all project assets: **Jira Cloud boards & issues, stored skills & Report Format templates, bug reports, visual evidence, agent logs, and target app inspection**.\n` +
       `- You can **attach, drag-and-drop, or paste (\`Ctrl+V\`) screenshots, images, PDFs, Word/Excel/PowerPoint docs, HAR network traces, logs, JSON, CSV, or code files** — I will analyze them visually & structurally.\n` +
       `- I know all 6 built-in agents (**Detective, Coroner, Judge, Sheriff, Watcher, Sanity Testers**) and can assign any individual agent or **organize a custom multi-agent sequence** whenever you ask.\n` +
-      `- Say **"Create a bug report"** when you're ready for the main workflow (**Detective → Coroner → Judge**).\n` +
-      `- **Sheriff** stays on standby until you explicitly ask to raise the ticket — and when raised, it always lands in Jira **Backlog**.`,
+      `- Say **"Create a bug report"** to run bug reporting with **Detective** (root cause investigation + formatted report matching your Project Report Format).\n` +
+      `- **Coroner** (visual evidence), **Judge** (verification), and **Sheriff** (Jira **Backlog**) stay on standby until you explicitly ask.`,
     suggested_actions: [
       'Check my Jira In QA list',
       'Show all project assets and built-in agents',
@@ -538,7 +538,7 @@ export default function ChatPage() {
                           <span className="truncate">{bug.label || 'Front-End'}</span>
                           {(bug.evidence?.length || 0) > 0 && (
                             <span
-                              title={`${bug.evidence.length} Coroner evidence file(s) collected`}
+                              title={`${bug.evidence.length} evidence file(s) attached`}
                               className="px-1.5 py-0.5 rounded bg-purple-950/70 text-purple-300 border border-purple-800/60 font-mono whitespace-nowrap"
                             >
                               📸 {bug.evidence.length}

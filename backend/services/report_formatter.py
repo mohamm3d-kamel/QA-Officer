@@ -737,8 +737,10 @@ def _populate_section_values(
     environment = "\n".join(env_parts)
 
     description = raw_desc or title
+    is_judge_verified = bool(judge_verdict) and judge_verdict.get("judge_invoked", True) is not False
     if root_cause and root_cause.lower() not in description.lower():
-        description_with_rc = f"{description}\n\n**Verified Root Cause:** {root_cause}"
+        rc_heading = "Verified Root Cause" if is_judge_verified else "Root Cause"
+        description_with_rc = f"{description}\n\n**{rc_heading}:** {root_cause}"
     else:
         description_with_rc = description
 
@@ -780,7 +782,7 @@ def _populate_section_values(
         "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
         "preconditions": f"User has access to `{app_url or project_info.get('name', 'the application')}`.",
         "impact": f"Severity `{severity}` issue affecting the `{module}` (`{label}`) flow.",
-        "notes": judge_notes or "Verified by Judge Agent.",
+        "notes": judge_notes or ("Verified by Judge Agent." if is_judge_verified else "Authored by Detective Agent (Judge on standby)."),
     }
 
 

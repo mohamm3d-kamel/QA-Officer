@@ -8,6 +8,11 @@ from typing import Dict, Any, List, Optional
 from agents.base import BaseAgent
 from services.llm_router import LLMRouter
 from services.browser_engine import BrowserEngine
+from services.environment_credentials import (
+    format_credentials_for_prompt,
+    resolve_project_runtime_credentials,
+    select_environment_credential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +34,19 @@ class SanityTesterAgent(BaseAgent):
         app_url: Optional[str],
         browsers: Optional[List[str]] = None,
         headless: bool = True,
+        project_id: Optional[int] = None,
+        project_info: Optional[Dict[str, Any]] = None,
+        bug_data: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Run a lightweight browser sanity probe to collect HTTP status, console, and network errors."""
+        """Run a lightweight browser sanity probe to collect HTTP status, console, and network errors (with auto-login)."""
         if not app_url or str(app_url).strip().lower() in ("", "none"):
             return None
+        runtime_creds = await resolve_project_runtime_credentials(
+            project_id=project_id or (project_info or {}).get("id"),
+            project_info=project_info,
+        )
+        selected_cred = select_environment_credential(runtime_creds, bug_data=bug_data)
+
         engine = BrowserEngine(headless=headless, browsers=browsers or ["chromium"])
         session = None
         try:
@@ -40,11 +54,20 @@ class SanityTesterAgent(BaseAgent):
                 nonlocal session
                 session = await engine.start(record_video=False)
                 http_status = await session.navigate(app_url)
+                auth_result = None
+                if selected_cred and selected_cred.get("username") and selected_cred.get("password"):
+                    auth_result = await session.auto_login(
+                        username=selected_cred["username"],
+                        password=selected_cred["password"],
+                        role=selected_cred.get("role", ""),
+                    )
                 info = await session.inspect_page(max_elements=15)
                 info["http_status"] = http_status
+                if auth_result:
+                    info["auth"] = auth_result
                 return info
 
-            return await asyncio.wait_for(_run(), timeout=12.0)
+            return await asyncio.wait_for(_run(), timeout=22.0)
         except Exception as e:
             logger.debug(f"Sanity live smoke probe skipped for {app_url}: {e}")
             return None
@@ -66,19 +89,28 @@ class SanityTesterAgent(BaseAgent):
         bug_report_id: Optional[int] = None,
         browsers: Optional[List[str]] = None,
         headless: bool = True,
+        runtime_telemetry: Optional[List[Dict[str, Any]]] = None,
+        judge_verdict: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Test affected components to make sure the bug resolution didn't introduce new defects."""
+        """Test affected components to make sure the fix or In-QA change didn't introduce regressions."""
         start_time = datetime.utcnow()
-        smoke_telemetry = await self._probe_live_app(
-            project_info.get("app_url"),
-            browsers=browsers,
-            headless=headless,
+        smoke_telemetry = (
+            runtime_telemetry
+            if runtime_telemetry
+            else await self._probe_live_app(
+                project_info.get("app_url"),
+                browsers=browsers,
+                headless=headless,
+                project_id=project_id,
+                project_info=project_info,
+                bug_data=resolved_bug,
+            )
         )
 
         system_prompt = (
             "You are the Sanity Testers AI Agent in QA Officer. "
-            "A defect has just been fixed and resolved. Your mission is to analyze what other parts, APIs, "
-            "database models, user flows, and dependent modules could be impacted or broken by this change.\n"
+            "A Jira ticket in 'In QA' has just been examined. Regardless of whether Judge confirmed or rejected it, your mission "
+            "is to test what other parts, APIs, database models, user flows, and dependent modules could be impacted or broken.\n"
             "Return ONLY a valid JSON object in this format:\n"
             "{\n"
             '  "affected_modules": ["Module A", "Module B"],\n'
@@ -94,18 +126,30 @@ class SanityTesterAgent(BaseAgent):
         )
 
         telemetry_block = (
-            f"\nLive Smoke Telemetry:\n{json.dumps(smoke_telemetry)}\n"
+            f"\nLive Smoke / Coroner Telemetry:\n{json.dumps(smoke_telemetry, ensure_ascii=False)[:2200]}\n"
             if smoke_telemetry
             else ""
         )
+        judge_block = (
+            f"Judge Review Verdict: {judge_verdict.get('verdict', 'N/A')} — {judge_verdict.get('judge_notes', '')}\n"
+            if isinstance(judge_verdict, dict)
+            else ""
+        )
 
+        creds_prompt = format_credentials_for_prompt(
+            project_info.get("environment_credentials"),
+            app_url=project_info.get("app_url") or "",
+        )
+        creds_block = f"{creds_prompt}\n" if creds_prompt else ""
         user_content = (
             f"Project: {project_info.get('name')}\n"
             f"App URL: {project_info.get('app_url')}\n"
-            f"Resolved Bug Title: {resolved_bug.get('title')}\n"
-            f"Resolved Bug Root Cause: {resolved_bug.get('root_cause')}\n"
-            f"Resolved Module: {resolved_bug.get('module')}\n"
-            f"Business / Requirements Context:\n{skills_context}\n"
+            f"{creds_block}"
+            f"Ticket / Bug Title: {resolved_bug.get('title')}\n"
+            f"Root Cause / Notes: {resolved_bug.get('root_cause')}\n"
+            f"Target Module: {resolved_bug.get('module')}\n"
+            f"{judge_block}"
+            f"Business / Requirements Context:\n{skills_context[:2500]}\n"
             f"{telemetry_block}"
         )
 
