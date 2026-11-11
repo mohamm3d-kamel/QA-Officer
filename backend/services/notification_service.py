@@ -39,6 +39,7 @@ JIRA_UPDATE_ACTIONS = frozenset({
     "jira_retest_resolved",
     "jira_retest_failed",
     "jira_poll_failed",
+    "jira_poll_error",
     "jira_transition_failed",
     "jira_attachment_partial_failure",
 })
@@ -90,18 +91,20 @@ def is_jira_update_event(
     """Return True iff this event represents a Jira Cloud update or Jira lifecycle failure."""
     cat = (category or "").strip().lower()
     act = (action or "").strip().lower()
-    if cat in ("watcher_sweep", "notification_delivery", "module_health"):
+    if cat in ("watcher_sweep", "notification_delivery", "module_health", "local_simulation", "regression_finding"):
         return False
     if act in NON_JIRA_ACTIONS or act in NON_AGENT_SYSTEM_FAILURE_ACTIONS:
         return False
     if act in JIRA_UPDATE_ACTIONS:
         if act in (
+            "create_jira_ticket",
+            "sync_ticket_evidence",
             "jira_status_changed",
             "jira_retest_resolved",
             "jira_retest_failed",
             "jira_status_drift_detected",
             "jira_issue_updated",
-        ) and not jira_key:
+        ) and not jira_key and (status or "").strip().lower() != "failed":
             return False
         return True
     if cat == "jira_sync":
@@ -125,7 +128,7 @@ def is_ai_agent_failure_event(
     lvl = (level or "").strip().lower()
     ag = (agent_name or "").strip().lower()
 
-    if cat in ("watcher_sweep", "notification_delivery", "module_health"):
+    if cat in ("watcher_sweep", "notification_delivery", "module_health", "local_simulation", "regression_finding"):
         return False
     if act in NON_AGENT_SYSTEM_FAILURE_ACTIONS or act in NON_JIRA_ACTIONS or act == "jira_retest_failed":
         return False
@@ -205,6 +208,7 @@ class NotificationService:
         smtp_username: str = "",
         smtp_password: str = "",
         smtp_from_email: str = "",
+        smtp_from: str = "",
         smtp_use_tls: bool = True,
         smtp_use_ssl: bool = False,
         notify_on_all_events: bool = False,
@@ -221,7 +225,9 @@ class NotificationService:
         self.smtp_port = _as_int(smtp_port, 587)
         self.smtp_username = (smtp_username or "").strip()
         self.smtp_password = smtp_password or ""
-        self.smtp_from_email = (smtp_from_email or self.smtp_username or self.email_address).strip()
+        effective_from = (smtp_from_email or smtp_from or self.smtp_username or self.email_address).strip()
+        self.smtp_from_email = effective_from
+        self.smtp_from = effective_from
         self.smtp_use_tls = bool(smtp_use_tls)
         self.smtp_use_ssl = bool(smtp_use_ssl)
 
@@ -234,6 +240,7 @@ class NotificationService:
     def from_settings(cls, settings_dict: Optional[Dict[str, Any]]) -> "NotificationService":
         """Construct a configured NotificationService from flat QA Officer Settings dict."""
         s = settings_dict or {}
+        from_val = str(s.get("smtp_from_email") or s.get("smtp_from") or "")
         return cls(
             email_enabled=_as_bool(s.get("notification_email_enabled"), False),
             email_address=str(s.get("notification_email") or ""),
@@ -243,7 +250,8 @@ class NotificationService:
             smtp_port=_as_int(s.get("smtp_port"), 587),
             smtp_username=str(s.get("smtp_username") or ""),
             smtp_password=str(s.get("smtp_password") or ""),
-            smtp_from_email=str(s.get("smtp_from_email") or ""),
+            smtp_from_email=from_val,
+            smtp_from=from_val,
             smtp_use_tls=_as_bool(s.get("smtp_use_tls"), True),
             smtp_use_ssl=_as_bool(s.get("smtp_use_ssl"), False),
             notify_on_all_events=_as_bool(s.get("notify_on_all_events"), False),
@@ -403,13 +411,13 @@ class NotificationService:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         ctx = ssl.create_default_context()
-        if self.smtp_use_ssl:
-            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=12, context=ctx) as server:
+        if self.smtp_use_ssl or self.smtp_port == 465:
+            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=15, context=ctx) as server:
                 if self.smtp_username and self.smtp_password:
                     server.login(self.smtp_username, self.smtp_password)
                 server.sendmail(from_addr, recipients, msg.as_string())
         else:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=12) as server:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=15) as server:
                 server.ehlo()
                 if self.smtp_use_tls:
                     server.starttls(context=ctx)
@@ -545,7 +553,7 @@ class NotificationService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.post(self.slack_webhook, json=payload)
                 if 200 <= response.status_code < 300:
                     logger.info(f"Slack notification sent: {title}")

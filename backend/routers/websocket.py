@@ -1,4 +1,5 @@
 """WebSocket Connection Manager and Router."""
+import asyncio
 import json
 import logging
 from typing import List, Dict, Any
@@ -10,26 +11,33 @@ router = APIRouter(tags=["websocket"])
 
 
 class ConnectionManager:
-    """Manages active WebSocket connections."""
+    """Manages active WebSocket connections safely under concurrent broadcasts."""
 
     def __init__(self):
         self.active_connections: List[WebSocket] = []
+        self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(f"WebSocket client connected. Total clients: {len(self.active_connections)}")
+        async with self._lock:
+            self.active_connections.append(websocket)
+            total = len(self.active_connections)
+        logger.info(f"WebSocket client connected. Total clients: {total}")
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-            logger.info(f"WebSocket client disconnected. Total clients: {len(self.active_connections)}")
+    async def disconnect(self, websocket: WebSocket):
+        async with self._lock:
+            if websocket in self.active_connections:
+                self.active_connections.remove(websocket)
+                logger.info(f"WebSocket client disconnected. Total clients: {len(self.active_connections)}")
 
     async def broadcast(self, message: Dict[str, Any]):
-        """Broadcast message to all connected clients."""
+        """Broadcast message to a snapshot of all connected clients."""
+        async with self._lock:
+            connections = list(self.active_connections)
+
         disconnected = []
         payload = json.dumps(message)
-        for connection in self.active_connections:
+        for connection in connections:
             try:
                 await connection.send_text(payload)
             except Exception as e:
@@ -37,7 +45,7 @@ class ConnectionManager:
                 disconnected.append(connection)
 
         for dead in disconnected:
-            self.disconnect(dead)
+            await self.disconnect(dead)
 
 
 manager = ConnectionManager()
@@ -57,8 +65,8 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception:
                 pass
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        await manager.disconnect(websocket)
     except Exception as e:
         logger.error(f"WebSocket unexpected error: {e}")
-        manager.disconnect(websocket)
+        await manager.disconnect(websocket)
 

@@ -9,19 +9,19 @@ class BugReport(Base):
     __tablename__ = "bug_reports"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     title = Column(String(500), nullable=False)
     description = Column(Text, nullable=True)
     root_cause = Column(Text, nullable=True)
     steps_to_reproduce = Column(Text, nullable=True)
     severity = Column(String(50), default="medium")  # lowest, low, medium, high, highest
-    status = Column(String(50), default="draft")  # draft, confirmed, reported, in_qa, resolved, failed
+    status = Column(String(50), default="draft", index=True)  # draft, confirmed, reported, in_qa, resolved, failed
     jira_ticket_id = Column(String(100), nullable=True)
     jira_ticket_url = Column(String(500), nullable=True)
     label = Column(String(50), nullable=True)  # Back-End, Front-End, Mobile
     formatted_report = Column(Text, nullable=True)
     module = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships

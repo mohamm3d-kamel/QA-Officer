@@ -1,4 +1,5 @@
 """Sanity Tester Agents - Tests related and affected areas of resolved bugs to prevent regressions."""
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -19,9 +20,42 @@ class SanityTesterAgent(BaseAgent):
             name="Sanity Testers",
             role="Impacted Area & Regression Verifier",
             color="#14b8a6",
-            icon="🧪"
+            icon="🧪",
         )
         self.llm = llm_router
+
+    async def _probe_live_app(
+        self,
+        app_url: Optional[str],
+        browsers: Optional[List[str]] = None,
+        headless: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Run a lightweight browser sanity probe to collect HTTP status, console, and network errors."""
+        if not app_url or str(app_url).strip().lower() in ("", "none"):
+            return None
+        engine = BrowserEngine(headless=headless, browsers=browsers or ["chromium"])
+        session = None
+        try:
+            async def _run():
+                nonlocal session
+                session = await engine.start(record_video=False)
+                http_status = await session.navigate(app_url)
+                info = await session.inspect_page(max_elements=15)
+                info["http_status"] = http_status
+                return info
+
+            return await asyncio.wait_for(_run(), timeout=12.0)
+        except Exception as e:
+            logger.debug(f"Sanity live smoke probe skipped for {app_url}: {e}")
+            return None
+        finally:
+            try:
+                if session is not None:
+                    await session.close()
+                else:
+                    await engine.stop()
+            except Exception:
+                pass
 
     async def run_sanity_checks(
         self,
@@ -30,9 +64,17 @@ class SanityTesterAgent(BaseAgent):
         project_info: Dict[str, Any],
         project_id: int,
         bug_report_id: Optional[int] = None,
+        browsers: Optional[List[str]] = None,
+        headless: bool = True,
     ) -> Dict[str, Any]:
         """Test affected components to make sure the bug resolution didn't introduce new defects."""
         start_time = datetime.utcnow()
+        smoke_telemetry = await self._probe_live_app(
+            project_info.get("app_url"),
+            browsers=browsers,
+            headless=headless,
+        )
+
         system_prompt = (
             "You are the Sanity Testers AI Agent in QA Officer. "
             "A defect has just been fixed and resolved. Your mission is to analyze what other parts, APIs, "
@@ -51,6 +93,12 @@ class SanityTesterAgent(BaseAgent):
             "}"
         )
 
+        telemetry_block = (
+            f"\nLive Smoke Telemetry:\n{json.dumps(smoke_telemetry)}\n"
+            if smoke_telemetry
+            else ""
+        )
+
         user_content = (
             f"Project: {project_info.get('name')}\n"
             f"App URL: {project_info.get('app_url')}\n"
@@ -58,63 +106,78 @@ class SanityTesterAgent(BaseAgent):
             f"Resolved Bug Root Cause: {resolved_bug.get('root_cause')}\n"
             f"Resolved Module: {resolved_bug.get('module')}\n"
             f"Business / Requirements Context:\n{skills_context}\n"
+            f"{telemetry_block}"
         )
 
         llm_failure_err: Optional[str] = None
+        log_category = "agent_action"
         try:
             response = await self.llm.chat(
                 messages=[{"role": "user", "content": user_content}],
                 system_prompt=system_prompt,
                 temperature=0.2,
+                json_mode=True,
             )
-            content = response.content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            sanity_result = json.loads(content.strip())
+            sanity_result = self.parse_json_response(response.content)
+            if not isinstance(sanity_result, dict):
+                raise ValueError("Sanity tester expected JSON object response")
+            sanity_result["llm_degraded"] = False
+            regression = bool(
+                sanity_result.get("regression_detected")
+                or str(sanity_result.get("overall_status")).upper() == "FAILED"
+            )
+            log_status = "failed" if regression else "success"
+            log_level = "warning" if regression else "success"
+            log_category = "regression_finding" if regression else "agent_action"
         except Exception as e:
             if self.llm.is_configured():
                 llm_failure_err = self.llm._redact_secrets(str(e))
-            logger.warning(f"Sanity test parsing fallback: {e}")
+                logger.warning(f"Sanity test LLM failure fallback: {llm_failure_err}")
+                log_status = "failed"
+                log_level = "error"
+                log_category = "error"
+            else:
+                logger.warning(f"Sanity test fell back to offline heuristic check: {e}")
+                log_status = "degraded"
+                log_level = "warning"
             sanity_result = {
                 "affected_modules": [resolved_bug.get("module", "Core System"), "Data Persistence"],
                 "sanity_test_cases": [
                     {
                         "name": f"Check baseline inputs around {resolved_bug.get('module')}",
                         "status": "PASSED",
-                        "details": "Verified no regression on baseline inputs."
+                        "details": "Verified no regression on baseline inputs.",
                     },
                     {
                         "name": "Verify state consistency after fix",
                         "status": "PASSED",
-                        "details": "State remains valid across views."
-                    }
+                        "details": "State remains valid across views.",
+                    },
                 ],
                 "regression_detected": False,
                 "regression_bug": None,
                 "overall_status": "PASSED",
                 "summary": "All impacted modules tested successfully. Zero regressions discovered.",
+                "llm_degraded": True,
+                "llm_error": llm_failure_err or str(e),
             }
-            if llm_failure_err:
-                sanity_result["llm_error"] = llm_failure_err
 
-        failed = bool(llm_failure_err or sanity_result.get("regression_detected") or str(sanity_result.get("overall_status")).upper() == "FAILED")
         await self.log_action(
             action="run_sanity_regression_checks",
             input_data={
                 "resolved_bug_id": bug_report_id,
                 "resolved_title": resolved_bug.get("title"),
                 "module": resolved_bug.get("module"),
+                "live_smoke": bool(smoke_telemetry),
             },
             output_data=sanity_result,
-            status="failed" if failed else "success",
+            status=log_status,
             bug_report_id=bug_report_id,
             project_id=project_id,
             module=resolved_bug.get("module") or "Sanity & Regression",
-            level="error" if failed else "success",
+            category=log_category,
+            level=log_level,
+            notify=bool(llm_failure_err),
             started_at=start_time,
         )
         return sanity_result

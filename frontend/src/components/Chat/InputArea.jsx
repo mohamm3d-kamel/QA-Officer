@@ -170,51 +170,51 @@ export default function InputArea({
     clearAllPending();
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
-    if (onSendMessage) {
-      await onSendMessage(trimmed, uploadedAttachments);
-      return;
-    }
-
-    addMessage({
-      id: Date.now(),
-      role: 'user',
-      content: trimmed,
-      attachments: uploadedAttachments,
-      timestamp: new Date().toISOString(),
-    });
-
     setSending(true);
-    setChatLoading(true);
-
     try {
+      if (onSendMessage) {
+        await onSendMessage(trimmed, uploadedAttachments);
+        return;
+      }
+
+      addMessage(
+        {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          sender: 'user',
+          role: 'user',
+          content: trimmed,
+          attachments: uploadedAttachments,
+          timestamp: new Date().toISOString(),
+        },
+        projectId
+      );
+
+      setChatLoading(true);
       const response = await api.sendMessage({
-        project_id: parseInt(projectId),
+        project_id: parseInt(projectId, 10),
         message: trimmed,
         attachments: uploadedAttachments,
       });
 
       if (response.response) {
-        addMessage({
-          id: Date.now() + 1,
-          role: 'assistant',
-          content: response.response,
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      if (response.agent_updates) {
-        response.agent_updates.forEach((update, i) => {
-          addMessage({
-            id: Date.now() + 2 + i,
-            role: 'agent',
-            agent: update.agent,
-            content: update.message || update.output,
+        addMessage(
+          {
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            sender: 'agent',
+            role: 'assistant',
+            agent: response.agent || 'Desk Officer',
+            content: response.response,
+            evidence: response.evidence || response.pipeline_result?.evidence,
+            llm_mode: response.llm_mode,
+            llm_notice: response.llm_notice,
+            llmDegraded: Boolean(response.llm_degraded),
             timestamp: new Date().toISOString(),
-          });
-        });
+          },
+          projectId
+        );
       }
     } catch (err) {
-      toast.error(err.message || 'Failed to send message');
+      toast.error(err?.message || 'Failed to send message');
     } finally {
       setSending(false);
       setChatLoading(false);
@@ -344,6 +344,7 @@ export default function InputArea({
             <textarea
               ref={textareaRef}
               value={text}
+              disabled={isBusy}
               onChange={(e) => {
                 setText(e.target.value);
                 handleResize();
@@ -352,7 +353,7 @@ export default function InputArea({
               onPaste={handlePaste}
               placeholder="Chat with Desk Officer, describe a bug, or paste / drop images, PDFs, HAR traces & log files..."
               rows={1}
-              className="w-full input-field resize-none pr-10 py-3 text-sm min-h-[44px]"
+              className="w-full input-field resize-none pr-10 py-3 text-sm min-h-[44px] disabled:opacity-60"
             />
           </div>
 
@@ -412,6 +413,7 @@ export default function InputArea({
 
       {showAutoTest && (
         <AutoTestModal
+          isOpen={showAutoTest}
           projectId={projectId}
           onClose={() => setShowAutoTest(false)}
         />

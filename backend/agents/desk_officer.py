@@ -30,8 +30,8 @@ AGENT_ROSTER: List[Dict[str, str]] = [
     {
         "key": "detective",
         "name": "Detective",
-        "role": "Root Cause Investigator & Tracer",
-        "description": "Traces bug symptoms, logs, and business requirements to identify root cause, reproduction steps, severity, label, and affected module; also retests fixes and performs autonomous bug discovery.",
+        "role": "Root Cause Investigator",
+        "description": "Traces bug symptoms, live browser telemetry, runtime errors, logs, and business requirements to identify root cause, reproduction steps, severity, label, and affected module; and retests fixes or runs autonomous discovery.",
     },
     {
         "key": "coroner",
@@ -49,7 +49,7 @@ AGENT_ROSTER: List[Dict[str, str]] = [
         "key": "reporter",
         "name": "Reporter",
         "role": "Bug Report Author",
-        "description": "Authors the formatted Markdown bug report adhering strictly to the project's custom report template.",
+        "description": "Authors clean, verified Markdown bug reports incorporating Detective findings, Coroner visual evidence, and Judge verdicts while adhering strictly to the project's configured Report Format template as-is.",
     },
     {
         "key": "sheriff",
@@ -90,6 +90,29 @@ _NEGATION_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _CLAUSE_SPLIT_RE = re.compile(r"[,.;!?\n—]+|--|\b(?:but|however|except|and)\b", re.IGNORECASE)
+
+_GREETING_PHRASES = {
+    "hi", "hello", "hey", "yo", "hola", "salam", "salam alaikum", "marhaba",
+    "good morning", "good afternoon", "good evening", "how are you",
+    "how are you doing", "whats up", "what's up", "sup",
+    "hi there", "hello there", "hey there",
+    "hi desk officer", "hello desk officer", "hey desk officer",
+    "test", "testing",
+}
+_ACK_PHRASES = {
+    "ok", "okay", "k", "thanks", "thank you", "thx", "ty",
+    "thanks a lot", "thank you so much", "thank you very much",
+    "cool", "nice", "great", "awesome", "perfect", "got it",
+    "sounds good", "noted", "bye", "goodbye",
+}
+_BUG_SIGNAL_RE = re.compile(
+    r"\b(bug|bugs|error|errors|fail|fails|failed|crash|crashes|broken|issue|issues|defect|404|500|exception|timeout|slow|fix|broken|create|assign|jira|retest|sanity)\b",
+    re.IGNORECASE,
+)
+_BUG_LIST_QUERY_RE = re.compile(
+    r"\b(what|which|show|list|view|get|check|status\s+of)\b[^.?\n]{0,30}\b(bugs?|defects?|issues?|tickets?|reports?)\b|\b(recent|latest|open|tracked)\s+(bugs?|defects?|issues?|tickets?)\b",
+    re.IGNORECASE,
+)
 
 
 def format_agent_roster() -> str:
@@ -432,7 +455,7 @@ class DeskOfficerAgent(BaseAgent):
             ("detective", r"\bdetective\b"),
             ("coroner", r"\bcoroner\b"),
             ("judge", r"\bjudge\b"),
-            ("reporter", r"\breporter\b"),
+            ("reporter", r"(?<!default\s)(?<!jira\s)\breporter\b"),
             ("watcher", r"\bwatcher\b"),
             ("sanity", r"\bsanity(\s+testers?)?\b"),
         ]
@@ -563,13 +586,29 @@ class DeskOfficerAgent(BaseAgent):
         return collected
 
     @classmethod
+    def _classify_small_talk(cls, text: str) -> Optional[str]:
+        """Classify greetings and short acknowledgements so they aren't treated as bug notes."""
+        normalized = " ".join(re.sub(r"[^\w'\s]", " ", (text or "").lower()).split())
+        if not normalized or len(normalized.split()) > 6:
+            return None
+        if normalized in _ACK_PHRASES:
+            return "ack"
+        if normalized in _GREETING_PHRASES:
+            return "greeting"
+        # Extended elongated greetings like 'hiii' / 'heyyy' / 'hi how are you'
+        first_word = normalized.split()[0]
+        if re.match(r"^(hi+|hello+|hey+)$", first_word) and not _BUG_SIGNAL_RE.search(normalized):
+            return "greeting"
+        return None
+
+    @classmethod
     def _synthesize_bug_context(
         cls,
         message: str,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        """Combine prior chat discussion and attached files/images about the active bug."""
+        """Combine prior substantive chat discussion and attached files/images about the active bug."""
         chunks: List[str] = []
         active_history = cls._slice_history_since_last_completed_report(conversation_history)
         if active_history:
@@ -579,15 +618,15 @@ class DeskOfficerAgent(BaseAgent):
                 content = (item.get("content") or "").strip()
                 if not content or item.get("isStatus"):
                     continue
-                if sender == "user":
-                    if re.match(r"^(hi|hello|hey|yo|hola|salam|good\s+(?:morning|afternoon|evening)|how are you|ok|okay|thanks|thank you)[!.?\s]*$", content.lower()):
-                        continue
+                if sender == "user" and not cls._classify_small_talk(content):
                     user_notes.append(content)
             if user_notes:
                 chunks.append("Prior bug discussion from user:\n" + "\n---\n".join(user_notes))
 
         trimmed = message.strip()
-        if trimmed:
+        if trimmed and not cls._classify_small_talk(trimmed):
+            chunks.append(f"Latest user instruction:\n{trimmed}")
+        elif not chunks and trimmed:
             chunks.append(f"Latest user instruction:\n{trimmed}")
 
         all_atts = cls._collect_active_attachments(attachments, conversation_history, include_binary_from_history=False)
@@ -830,7 +869,7 @@ class DeskOfficerAgent(BaseAgent):
 
         for t in raw_user_turns:
             lower = t.lower()
-            if re.match(r"^(hi|hello|hey|yo|hola|salam|good\s+(morning|afternoon|evening)|how are you)[!.?\s]*$", lower):
+            if cls._classify_small_talk(lower):
                 continue
             if cls._is_question_about_agent(lower):
                 continue
@@ -885,7 +924,16 @@ class DeskOfficerAgent(BaseAgent):
             + (1 if analysis["urls"] else 0)
         )
 
-        if len(bug_turns) >= 2 or len(combined_substantive) >= 140 or signals >= 2:
+        prior_turns = self._extract_substantive_bug_turns("", conversation_history)
+        current_substantive = self._strip_command_phrases(message)
+        current_is_pure_command = len(current_substantive) < 12
+
+        if (
+            len(bug_turns) >= 2
+            or len(combined_substantive) >= 140
+            or signals >= 2
+            or (prior_turns and current_is_pure_command and (signals >= 1 or len(combined_substantive) >= 80))
+        ):
             return False, "", []
 
         snippet = bug_turns[-1].strip().splitlines()[0][:110]
@@ -1003,8 +1051,9 @@ class DeskOfficerAgent(BaseAgent):
                     "Show all project assets and built-in agents",
                 ]
 
-        # 1. Pure greeting / conversational opener
-        if re.match(r"^(hi|hello|hey|yo|hola|salam|good\s+(morning|afternoon|evening)|how are you)[!.?\s]*$", lower):
+        # 1. Greetings & short acknowledgements
+        small_talk = self._classify_small_talk(message)
+        if small_talk == "greeting":
             unraised_count = sum(1 for b in recent_bugs if not b.get("jira_ticket_id") and b.get("status") != "resolved")
             bug_line = (
                 f"You currently have **{len(recent_bugs)}** tracked defect(s) in **{proj_name}**"
@@ -1023,6 +1072,16 @@ class DeskOfficerAgent(BaseAgent):
                 "Check my Jira In QA list",
                 "Show all project assets and built-in agents",
                 "Run Auto-Test discovery",
+            ]
+        if small_talk == "ack":
+            reply = (
+                "Got it! Let me know whenever you want to discuss another bug, investigate an issue, "
+                "say **\"Create a bug report\"**, or assign any QA agent."
+            )
+            return reply, [
+                "Check my Jira In QA list",
+                "Show all project assets and built-in agents",
+                "Create a bug report",
             ]
 
         # 2. Questions about specific built-in agent or full roster / project assets
@@ -1431,6 +1490,7 @@ class DeskOfficerAgent(BaseAgent):
             "attachments": [],
             "suggested_actions": suggested,
             "llm_mode": "fallback",
+            "llm_degraded": (not self.llm.is_configured()) or bool(llm_error),
             "llm_notice": llm_error or self.llm.configuration_issue(),
         }
 
@@ -1657,6 +1717,7 @@ class DeskOfficerAgent(BaseAgent):
             "attachments": active_attachments,
             "suggested_actions": suggested_actions,
             "llm_mode": "live",
+            "llm_degraded": False,
             "llm_notice": None,
         }
 
@@ -1778,6 +1839,7 @@ class DeskOfficerAgent(BaseAgent):
                 asset_snapshot=asset_snapshot,
                 prefetched_results=prefetched_results,
             )
+            decision["llm_degraded"] = False
             await self.log_action(
                 action="triage_chat_message",
                 input_data={"message": message[:300], "project_id": project_id},
@@ -1942,6 +2004,10 @@ class DeskOfficerAgent(BaseAgent):
             decision["executed_asset_ops"] = executed_asset_ops
 
         had_live_llm_error = bool(decision.get("llm_mode") == "fallback" and decision.get("llm_notice") and self.llm.is_configured())
+        is_degraded = bool(decision.get("llm_mode") == "fallback" or decision.get("llm_degraded"))
+        decision.setdefault("llm_degraded", is_degraded)
+        log_status = "failed" if had_live_llm_error else ("degraded" if is_degraded else "success")
+        log_level = "error" if had_live_llm_error else ("warning" if is_degraded else "success")
         await self.log_action(
             action=f"desk_officer_{decision['action']}",
             input_data={
@@ -1958,12 +2024,14 @@ class DeskOfficerAgent(BaseAgent):
                 "jira_key": decision.get("jira_key"),
                 "jira_project_key": decision.get("jira_project_key"),
                 "force_new_ticket": decision.get("force_new_ticket"),
-                **({"llm_notice": decision.get("llm_notice")} if had_live_llm_error else {}),
+                "llm_degraded": is_degraded,
+                **({"llm_notice": decision.get("llm_notice")} if (had_live_llm_error or is_degraded) and decision.get("llm_notice") else {}),
             },
-            status="failed" if had_live_llm_error else "success",
+            status=log_status,
             module="Desk Officer Chat",
             category="error" if had_live_llm_error else "agent_action",
-            level="error" if had_live_llm_error else None,
+            level=log_level,
+            notify=bool(had_live_llm_error),
             bug_report_id=decision.get("bug_report_id"),
             jira_key=decision.get("jira_key"),
             project_id=project_id,

@@ -33,6 +33,7 @@ class TestNotificationRequest(BaseModel):
     smtp_username: Optional[str] = None
     smtp_password: Optional[str] = None
     smtp_from_email: Optional[str] = None
+    smtp_from: Optional[str] = None
     smtp_use_tls: Optional[str] = None
     smtp_use_ssl: Optional[str] = None
     notification_slack_enabled: Optional[str] = None
@@ -41,23 +42,32 @@ class TestNotificationRequest(BaseModel):
 
 @router.get("")
 async def get_settings(db: AsyncSession = Depends(get_db)):
-    """Get all settings, initialized with defaults."""
+    """Get all settings, initialized with defaults and with secrets masked."""
     res = await db.execute(select(Settings))
     existing = {s.key: s.value for s in res.scalars().all()}
 
     merged = {**config.DEFAULTS, **existing}
-    return [{"key": k, "value": v} for k, v in merged.items()]
+    return [
+        {
+            "key": k,
+            "value": config.mask_secret(v) if k in config.SECRET_SETTING_KEYS else v,
+        }
+        for k, v in merged.items()
+    ]
 
 
 @router.put("")
 async def update_settings(payload: Dict[str, Any], db: AsyncSession = Depends(get_db)):
-    """Update settings in bulk and notify Watcher of configuration changes."""
+    """Update settings in bulk while preserving existing secrets if masked placeholders are sent back."""
     res = await db.execute(select(Settings))
     existing = {s.key: s for s in res.scalars().all()}
     changed_keys: List[str] = []
 
     for key, value in payload.items():
         val_str = str(value) if value is not None else ""
+        # Keep existing stored secret if client submits back the masked placeholder
+        if key in config.SECRET_SETTING_KEYS and val_str.startswith("••••"):
+            continue
         if key in existing:
             if existing[key].value != val_str:
                 changed_keys.append(key)
@@ -77,9 +87,11 @@ async def update_settings(payload: Dict[str, Any], db: AsyncSession = Depends(ge
             category="system_change",
             status="success",
             level="change",
-            agent_name="Watcher",
+            agent_name="System",
             input_data={"changed_keys": changed_keys, "values": sanitize_for_log(payload)},
             output_data={"updated_count": len(changed_keys), "changed_keys": changed_keys},
+            notify=False,
+            notify_ui_bell=False,
         )
 
     return {"message": "Settings updated successfully", "changed_keys": changed_keys}
@@ -111,7 +123,11 @@ async def test_llm_connection(payload: TestLLMRequest, db: AsyncSession = Depend
     all_settings = {s.key: s.value for s in res.scalars().all()}
 
     provider = payload.llm_provider if payload.llm_provider is not None else all_settings.get("llm_provider", "openai")
-    api_key = payload.llm_api_key if payload.llm_api_key is not None else all_settings.get("llm_api_key", "")
+    submitted_key = payload.llm_api_key
+    if submitted_key is None or str(submitted_key).startswith("••••"):
+        api_key = all_settings.get("llm_api_key", "")
+    else:
+        api_key = submitted_key
     model = payload.llm_model if payload.llm_model is not None else all_settings.get("llm_model", "gpt-4")
     base_url = payload.llm_base_url if payload.llm_base_url is not None else all_settings.get("llm_base_url", "")
 
@@ -132,9 +148,10 @@ async def test_llm_connection(payload: TestLLMRequest, db: AsyncSession = Depend
             category="agent_action",
             status="success",
             level="success",
-            agent_name="Watcher",
+            agent_name="System",
             output_data={"provider": llm.provider, "model": resp.model or llm.model, "latency_ms": latency_ms},
             notify=False,
+            notify_ui_bell=False,
         )
         return {
             "ok": True,
@@ -154,8 +171,10 @@ async def test_llm_connection(payload: TestLLMRequest, db: AsyncSession = Depend
             category="error",
             status="failed",
             level="error",
-            agent_name="Watcher",
+            agent_name="System",
             output_data={"provider": llm.provider, "model": llm.model, "error": err_msg},
+            notify=False,
+            notify_ui_bell=False,
         )
         return {
             "ok": False,
@@ -180,6 +199,11 @@ async def test_notification_channels(
     overrides = req.model_dump(exclude_none=True)
     channel = str(overrides.pop("channel", "all") or "all").lower()
 
+    # Preserve stored plaintext secrets when UI passes back masked preview placeholders
+    for secret_key in config.SECRET_SETTING_KEYS:
+        if secret_key in overrides and str(overrides[secret_key]).startswith("••••"):
+            overrides.pop(secret_key, None)
+
     merged = {**config.DEFAULTS, **stored, **overrides}
     if channel == "slack":
         merged["notification_slack_enabled"] = "true"
@@ -194,8 +218,8 @@ async def test_notification_channels(
     delivery = await notifier.notify_event(
         title="Test Notification — QA Officer Watcher Active",
         message=(
-            "QA Officer Watcher is monitoring every module, every AI agent, and all logs. "
-            "Updates for changes, failures, and successes will arrive on this channel."
+            "QA Officer Watcher is active. Slack and Email alerts are configured to notify you "
+            "on Jira updates and AI agent failures."
         ),
         level="info",
         category="notification_test",

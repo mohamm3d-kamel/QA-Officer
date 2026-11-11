@@ -1,22 +1,17 @@
 """Watcher Agent - Tracks Jira updates & transitions and monitors AI agent failures."""
-import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import httpx
 from sqlalchemy import select
 
+import config
 from agents.base import BaseAgent
 from agents.detective import DetectiveAgent
 from agents.coroner import CoronerAgent
 from services.jira_client import JiraClient, is_real_jira_issue_key
-from services.notification_service import (
-    NotificationService,
-    _as_bool,
-    is_ai_agent_failure_event,
-    is_jira_update_event,
-)
+from services.notification_service import NotificationService, _as_bool
 from services.watcher_bus import record_system_event
 from database import async_session
 from models.agent_log import AgentLog
@@ -39,6 +34,66 @@ def _map_jira_status_to_local(raw_status: str) -> str:
     if norm in ("backlog", "todo", "selectedfordevelopment", "open", "reported"):
         return "reported"
     return "reported"
+
+
+def _diff_jira_snapshot(
+    recent_issues: List[Dict[str, Any]],
+    prev_snapshot_raw: str,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Compare live Jira issues against the last stored snapshot to detect board updates cleanly."""
+    curr_snapshot: Dict[str, Dict[str, Any]] = {}
+    for iss in recent_issues or []:
+        key = str(iss.get("key") or "").strip().upper()
+        if not key:
+            continue
+        curr_snapshot[key] = {
+            "status": iss.get("status") or "",
+            "summary": iss.get("summary") or "",
+            "priority": iss.get("priority") or "",
+            "updated": iss.get("updated") or "",
+            "url": iss.get("url") or "",
+        }
+
+    prev_snapshot: Optional[Dict[str, Any]] = None
+    if (prev_snapshot_raw or "").strip():
+        try:
+            loaded = json.loads(prev_snapshot_raw)
+            if isinstance(loaded, dict):
+                prev_snapshot = loaded
+        except Exception:
+            prev_snapshot = None
+
+    curr_json = json.dumps(curr_snapshot, ensure_ascii=False)
+    if prev_snapshot is None:
+        # Establish baseline on very first snapshot without flooding existing tickets
+        return [], curr_json
+
+    changes: List[Dict[str, Any]] = []
+    for key, cur in curr_snapshot.items():
+        prev = prev_snapshot.get(key)
+        if not prev:
+            changes.append({
+                "key": key,
+                "change_type": "created_or_updated",
+                "status": cur.get("status"),
+                "summary": cur.get("summary"),
+                "url": cur.get("url"),
+            })
+            continue
+        diffs = {}
+        for field in ("status", "summary", "priority", "updated"):
+            if (cur.get(field) or "") != (prev.get(field) or ""):
+                diffs[field] = {"old": prev.get(field), "new": cur.get(field)}
+        if diffs:
+            changes.append({
+                "key": key,
+                "change_type": "status_changed" if "status" in diffs else "issue_updated",
+                "status": cur.get("status"),
+                "summary": cur.get("summary"),
+                "url": cur.get("url"),
+                "diffs": diffs,
+            })
+    return changes, curr_json
 
 
 class WatcherAgent(BaseAgent):
@@ -68,10 +123,20 @@ class WatcherAgent(BaseAgent):
         jira_settings: Dict[str, str],
         force_status: Optional[str] = None,
         update_jira: bool = True,
-        notify: bool = True,
+        notify: Optional[bool] = None,
+        browsers: Optional[List[str]] = None,
+        headless: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Check status of a specific ticket, detect drift, and trigger retest flow if in 'In QA'."""
         start_time = datetime.utcnow()
+        effective_notify = _as_bool((jira_settings or {}).get("watcher_enabled"), True) if notify is None else bool(notify)
+        eff_browsers = browsers or config.get_enabled_browsers(jira_settings or {})
+        eff_headless = (
+            str((jira_settings or {}).get("browser_headless", "true")).lower() == "true"
+            if headless is None
+            else bool(headless)
+        )
+
         async with async_session() as session:
             bug = await session.get(BugReport, bug_report_id)
             if not bug:
@@ -87,9 +152,11 @@ class WatcherAgent(BaseAgent):
             email = (jira_settings.get("jira_email") or "").strip()
             token = (jira_settings.get("jira_api_token") or "").strip()
 
+            live_jira_configured = bool(base_url and email and token)
+            has_real_jira = bool(live_jira_configured and bug.jira_ticket_id and is_real_jira_issue_key(bug.jira_ticket_id))
             jira_poll_error: Optional[str] = None
             jira_status_fetched: Optional[str] = None
-            if base_url and email and token and bug.jira_ticket_id and is_real_jira_issue_key(bug.jira_ticket_id):
+            if has_real_jira:
                 try:
                     jira_client = JiraClient(base_url, email, token)
                     issue = await jira_client.get_issue(bug.jira_ticket_id)
@@ -99,24 +166,23 @@ class WatcherAgent(BaseAgent):
                 except Exception as e:
                     jira_poll_error = str(e)
                     logger.warning(f"Could not poll Jira issue {bug.jira_ticket_id}: {e}")
+                    if force_status is None:
+                        await self.log_action(
+                            action="jira_poll_failed",
+                            input_data={"bug_id": bug.id, "ticket": bug.jira_ticket_id},
+                            output_data={"error": jira_poll_error},
+                            status="failed",
+                            bug_report_id=bug.id,
+                            project_id=bug.project_id,
+                            module=bug.module or "Jira Integration",
+                            category="jira_sync",
+                            level="error",
+                            jira_key=bug.jira_ticket_id,
+                            notify=effective_notify,
+                            started_at=start_time,
+                        )
 
             is_in_qa = str(current_status or "").lower().replace(" ", "") in ("inqa", "in_qa")
-
-            if jira_poll_error and force_status is None:
-                await self.log_action(
-                    action="jira_poll_failed",
-                    input_data={"bug_id": bug.id, "ticket": bug.jira_ticket_id},
-                    output_data={"error": jira_poll_error},
-                    status="failed",
-                    bug_report_id=bug.id,
-                    project_id=bug.project_id,
-                    module=bug.module or "Jira Integration",
-                    category="jira_sync",
-                    level="error",
-                    jira_key=bug.jira_ticket_id,
-                    notify=notify,
-                    started_at=start_time,
-                )
 
             if not is_in_qa and force_status is None:
                 mapped = _map_jira_status_to_local(current_status) if jira_status_fetched else bug.status
@@ -136,20 +202,7 @@ class WatcherAgent(BaseAgent):
                         bug_report_id=bug.id,
                         jira_key=bug.jira_ticket_id,
                         output_data={"old_status": previous_local_status, "new_jira_status": jira_status_fetched},
-                        notify=notify,
-                    )
-                else:
-                    await self.log_action(
-                        action="status_check",
-                        input_data={"bug_id": bug.id, "ticket": bug.jira_ticket_id, "status": current_status},
-                        output_data={"action_taken": "none", "reason": "Not in 'In QA' column"},
-                        status="success",
-                        bug_report_id=bug.id,
-                        project_id=bug.project_id,
-                        module=bug.module or "Jira Integration",
-                        jira_key=bug.jira_ticket_id,
-                        notify=False,
-                        started_at=start_time,
+                        notify=effective_notify,
                     )
                 return {
                     "status": current_status,
@@ -159,11 +212,11 @@ class WatcherAgent(BaseAgent):
                     "drifted": drifted,
                 }
 
-            # Ticket is IN QA -> notify real Jira ticket detection and launch Detective retest
+            # Ticket is IN QA -> notify real Jira transition and launch Detective retest
             bug.status = "in_qa"
             await session.commit()
 
-            if notify and update_jira and bug.jira_ticket_id:
+            if effective_notify and has_real_jira and update_jira and (force_status is not None or not jira_poll_error):
                 await self.notifier.notify_status_change(
                     jira_key=bug.jira_ticket_id,
                     old_status=previous_local_status,
@@ -178,11 +231,14 @@ class WatcherAgent(BaseAgent):
                 project_info=project_info,
                 project_id=bug.project_id,
                 bug_report_id=bug.id,
+                browsers=eff_browsers,
+                headless=eff_headless,
             )
 
             is_resolved = retest_result.get("is_resolved", False)
             target_status = "Ready To Deploy" if is_resolved else "Failed QA"
 
+            # Always capture failure evidence when QA fails (both local and Jira mode)
             failure_evidence = []
             if not is_resolved:
                 failure_evidence = await self.coroner.capture_evidence(
@@ -191,15 +247,16 @@ class WatcherAgent(BaseAgent):
                     stage="retest",
                     bug_report_id=bug.id,
                     project_id=bug.project_id,
+                    browsers=eff_browsers,
+                    headless=eff_headless,
                 )
 
             jira_updated = False
             jira_transition_error: Optional[str] = None
-            if update_jira and base_url and email and token and bug.jira_ticket_id:
+            if update_jira and has_real_jira:
                 try:
                     jira_client = JiraClient(base_url, email, token)
-                    await jira_client.transition_issue(bug.jira_ticket_id, target_status)
-                    jira_updated = True
+                    jira_updated = bool(await jira_client.transition_issue(bug.jira_ticket_id, target_status))
 
                     if not is_resolved:
                         comment = (
@@ -228,13 +285,13 @@ class WatcherAgent(BaseAgent):
                         category="jira_sync",
                         level="error",
                         jira_key=bug.jira_ticket_id,
-                        notify=notify,
+                        notify=effective_notify,
                     )
 
             bug.status = "resolved" if is_resolved else "failed"
             await session.commit()
 
-            if notify and update_jira and bug.jira_ticket_id:
+            if effective_notify and has_real_jira and update_jira and jira_updated:
                 if is_resolved:
                     await self.notifier.notify_bug_resolved(
                         bug.title,
@@ -253,6 +310,11 @@ class WatcherAgent(BaseAgent):
                         bug_id=bug.id,
                     )
 
+            retest_log_status = (
+                "degraded"
+                if retest_result.get("llm_degraded") and not (self.detective.llm.is_configured())
+                else ("success" if is_resolved else "failed")
+            )
             await self.log_action(
                 action="retest_workflow_executed",
                 input_data={
@@ -267,12 +329,12 @@ class WatcherAgent(BaseAgent):
                     "jira_updated": jira_updated,
                     "result": retest_result,
                 },
-                status="success" if is_resolved else "failed",
+                status=retest_log_status,
                 bug_report_id=bug.id,
                 project_id=bug.project_id,
                 module=bug.module or "QA Verification",
                 category="status_change",
-                level="success" if is_resolved else "error",
+                level="warning" if retest_log_status == "degraded" else ("success" if is_resolved else "error"),
                 jira_key=bug.jira_ticket_id,
                 notify=False,
                 started_at=start_time,
@@ -321,9 +383,9 @@ class WatcherAgent(BaseAgent):
         jira_settings: Dict[str, str],
         project_id: Optional[int] = None,
         include_app_health: bool = True,
-        notify: bool = True,
+        notify: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Audit every project, module, AI agent, Jira ticket, and system log, then dispatch alerts."""
+        """Audit projects, modules, AI agents, Jira tickets, and logs; dispatch alerts strictly for Jira updates & AI agent failures."""
         start_time = datetime.utcnow()
         s = jira_settings or {}
         monitor_modules = _as_bool(s.get("watcher_monitor_modules"), True)
@@ -337,6 +399,11 @@ class WatcherAgent(BaseAgent):
 
             # Refresh notifier from effective settings so sweep uses latest Slack/Email/SMTP config
             self.notifier = NotificationService.from_settings(effective_settings)
+            effective_notify = (
+                _as_bool(effective_settings.get("watcher_enabled"), True)
+                if notify is None
+                else (bool(notify) and _as_bool(effective_settings.get("watcher_enabled"), True))
+            )
 
             last_sweep_raw = effective_settings.get("watcher_last_sweep_at") or ""
             since_dt = datetime.utcnow() - timedelta(hours=24)
@@ -369,16 +436,25 @@ class WatcherAgent(BaseAgent):
         # 1. Check active / tracked bugs + Jira status changes & In QA retests
         retested_tickets: List[Dict[str, Any]] = []
         jira_changes: List[Dict[str, Any]] = []
+        drift_emitted_keys = set()
         for bug in all_bugs:
             should_poll = bug.status in ("reported", "in_qa", "failed", "confirmed")
             if not should_poll:
                 continue
             try:
-                res = await self.check_ticket_and_process(bug.id, effective_settings)
+                res = await self.check_ticket_and_process(
+                    bug.id,
+                    effective_settings,
+                    notify=effective_notify,
+                )
                 if res.get("new_status") or res.get("is_resolved") is not None:
                     retested_tickets.append({"bug_id": bug.id, "jira_key": bug.jira_ticket_id, **res})
+                    if bug.jira_ticket_id:
+                        drift_emitted_keys.add(str(bug.jira_ticket_id).upper())
                 elif res.get("drifted"):
                     jira_changes.append({"bug_id": bug.id, "jira_key": bug.jira_ticket_id, "status": res.get("status")})
+                    if bug.jira_ticket_id:
+                        drift_emitted_keys.add(str(bug.jira_ticket_id).upper())
             except Exception as e:
                 logger.error(f"Watcher sweep error on bug #{bug.id}: {e}")
                 await record_system_event(
@@ -393,9 +469,11 @@ class WatcherAgent(BaseAgent):
                     bug_report_id=bug.id,
                     jira_key=bug.jira_ticket_id,
                     output_data={"error": str(e)},
+                    notify=effective_notify,
+                    notify_ui_bell=effective_notify,
                 )
 
-        # 2. Target app health checks across projects
+        # 2. Target app health checks across projects (audit log only; never triggers Jira/AI-failure alert)
         app_health_checks: List[Dict[str, Any]] = []
         unhealthy_apps: List[Dict[str, Any]] = []
         if include_app_health and monitor_modules:
@@ -412,9 +490,11 @@ class WatcherAgent(BaseAgent):
                             category="module_health",
                             status="failed",
                             level="error",
-                            agent_name="Watcher",
+                            agent_name="System",
                             project_id=proj.id,
                             output_data=probe,
+                            notify=False,
+                            notify_ui_bell=False,
                         )
 
         # 3. Module telemetry audit
@@ -446,6 +526,7 @@ class WatcherAgent(BaseAgent):
         stale_running: List[Dict[str, Any]] = []
         changes_detected: List[Dict[str, Any]] = list(jira_changes)
         success_count = 0
+        degraded_count = 0
         now_utc = datetime.utcnow()
 
         if monitor_agents or monitor_logs:
@@ -454,12 +535,15 @@ class WatcherAgent(BaseAgent):
                 st = lg.status or "unknown"
                 ab = agents_audit.setdefault(
                     ag,
-                    {"total": 0, "success": 0, "failed": 0, "running": 0, "latest_action": lg.action, "latest_status": st},
+                    {"total": 0, "success": 0, "failed": 0, "degraded": 0, "running": 0, "latest_action": lg.action, "latest_status": st},
                 )
                 ab["total"] += 1
                 if st == "success":
                     ab["success"] += 1
                     success_count += 1
+                elif st == "degraded":
+                    ab["degraded"] += 1
+                    degraded_count += 1
                 elif st == "failed":
                     ab["failed"] += 1
                     failures_detected.append({
@@ -482,36 +566,92 @@ class WatcherAgent(BaseAgent):
                         "module": lg.module or "System",
                     })
 
-        # 5. Live Jira board pulse if credentials configured
-        jira_pulse: Dict[str, Any] = {"configured": False}
+        # 5. Live Jira board pulse & snapshot diffing (detects ALL Jira updates across board)
+        jira_pulse: Dict[str, Any] = {"configured": False, "updated_issues": []}
         j_base = (effective_settings.get("jira_base_url") or "").strip()
         j_email = (effective_settings.get("jira_email") or "").strip()
         j_tok = (effective_settings.get("jira_api_token") or "").strip()
+        new_snapshot_json: Optional[str] = None
+        board_jira_updates: List[Dict[str, Any]] = []
+
         if j_base and j_email and j_tok:
             jira_pulse["configured"] = True
             try:
                 client = JiraClient(j_base, j_email, j_tok)
-                recent_issues = await client.search_jql("updated >= -14d ORDER BY updated DESC", max_results=15)
+                recent_issues = await client.search_jql("updated >= -14d ORDER BY updated DESC", max_results=20)
                 in_qa_jira = [i["key"] for i in recent_issues if str(i.get("status") or "").lower().replace(" ", "") in ("inqa", "in_qa")]
                 jira_pulse["recent_count"] = len(recent_issues)
                 jira_pulse["in_qa_keys"] = in_qa_jira
+
+                diff_list, new_snapshot_json = _diff_jira_snapshot(
+                    recent_issues,
+                    effective_settings.get("watcher_jira_issue_snapshot") or "",
+                )
+                for diff_item in diff_list[:5]:
+                    key = diff_item["key"]
+                    if key in drift_emitted_keys:
+                        continue
+                    board_jira_updates.append(diff_item)
+                    jira_changes.append({"jira_key": key, "status": diff_item.get("status"), "change_type": diff_item.get("change_type")})
+                    if diff_item.get("diffs", {}).get("status"):
+                        st_diff = diff_item["diffs"]["status"]
+                        msg_summary = f"Jira update: {key} moved from '{st_diff.get('old')}' to '{st_diff.get('new')}'."
+                    elif diff_item.get("change_type") == "created_or_updated":
+                        msg_summary = f"Jira update detected on {key} ({diff_item.get('status')}): {diff_item.get('summary')}"
+                    else:
+                        msg_summary = f"Jira issue {key} was updated ({diff_item.get('status')}): {diff_item.get('summary')}"
+                    await record_system_event(
+                        action="jira_issue_updated",
+                        summary=msg_summary,
+                        module="Jira Integration",
+                        category="jira_sync",
+                        status="success",
+                        level="change",
+                        agent_name="Watcher",
+                        project_id=project_id,
+                        jira_key=key,
+                        output_data=diff_item,
+                        notify=effective_notify,
+                        notify_ui_bell=effective_notify,
+                    )
+                jira_pulse["updated_issues"] = board_jira_updates
             except Exception as j_err:
                 jira_pulse["error"] = str(j_err)
+                await record_system_event(
+                    action="jira_poll_failed",
+                    summary=f"Watcher failed polling Jira Cloud board: {j_err}",
+                    module="Jira Integration",
+                    category="jira_sync",
+                    status="failed",
+                    level="error",
+                    agent_name="Watcher",
+                    project_id=project_id,
+                    output_data={"error": str(j_err)},
+                    notify=effective_notify,
+                    notify_ui_bell=effective_notify,
+                )
 
-        # Save sweep timestamp checkpoint
+        # Save sweep timestamp checkpoint + Jira board snapshot
         async with async_session() as session:
-            row = (
-                await session.execute(select(Settings).where(Settings.key == "watcher_last_sweep_at"))
-            ).scalar_one_or_none()
             now_iso = now_utc.isoformat()
-            if row:
-                row.value = now_iso
-            else:
-                session.add(Settings(key="watcher_last_sweep_at", value=now_iso))
+            updates_to_save = {"watcher_last_sweep_at": now_iso}
+            if new_snapshot_json is not None and not project_id:
+                updates_to_save["watcher_jira_issue_snapshot"] = new_snapshot_json
+            elif new_snapshot_json is not None and not (effective_settings.get("watcher_jira_issue_snapshot") or "").strip():
+                updates_to_save["watcher_jira_issue_snapshot"] = new_snapshot_json
+
+            for k, val in updates_to_save.items():
+                row = (
+                    await session.execute(select(Settings).where(Settings.key == k))
+                ).scalar_one_or_none()
+                if row:
+                    row.value = val
+                else:
+                    session.add(Settings(key=k, value=val))
             await session.commit()
 
         overall_status = "failed" if (failures_detected or unhealthy_apps) else "success"
-        overall_level = "error" if (failures_detected or unhealthy_apps) else ("change" if (retested_tickets or changes_detected) else "success")
+        overall_level = "error" if (failures_detected or unhealthy_apps) else ("change" if (retested_tickets or jira_changes or changes_detected) else "success")
 
         sweep_summary = {
             "scanned_at": now_utc.isoformat(),
@@ -526,6 +666,7 @@ class WatcherAgent(BaseAgent):
             "agents_audit": agents_audit,
             "logs_audited": len(recent_logs),
             "success_count": success_count,
+            "degraded_count": degraded_count,
             "failures_count": len(failures_detected) + len(unhealthy_apps),
             "changes_count": len(changes_detected),
             "failures_detected": failures_detected[:15],
@@ -538,38 +679,13 @@ class WatcherAgent(BaseAgent):
         summary_text = (
             f"Watcher audited {len(projects)} project(s), {len(modules_audit)} module(s), "
             f"{len(agents_audit)} active agent(s), and {len(recent_logs)} log event(s): "
-            f"{success_count} success, {len(changes_detected)} change(s), "
+            f"{success_count} success, {len(jira_changes)} Jira change(s), "
             f"{len(failures_detected) + len(unhealthy_apps)} failure(s), "
             f"{len(retested_tickets)} In-QA retest(s)."
         )
 
-        notif_res: Optional[Dict[str, Any]] = None
-        if notify and self.notifier.should_notify(category="watcher_sweep", status=overall_status, level=overall_level):
-            notif_res = await self.notifier.notify_event(
-                title=f"System Sweep: {len(modules_audit)} Modules · {len(agents_audit)} Agents · {len(failures_detected) + len(unhealthy_apps)} Failures",
-                message=summary_text,
-                level=overall_level,
-                category="watcher_sweep",
-                status=overall_status,
-                project_name=projects[0].name if (project_id and projects) else "All Projects",
-                module="All Modules",
-                agent_name="Watcher",
-                details={
-                    "failures": failures_detected[:5],
-                    "changes": changes_detected[:5],
-                    "retested": retested_tickets[:5],
-                    "agents": {k: {"total": v["total"], "failed": v["failed"]} for k, v in agents_audit.items()},
-                },
-            )
-            sweep_summary["notification_delivery"] = notif_res
-
-        channels_list = ["ws"] + list((notif_res or {}).get("channels_sent") or [])
-        for ch_name in ("slack", "email"):
-            ch_res = (notif_res or {}).get(ch_name) or {}
-            if ch_res.get("attempted") and not ch_res.get("sent"):
-                channels_list.append(f"{ch_name}(failed)")
-        channels_tag = ",".join(dict.fromkeys(channels_list))
-
+        # Sweep summary logs silently to DB/WS; external alerts fire only on real Jira updates or AI agent failures
+        channels_tag = "ws"
         await self.log_action(
             action="system_wide_sweep",
             input_data={
@@ -595,7 +711,8 @@ class WatcherAgent(BaseAgent):
 
     async def poll_all_active_projects(self, jira_settings: Dict[str, str]) -> Dict[str, Any]:
         """Run full system-wide Watcher sweep across all projects, modules, agents, bugs, and logs."""
-        return await self.run_full_system_sweep(jira_settings=jira_settings, notify=True)
+        enabled = _as_bool((jira_settings or {}).get("watcher_enabled"), True)
+        return await self.run_full_system_sweep(jira_settings=jira_settings, notify=enabled)
 
     async def run(self, *args, **kwargs) -> Any:
         if "bug_report_id" in kwargs or (args and isinstance(args[0], int)):

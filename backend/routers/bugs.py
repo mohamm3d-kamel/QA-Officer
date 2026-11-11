@@ -33,7 +33,7 @@ async def get_orchestrator(db: AsyncSession) -> AgentOrchestrator:
     all_settings = {s.key: s.value for s in res.scalars().all()}
 
     provider = all_settings.get("llm_provider", "openai")
-    api_key = all_settings.get("llm_api_key", "mock")
+    api_key = all_settings.get("llm_api_key", "")
     model = all_settings.get("llm_model", "gpt-4")
     base_url = all_settings.get("llm_base_url", "")
     default_reporter = all_settings.get("default_reporter", "Mohamed Kamel")
@@ -71,6 +71,23 @@ async def get_bug(bug_id: int, db: AsyncSession = Depends(get_db)):
     return data
 
 
+@router.delete("/api/bugs/{bug_id}")
+async def delete_bug(bug_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete a bug report and its cascaded evidence/logs."""
+    res = await db.execute(
+        select(BugReport)
+        .options(selectinload(BugReport.evidence), selectinload(BugReport.agent_logs))
+        .where(BugReport.id == bug_id)
+    )
+    bug = res.scalar_one_or_none()
+    if not bug:
+        raise HTTPException(status_code=404, detail="Bug report not found")
+
+    await db.delete(bug)
+    await db.commit()
+    return {"message": "Bug report deleted", "id": bug_id}
+
+
 @router.post("/api/bugs/{bug_id}/raise-jira")
 async def raise_bug_to_jira(bug_id: int, force_new: bool = False, db: AsyncSession = Depends(get_db)):
     """Explicitly trigger Sheriff to raise a Jira ticket in 'Backlog' for an existing bug report."""
@@ -82,7 +99,7 @@ async def raise_bug_to_jira(bug_id: int, force_new: bool = False, db: AsyncSessi
     await db.rollback()
 
     async def broadcast_ws(payload):
-        await manager.broadcast(payload)
+        await manager.broadcast({**payload, "project_id": payload.get("project_id") or bug.project_id})
 
     ticket = await orchestrator.raise_jira_ticket(
         bug_report_id=bug_id,
@@ -97,8 +114,19 @@ async def raise_bug_to_jira(bug_id: int, force_new: bool = False, db: AsyncSessi
 @router.post("/api/bugs/{bug_id}/retest")
 async def trigger_retest(bug_id: int, db: AsyncSession = Depends(get_db)):
     """Trigger Watcher and Detective to retest an 'In QA' bug and run sanity tests if resolved."""
+    bug = await db.get(BugReport, bug_id)
+    if not bug:
+        raise HTTPException(status_code=404, detail="Bug report not found")
+
     orchestrator = await get_orchestrator(db)
-    result = await orchestrator.retest_and_sanity_pipeline(bug_report_id=bug_id)
+
+    async def broadcast_ws(payload):
+        await manager.broadcast({**payload, "project_id": payload.get("project_id") or bug.project_id})
+
+    result = await orchestrator.retest_and_sanity_pipeline(
+        bug_report_id=bug_id,
+        broadcast_callback=broadcast_ws,
+    )
     return result
 
 
@@ -122,19 +150,26 @@ async def update_bug_status(bug_id: int, data: StatusUpdateRequest, db: AsyncSes
         category="status_change",
         status="success",
         level="change",
-        agent_name="Watcher",
+        agent_name="System",
         project_id=bug.project_id,
         bug_report_id=bug.id,
         jira_key=bug.jira_ticket_id,
         input_data={"old_status": old_status, "new_status": data.status},
         output_data={"bug_id": bug.id, "status": data.status},
-        notify=not is_in_qa,
+        notify=False,
+        notify_ui_bell=False,
     )
 
-    # If moved to 'in_qa', run retest automatically!
     if is_in_qa:
         orchestrator = await get_orchestrator(db)
-        retest_result = await orchestrator.retest_and_sanity_pipeline(bug_report_id=bug_id)
+
+        async def broadcast_ws(payload):
+            await manager.broadcast({**payload, "project_id": payload.get("project_id") or bug.project_id})
+
+        retest_result = await orchestrator.retest_and_sanity_pipeline(
+            bug_report_id=bug_id,
+            broadcast_callback=broadcast_ws,
+        )
         return {"bug": bug.to_dict(), "retest_result": retest_result}
 
     return bug.to_dict()
@@ -148,43 +183,41 @@ async def run_auto_test(project_id: int, data: AutoTestRequest, db: AsyncSession
         raise HTTPException(status_code=404, detail="Project not found")
 
     orchestrator = await get_orchestrator(db)
-    skills_context, _ = await orchestrator.get_project_skills_context(project_id)
+
+    async def broadcast_ws(payload):
+        await manager.broadcast({**payload, "project_id": payload.get("project_id") or project_id})
 
     try:
-        discovered_bugs = await orchestrator.detective.autonomous_discover(
-            skills_context=skills_context,
-            project_info=project.to_dict(),
+        result = await orchestrator.run_auto_test(
+            project_id=project_id,
             scope=data.scope,
             selected_modules=data.modules,
+            broadcast_callback=broadcast_ws,
         )
-
-        created_reports = []
-        for bug_item in discovered_bugs[:3]:
-            pipeline_res = await orchestrator.process_bug_pipeline(
-                bug_input=f"{bug_item.get('title')}: {bug_item.get('description')}\nRoot Cause: {bug_item.get('root_cause')}",
-                project_id=project_id,
-                include_sheriff=False,
-            )
-            created_reports.append(pipeline_res)
 
         await record_system_event(
             action="auto_test_completed",
-            summary=f"Auto-Test discovered {len(discovered_bugs)} potential bug(s) and created {len(created_reports)} report(s) for {project.name}.",
+            summary=f"Auto-Test discovered {result['discovered_count']} potential bug(s) and created {result['processed_count']} report(s) for {project.name}.",
             module=", ".join(data.modules[:3]) if data.modules else "Auto-Test",
             category="agent_action",
             status="success",
             level="success",
-            agent_name="Watcher",
+            agent_name="Auto-Test",
             project_id=project_id,
             output_data={
-                "discovered_count": len(discovered_bugs),
-                "processed_pipeline_count": len(created_reports),
+                "discovered_count": result["discovered_count"],
+                "processed_pipeline_count": result["processed_count"],
+                "skipped_duplicates": result.get("skipped_duplicates", 0),
             },
+            notify=False,
+            notify_ui_bell=False,
         )
+
         return {
-            "discovered_count": len(discovered_bugs),
-            "processed_pipeline_count": len(created_reports),
-            "bugs": created_reports,
+            "discovered_count": result["discovered_count"],
+            "processed_pipeline_count": result["processed_count"],
+            "skipped_duplicates": result.get("skipped_duplicates", 0),
+            "bugs": result["reports"],
         }
     except Exception as e:
         await record_system_event(
@@ -194,7 +227,7 @@ async def run_auto_test(project_id: int, data: AutoTestRequest, db: AsyncSession
             category="error",
             status="failed",
             level="error",
-            agent_name="Watcher",
+            agent_name="Auto-Test",
             project_id=project_id,
             output_data={"error": str(e)},
         )

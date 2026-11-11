@@ -40,6 +40,7 @@ DEFAULTS = {
     "smtp_username": "",
     "smtp_password": "",
     "smtp_from_email": "",
+    "smtp_from": "",
     "smtp_use_tls": "true",
     "smtp_use_ssl": "false",
     "notification_slack_enabled": "false",
@@ -53,5 +54,34 @@ DEFAULTS = {
     "browser_webkit": "true",
     "browser_headless": "true",
 }
+
+SECRET_SETTING_KEYS = {
+    "llm_api_key",
+    "jira_api_token",
+    "notification_slack_webhook",
+    "smtp_password",
+}
+
+
+def mask_secret(value: str) -> str:
+    """Return masked preview for API responses without leaking raw secrets."""
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "••••••••"
+    return f"••••••••{value[-4:]}"
+
+
+def get_enabled_browsers(settings: dict) -> list[str]:
+    """Extract enabled Playwright browser engines from settings dict."""
+    browsers = []
+    if str(settings.get("browser_chromium", "true")).lower() == "true":
+        browsers.append("chromium")
+    if str(settings.get("browser_firefox", "false")).lower() == "true":
+        browsers.append("firefox")
+    if str(settings.get("browser_webkit", "false")).lower() == "true":
+        browsers.append("webkit")
+    return browsers or ["chromium"]
+
 
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"

@@ -429,6 +429,7 @@ class SheriffAgent(BaseAgent):
                     bug.formatted_report = effective_report
                     await session.commit()
 
+        is_simulated = bool(ticket_result.get("simulated"))
         await self.log_action(
             action="create_jira_ticket",
             input_data={
@@ -439,16 +440,17 @@ class SheriffAgent(BaseAgent):
                 "label": label,
                 "evidence_count": len(resolved_evidence),
                 "evidence_files": [e["file_name"] for e in resolved_evidence],
+                "simulated": is_simulated,
             },
             output_data=ticket_result,
             status="success",
             bug_report_id=bug_report_id,
             project_id=project_info.get("id"),
-            module=bug_data.get("module") or "Jira Integration",
-            category="jira_sync",
-            level="warning" if ticket_result.get("failed_attachments") else "change",
+            module=bug_data.get("module") or ("Local Simulation" if is_simulated else "Jira Integration"),
+            category="local_simulation" if is_simulated else "jira_sync",
+            level="info" if is_simulated else ("warning" if ticket_result.get("failed_attachments") else "change"),
             jira_key=ticket_result.get("key"),
-            notify=notify_on_success,
+            notify=False if is_simulated else notify_on_success,
             started_at=start_time,
         )
         return ticket_result

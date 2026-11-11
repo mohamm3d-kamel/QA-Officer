@@ -3,8 +3,11 @@ import useAppStore from '../../store/appStore';
 import MessageBubble from './MessageBubble';
 import { MessageSquare } from 'lucide-react';
 
-export default function ChatWindow({ onSuggestionClick }) {
-  const messages = useAppStore((s) => s.messages);
+const EMPTY_MESSAGES = [];
+
+export default function ChatWindow({ projectId, onSuggestionClick }) {
+  const pid = String(projectId || 'default');
+  const messages = useAppStore((s) => s.messagesByProject[pid] || EMPTY_MESSAGES);
   const chatLoading = useAppStore((s) => s.chatLoading);
   const bottomRef = useRef(null);
   const hasActiveStream = messages.some((m) => m.isStreaming);

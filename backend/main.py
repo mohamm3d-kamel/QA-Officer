@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).parent / "site-packages"))
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -171,10 +172,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# CORS (allow localhost and private LAN origins, plus optional env override)
+extra_origins = [o.strip() for o in os.environ.get("QA_OFFICER_CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=extra_origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -183,7 +186,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def watcher_unhandled_error_middleware(request: Request, call_next):
-    """Capture unhandled 500 server errors across all modules via Watcher telemetry."""
+    """Capture unhandled 500 server errors across all modules via Watcher telemetry (System log only)."""
     try:
         response = await call_next(request)
         if response.status_code >= 500 and not response.headers.get("x-watcher-logged") and "raise-jira" not in request.url.path:
@@ -196,7 +199,9 @@ async def watcher_unhandled_error_middleware(request: Request, call_next):
                     category="error",
                     status="failed",
                     level="error",
-                    agent_name="Watcher",
+                    agent_name="System",
+                    notify=False,
+                    notify_ui_bell=False,
                     input_data={"method": request.method, "path": request.url.path},
                     output_data={"status_code": response.status_code},
                 )
@@ -214,7 +219,9 @@ async def watcher_unhandled_error_middleware(request: Request, call_next):
                 category="error",
                 status="failed",
                 level="error",
-                agent_name="Watcher",
+                agent_name="System",
+                notify=False,
+                notify_ui_bell=False,
                 input_data={"method": request.method, "path": request.url.path},
                 output_data={"error": str(exc)},
             )

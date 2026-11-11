@@ -866,6 +866,7 @@ class ReporterAgent(BaseAgent):
             icon="📝",
         )
         self.llm = llm_router
+        self.last_llm_degraded = False
 
     async def generate_report(
         self,
@@ -941,6 +942,7 @@ class ReporterAgent(BaseAgent):
         )
 
         llm_failure_err: Optional[str] = None
+        llm_degraded = False
         fallback_reason: Optional[str] = None
         report_text = ""
 
@@ -972,6 +974,7 @@ class ReporterAgent(BaseAgent):
             elif candidate:
                 report_text = candidate
         except Exception as e:
+            llm_degraded = True
             if self.llm.is_configured():
                 llm_failure_err = self.llm._redact_secrets(str(e))
                 logger.error(f"Reporter LLM generation error: {e}")
@@ -987,10 +990,12 @@ class ReporterAgent(BaseAgent):
             )
 
         report_text = ensure_evidence_in_report(report_text, evidence_list, bug_data)
+        self.last_llm_degraded = llm_degraded
 
         out_payload: Dict[str, Any] = {
             "report_preview": report_text[:200] + ("..." if len(report_text) > 200 else ""),
             "custom_template_used": bool(cleaned_template),
+            "llm_degraded": llm_degraded,
         }
         if fallback_reason:
             out_payload["template_enforced_deterministically"] = fallback_reason
@@ -1005,11 +1010,12 @@ class ReporterAgent(BaseAgent):
                 "has_custom_format": bool(cleaned_template),
             },
             output_data=out_payload,
-            status="failed" if llm_failure_err else "success",
+            status="failed" if llm_failure_err else ("degraded" if llm_degraded else "success"),
             bug_report_id=bug_report_id,
             project_id=project_id,
             module=values["module"] or "Bug Reporting",
-            level="error" if llm_failure_err else "success",
+            level="error" if llm_failure_err else ("warning" if llm_degraded else "success"),
+            notify=bool(llm_failure_err),
             started_at=start_time,
         )
         return report_text

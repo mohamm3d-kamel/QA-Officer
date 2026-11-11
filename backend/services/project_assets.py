@@ -84,7 +84,9 @@ class ProjectAssetHub:
                 "smtp_configured": bool((self.settings.get("smtp_host") or "").strip()),
                 "slack_enabled": self.settings.get("notification_slack_enabled", "false") == "true",
                 "slack_webhook_configured": bool((self.settings.get("notification_slack_webhook") or "").strip()),
-                "notify_on_all_events": self.settings.get("notify_on_all_events", "true") == "true",
+                "notify_on_all_events": self.settings.get("notify_on_all_events", "false") == "true",
+                "notify_on_changes": self.settings.get("notify_on_changes", "true") == "true",
+                "notify_on_failures": self.settings.get("notify_on_failures", "true") == "true",
             },
             "browsers": {
                 "enabled": browsers or ["chromium"],
@@ -455,6 +457,8 @@ class ProjectAssetHub:
                 agent_name="Desk Officer",
                 project_id=project_id,
                 output_data={"skill_id": skill_dict["id"], "type": stype, "title": title},
+                notify=False,
+                notify_ui_bell=False,
             )
             return {"tool": tool, "ok": True, "skill": skill_dict}
 
@@ -481,6 +485,8 @@ class ProjectAssetHub:
                 agent_name="Desk Officer",
                 project_id=project_id,
                 output_data={"deleted_skill_id": int(skill_id), "title": deleted_title},
+                notify=False,
+                notify_ui_bell=False,
             )
             return {"tool": tool, "ok": True, "deleted_skill_id": int(skill_id)}
 
@@ -514,6 +520,8 @@ class ProjectAssetHub:
                 agent_name="Desk Officer",
                 project_id=project_id,
                 output_data={"updated_fields": list(updates.keys()), "values": updates},
+                notify=False,
+                notify_ui_bell=False,
             )
             return {"tool": tool, "ok": True, "project": proj_dict, "updated_fields": list(updates.keys())}
 

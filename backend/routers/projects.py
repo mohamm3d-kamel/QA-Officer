@@ -1,13 +1,15 @@
 """Projects Router."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from pydantic import BaseModel
 from typing import Optional
 
 from agents.desk_officer import AGENT_ROSTER
 from agents.reporter import strip_report_format_preamble
 from database import get_db
+from models.agent_log import AgentLog
+from models.chat_message import ChatMessage
 from models.project import Project
 from models.settings import Settings
 from services.project_assets import ProjectAssetHub
@@ -67,9 +69,11 @@ async def create_project(data: ProjectCreate, db: AsyncSession = Depends(get_db)
         category="system_change",
         status="success",
         level="change",
-        agent_name="Watcher",
+        agent_name="System",
         project_id=project.id,
         output_data=project.to_dict(),
+        notify=False,
+        notify_ui_bell=False,
     )
     return project.to_dict()
 
@@ -122,23 +126,28 @@ async def update_project(project_id: int, data: ProjectUpdate, db: AsyncSession 
         category="system_change",
         status="success",
         level="change",
-        agent_name="Watcher",
+        agent_name="System",
         project_id=project.id,
         input_data={"updated_fields": list(updates.keys())},
         output_data=project.to_dict(),
+        notify=False,
+        notify_ui_bell=False,
     )
     return project.to_dict()
 
 
 @router.delete("/{project_id}")
 async def delete_project(project_id: int, db: AsyncSession = Depends(get_db)):
-    """Delete project."""
+    """Delete project, its chat history, and its orphaned agent audit logs safely under FK enforcement."""
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     proj_name = project.name
+    await db.execute(delete(ChatMessage).where(ChatMessage.project_id == project_id))
+    await db.execute(delete(AgentLog).where(AgentLog.project_id == project_id))
     await db.delete(project)
+    await db.flush()
     await db.commit()
 
     await record_system_event(
@@ -148,9 +157,11 @@ async def delete_project(project_id: int, db: AsyncSession = Depends(get_db)):
         category="system_change",
         status="success",
         level="change",
-        agent_name="Watcher",
+        agent_name="System",
         project_id=None,
         input_data={"deleted_project_id": project_id, "name": proj_name},
         output_data={"id": project_id, "deleted": True},
+        notify=False,
+        notify_ui_bell=False,
     )
     return {"message": "Project deleted successfully", "id": project_id}

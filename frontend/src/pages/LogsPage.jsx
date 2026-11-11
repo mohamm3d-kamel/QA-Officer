@@ -79,7 +79,9 @@ export default function LogsPage() {
         setLogs(Array.isArray(logsRes) ? logsRes : []);
         setSummary(summaryRes || null);
       } catch (err) {
-        console.error('Failed to fetch logs:', err);
+        if (!silent) {
+          toast.error(err.message || 'Failed to fetch activity logs');
+        }
       } finally {
         if (!silent) setLoading(false);
       }
@@ -93,7 +95,7 @@ export default function LogsPage() {
         const projs = await api.getProjects();
         setProjects(projs);
       } catch (err) {
-        console.error(err);
+        toast.error(err.message || 'Failed to load projects');
       }
     }
     loadProjects();
@@ -156,7 +158,7 @@ export default function LogsPage() {
             <span>Watcher Telemetry &amp; Agent Logs</span>
           </h1>
           <p className="text-xs text-slate-400 mt-1">
-            System-wide audit trail across every module, every AI agent, system changes, failures, successes, and Slack/Email deliveries.
+            Full system audit trail across modules, AI agents, and logs — with Slack &amp; Email alerts dispatched strictly for Jira updates and AI agent failures.
           </p>
         </div>
 
@@ -212,7 +214,7 @@ export default function LogsPage() {
               <strong>{lastSweep.agents_monitored}</strong> AI agent(s), and{' '}
               <strong>{lastSweep.logs_audited}</strong> log(s) ({lastSweep.failures_count} failure(s),{' '}
               {lastSweep.changes_count} change(s)). Channels:{' '}
-              <code className="text-cyan-300">{lastSweep.notified_channels || 'ws'}</code>
+              <code className="text-cyan-300">{lastSweep.notified_channels || 'internal log'}</code>
             </span>
           </div>
           <button
@@ -362,6 +364,7 @@ export default function LogsPage() {
           <option value="Sheriff">Sheriff</option>
           <option value="Watcher">Watcher</option>
           <option value="Sanity Testers">Sanity Testers</option>
+          <option value="System">System</option>
         </select>
 
         {/* Category */}
@@ -389,6 +392,7 @@ export default function LogsPage() {
         >
           <option value="">All Statuses</option>
           <option value="success">Success</option>
+          <option value="degraded">Degraded (Fallback)</option>
           <option value="failed">Failed</option>
           <option value="running">Running</option>
         </select>

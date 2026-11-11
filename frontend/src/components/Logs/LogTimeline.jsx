@@ -27,20 +27,22 @@ export default function LogTimeline({ logs }) {
         const Icon = agentIcons[log.agent_name] || Shield;
         const isSuccess = log.status === 'success';
         const isFailed = log.status === 'failed';
-        const isChange = log.level === 'change' || log.category === 'system_change' || log.category === 'status_change';
+        const isDegraded = log.status === 'degraded';
+        const isChange =
+          log.level === 'change' || log.category === 'system_change' || log.category === 'status_change';
+
+        const borderClass = isFailed
+          ? 'border-red-500 text-red-400'
+          : isDegraded || isChange
+          ? 'border-amber-500 text-amber-400'
+          : isSuccess
+          ? 'border-cyan-500 text-cyan-400'
+          : 'border-slate-500 text-slate-400';
 
         return (
           <div key={log.id} className="relative flex items-start gap-4 group">
             <div
-              className={`absolute -left-6 top-1.5 w-6 h-6 rounded-full flex items-center justify-center border-2 bg-slate-900 ${
-                isFailed
-                  ? 'border-red-500 text-red-400'
-                  : isChange
-                  ? 'border-amber-500 text-amber-400'
-                  : isSuccess
-                  ? 'border-cyan-500 text-cyan-400'
-                  : 'border-slate-500 text-slate-400'
-              }`}
+              className={`absolute -left-6 top-1.5 w-6 h-6 rounded-full flex items-center justify-center border-2 bg-slate-900 ${borderClass}`}
             >
               <Icon className="w-3.5 h-3.5" />
             </div>
@@ -63,6 +65,11 @@ export default function LogTimeline({ logs }) {
                   {log.notified_channels && (
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-950/60 border border-purple-800/60 text-purple-300">
                       {log.notified_channels}
+                    </span>
+                  )}
+                  {log.status === 'degraded' && (
+                    <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-amber-950 text-amber-400 border border-amber-800">
+                      degraded
                     </span>
                   )}
                 </div>

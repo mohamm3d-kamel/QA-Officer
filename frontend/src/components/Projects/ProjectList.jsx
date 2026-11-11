@@ -1,6 +1,7 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FolderGit2, ExternalLink, MessageSquare, Trash2, Edit2, FileText } from 'lucide-react';
+import toast from 'react-hot-toast';
 import api from '../../services/api';
 import useAppStore from '../../store/appStore';
 
@@ -15,8 +16,10 @@ export default function ProjectList({ onEditProject }) {
     try {
       await api.deleteProject(id);
       removeProject(id);
+      toast.success('Project deleted');
     } catch (err) {
       console.error('Delete error:', err);
+      toast.error(err?.message || 'Failed to delete project');
     }
   };
 
@@ -107,7 +110,10 @@ export default function ProjectList({ onEditProject }) {
             </div>
 
             <button
-              onClick={() => navigate(`/chat/${proj.id}`)}
+              onClick={(e) => {
+                e.stopPropagation();
+                navigate(`/chat/${proj.id}`);
+              }}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-600/10 text-cyan-400 group-hover:bg-cyan-600 group-hover:text-white transition-all font-medium text-xs"
             >
               <MessageSquare className="w-3.5 h-3.5" />

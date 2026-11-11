@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { PieChart, FolderGit2 } from 'lucide-react';
+import { PieChart } from 'lucide-react';
+import toast from 'react-hot-toast';
 import useAppStore from '../store/appStore';
 import api from '../services/api';
 import SummaryReport from '../components/Reports/SummaryReport';
@@ -15,17 +16,17 @@ export default function SummaryPage() {
   const [summaryData, setSummaryData] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  const loadSummary = async (targetId) => {
+  const loadSummary = useCallback(async (targetId) => {
     setLoading(true);
     try {
       const data = await api.getSummary(targetId);
       setSummaryData(data);
     } catch (err) {
-      console.error('Failed to load summary report:', err);
+      toast.error(err.message || 'Failed to load summary report');
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     async function init() {
@@ -34,21 +35,20 @@ export default function SummaryPage() {
         setProjects(projs);
         const activeId = projectId || (projs[0] ? projs[0].id : null);
         if (activeId) {
-          loadSummary(activeId);
+          await loadSummary(activeId);
         } else {
           setLoading(false);
         }
       } catch (err) {
-        console.error(err);
+        toast.error(err.message || 'Failed to load projects');
         setLoading(false);
       }
     }
     init();
-  }, [projectId, setProjects]);
+  }, [projectId, setProjects, loadSummary]);
 
   const handleProjectChange = (id) => {
     navigate(`/summary/${id}`);
-    loadSummary(id);
   };
 
   return (
@@ -103,4 +103,3 @@ export default function SummaryPage() {
     </div>
   );
 }
-

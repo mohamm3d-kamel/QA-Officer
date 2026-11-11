@@ -14,7 +14,9 @@ import {
   Send,
   X,
 } from 'lucide-react';
+import toast from 'react-hot-toast';
 import api from '../../services/api';
+import useAppStore from '../../store/appStore';
 
 const PROVIDER_DEFAULTS = {
   openai: 'gpt-4o-mini',
@@ -87,6 +89,7 @@ function findSmtpPreset(presetParam) {
 
 export default function SettingsForm() {
   const location = useLocation();
+  const setReporterName = useAppStore((s) => s.setReporterName);
   const emailPanelRef = useRef(null);
   const smtpHostRef = useRef(null);
   const smtpUsernameRef = useRef(null);
@@ -95,7 +98,7 @@ export default function SettingsForm() {
   const [settings, setSettings] = useState({
     llm_provider: 'openai',
     llm_api_key: '',
-    llm_model: 'gpt-4',
+    llm_model: 'gpt-4o-mini',
     llm_base_url: '',
     jira_base_url: '',
     jira_email: '',
@@ -117,9 +120,9 @@ export default function SettingsForm() {
     smtp_use_ssl: 'false',
     notification_slack_enabled: 'false',
     notification_slack_webhook: '',
-    notify_on_all_events: 'true',
+    notify_on_all_events: 'false',
     notify_on_changes: 'true',
-    notify_on_success: 'true',
+    notify_on_success: 'false',
     notify_on_failures: 'true',
     browser_chromium: 'true',
     browser_firefox: 'true',
@@ -149,10 +152,19 @@ export default function SettingsForm() {
           res.forEach((item) => {
             mapped[item.key] = item.value;
           });
-          setSettings((prev) => ({ ...prev, ...mapped }));
+          setSettings((prev) => ({
+            ...prev,
+            ...mapped,
+            smtp_from_email: mapped.smtp_from_email || mapped.smtp_from || prev.smtp_from_email,
+          }));
+          if (mapped.default_reporter) {
+            setReporterName(mapped.default_reporter);
+          }
         }
       } catch (err) {
-        console.error('Failed to load settings:', err);
+        if (active) {
+          toast.error(err.message || 'Failed to load settings');
+        }
       } finally {
         if (active) setSettingsLoaded(true);
       }
@@ -161,7 +173,7 @@ export default function SettingsForm() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [setReporterName]);
 
   useEffect(() => {
     if (!settingsLoaded) return undefined;
@@ -269,6 +281,9 @@ export default function SettingsForm() {
       const isKnownDefault =
         !currentModel ||
         currentModel === 'gpt-4' ||
+        currentModel === 'gemini-1.5-pro' ||
+        currentModel === 'gemini-2.5-flash' ||
+        currentModel === 'claude-3-opus' ||
         /\s/.test(currentModel) ||
         Object.values(PROVIDER_DEFAULTS).includes(currentModel) ||
         allPresets.includes(currentModel);
@@ -344,14 +359,18 @@ export default function SettingsForm() {
         smtp_username: (settings.smtp_username || '').trim(),
         smtp_from_email: (settings.smtp_from_email || '').trim(),
         notification_slack_webhook: (settings.notification_slack_webhook || '').trim(),
+        notify_on_all_events: 'false',
+        notify_on_success: 'false',
       };
       setSettings(normalized);
       await api.updateSettings(normalized);
+      setReporterName(normalized.default_reporter);
       setSaved(true);
       setUrlPresetNotice(null);
+      toast.success('Configuration saved successfully');
       setTimeout(() => setSaved(false), 3000);
     } catch (err) {
-      console.error('Failed to update settings:', err);
+      toast.error(err.message || 'Failed to save configuration');
     } finally {
       setLoading(false);
     }
@@ -359,6 +378,8 @@ export default function SettingsForm() {
 
   const modelPresets = PROVIDER_MODEL_PRESETS[settings.llm_provider] || [];
   const hasInvalidModelSpaces = /\s/.test((settings.llm_model || '').trim());
+  const smtpPasswordMasked = String(settings.smtp_password || '').startsWith('••••');
+  const slackWebhookMasked = String(settings.notification_slack_webhook || '').startsWith('••••');
   const activeSmtpPreset = SMTP_PRESETS.find(
     (preset) =>
       (settings.smtp_host || '').trim().toLowerCase() === preset.host &&
@@ -468,7 +489,7 @@ export default function SettingsForm() {
               type="password"
               value={settings.llm_api_key}
               onChange={(e) => handleChange('llm_api_key', e.target.value)}
-              placeholder={settings.llm_provider === 'ollama' ? 'ollama (optional)' : 'sk-... / AQ... / AIza...'}
+              placeholder={settings.llm_provider === 'ollama' ? 'ollama (optional)' : 'sk-... / AQ... / AIza... (masked once saved)'}
               className="w-full bg-slate-950 border border-slate-800 rounded-lg text-sm text-slate-200 px-3 py-2 focus:border-cyan-500 focus:outline-none font-mono"
             />
           </div>
@@ -506,7 +527,7 @@ export default function SettingsForm() {
                   <div className="font-semibold">
                     Connected to {testResult.provider}/{testResult.model} ({testResult.latency_ms}ms)
                   </div>
-                  <div className="text-emerald-200/80">Reply: "{testResult.reply}"</div>
+                  <div className="text-emerald-200/80">Reply: &quot;{testResult.reply}&quot;</div>
                 </>
               ) : (
                 <>
@@ -561,7 +582,7 @@ export default function SettingsForm() {
           </div>
         </div>
 
-        <div className="mt-4 pt-4 border-t border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="mt-4 pt-4 border-t border-slate-800 grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label className="text-xs font-medium text-slate-400 mb-1.5 block">Default Reporter Name</label>
             <input
@@ -585,25 +606,37 @@ export default function SettingsForm() {
               className="w-full bg-slate-950 border border-slate-800 rounded-lg text-sm text-slate-200 px-3 py-2 focus:border-cyan-500 focus:outline-none"
             />
           </div>
+
+          <div className="flex items-end">
+            <label className="w-full flex items-center justify-between p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-300 cursor-pointer">
+              <span>Watcher Background Polling</span>
+              <input
+                type="checkbox"
+                checked={settings.watcher_enabled === 'true'}
+                onChange={(e) => handleChange('watcher_enabled', e.target.checked ? 'true' : 'false')}
+                className="rounded text-cyan-500"
+              />
+            </label>
+          </div>
         </div>
       </div>
 
       {/* Watcher Sentinel Scope */}
       <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 shadow space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-2.5 text-indigo-400">
             <Eye className="w-5 h-5" />
             <div>
               <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-100">
-                Watcher Sentinel Scope
+                Watcher Telemetry &amp; Audit Scope
               </h3>
               <p className="text-[11px] text-slate-400">
-                Choose what Watcher monitors across the system and forwards to Slack &amp; Email.
+                Records system-wide audit logs across modules and AI agents. External Slack &amp; Email alerts trigger strictly for Jira updates and AI agent failures.
               </p>
             </div>
           </div>
 
-          <label className="flex items-center gap-2 text-xs font-semibold text-slate-200 cursor-pointer">
+          <label className="flex items-center gap-2 text-xs font-semibold text-slate-200 cursor-pointer flex-shrink-0">
             <input
               type="checkbox"
               checked={settings.watcher_enabled === 'true'}
@@ -623,9 +656,9 @@ export default function SettingsForm() {
               className="mt-0.5 rounded text-cyan-500"
             />
             <div>
-              <div className="font-semibold text-slate-100">Every Module</div>
+              <div className="font-semibold text-slate-100">Module Audit Trail</div>
               <div className="text-[11px] text-slate-400 mt-0.5">
-                Projects, Skills, Bugs, Uploads, Settings, Jira Sync, App URLs
+                Log Projects, Skills, Bugs, Uploads, Settings &amp; Jira sync telemetry internally
               </div>
             </div>
           </label>
@@ -653,9 +686,9 @@ export default function SettingsForm() {
               className="mt-0.5 rounded text-cyan-500"
             />
             <div>
-              <div className="font-semibold text-slate-100">All Logs &amp; Errors</div>
+              <div className="font-semibold text-slate-100">Full Log Capture</div>
               <div className="text-[11px] text-slate-400 mt-0.5">
-                Status changes, API 500 errors, LLM/Jira failures &amp; telemetry sweeps
+                Capture API diagnostics, status sweeps &amp; Jira transitions in Logs &amp; Timeline
               </div>
             </div>
           </label>
@@ -675,7 +708,7 @@ export default function SettingsForm() {
                 External Notifications (Slack &amp; Email)
               </h3>
               <p className="text-[11px] text-slate-400">
-                Receive instant Watcher alerts for changes, updates, failures, and successes.
+                Strict Watcher Scope: alerts dispatch ONLY for Jira updates and AI agent failures.
               </p>
             </div>
           </div>
@@ -838,17 +871,19 @@ export default function SettingsForm() {
               <div>
                 <label className="text-[11px] text-slate-400 block mb-1">
                   SMTP Password{' '}
-                  <button
-                    type="button"
-                    onClick={() => setShowSmtpPass((v) => !v)}
-                    className="text-cyan-400 hover:underline ml-1"
-                  >
-                    {showSmtpPass ? 'Hide' : 'Show'}
-                  </button>
+                  {!smtpPasswordMasked && (
+                    <button
+                      type="button"
+                      onClick={() => setShowSmtpPass((v) => !v)}
+                      className="text-cyan-400 hover:underline ml-1"
+                    >
+                      {showSmtpPass ? 'Hide' : 'Show'}
+                    </button>
+                  )}
                 </label>
                 <input
-                  type={showSmtpPass ? 'text' : 'password'}
-                  placeholder="App password"
+                  type={showSmtpPass && !smtpPasswordMasked ? 'text' : 'password'}
+                  placeholder="App password (masked once saved)"
                   value={settings.smtp_password}
                   onChange={(e) => handleChange('smtp_password', e.target.value)}
                   className="w-full bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2 focus:border-cyan-500 focus:outline-none font-mono"
@@ -935,17 +970,19 @@ export default function SettingsForm() {
               <div>
                 <label className="text-[11px] text-slate-400 block mb-1">
                   Incoming Webhook URL{' '}
-                  <button
-                    type="button"
-                    onClick={() => setShowSlackWebhook((v) => !v)}
-                    className="text-cyan-400 hover:underline ml-1"
-                  >
-                    {showSlackWebhook ? 'Hide' : 'Show'}
-                  </button>
+                  {!slackWebhookMasked && (
+                    <button
+                      type="button"
+                      onClick={() => setShowSlackWebhook((v) => !v)}
+                      className="text-cyan-400 hover:underline ml-1"
+                    >
+                      {showSlackWebhook ? 'Hide' : 'Show'}
+                    </button>
+                  )}
                 </label>
                 <input
-                  type={showSlackWebhook ? 'url' : 'password'}
-                  placeholder="https://hooks.slack.com/services/..."
+                  type={showSlackWebhook && !slackWebhookMasked ? 'url' : 'password'}
+                  placeholder="https://hooks.slack.com/services/... (masked once saved)"
                   value={settings.notification_slack_webhook}
                   onChange={(e) => handleChange('notification_slack_webhook', e.target.value)}
                   className="w-full bg-slate-900 border border-slate-800 rounded text-xs text-slate-200 px-3 py-2 focus:border-cyan-500 focus:outline-none font-mono"
@@ -953,55 +990,46 @@ export default function SettingsForm() {
               </div>
             </div>
 
-            {/* Event Triggers */}
-            <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-2.5">
-              <div className="text-xs font-semibold text-slate-200">
-                What Should Trigger Slack &amp; Email Updates?
+            {/* Event Triggers — Strict Scope */}
+            <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-200">
+                  Slack &amp; Email Trigger Scope
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-950/80 border border-indigo-800/70 text-indigo-300 font-semibold">
+                  Jira + AI Failures Only
+                </span>
               </div>
 
-              <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={settings.notify_on_all_events === 'true'}
-                  onChange={(e) => handleChange('notify_on_all_events', e.target.checked ? 'true' : 'false')}
-                  className="mt-0.5 rounded text-cyan-500"
-                />
-                <span>
-                  <strong className="text-slate-100">All Events (Everything)</strong> — forward every Watcher observation across modules &amp; agents
-                </span>
-              </label>
-
-              <div className="pl-2 pt-1 space-y-2 border-l border-slate-800">
-                <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+              <div className="space-y-2.5">
+                <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={settings.notify_on_changes === 'true'}
                     onChange={(e) => handleChange('notify_on_changes', e.target.checked ? 'true' : 'false')}
-                    className="rounded text-cyan-500"
+                    className="mt-0.5 rounded text-cyan-500"
                   />
-                  <span>Changes &amp; Updates (projects, skills, settings, Jira syncs)</span>
+                  <span>
+                    <strong className="text-slate-100">Jira Updates</strong> — Ticket created in Backlog, Jira transitions (<code className="text-cyan-300">In QA</code>, <code className="text-emerald-300">Ready To Deploy</code>, <code className="text-red-300">Failed QA</code>), board status drift &amp; evidence sync
+                  </span>
                 </label>
 
-                <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={settings.notify_on_success === 'true'}
-                    onChange={(e) => handleChange('notify_on_success', e.target.checked ? 'true' : 'false')}
-                    className="rounded text-cyan-500"
-                  />
-                  <span>Successes (verified reports, retest passes, completed scans)</span>
-                </label>
-
-                <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={settings.notify_on_failures === 'true'}
                     onChange={(e) => handleChange('notify_on_failures', e.target.checked ? 'true' : 'false')}
-                    className="rounded text-cyan-500"
+                    className="mt-0.5 rounded text-cyan-500"
                   />
-                  <span>Failures &amp; Errors (Jira/LLM errors, regressions, API 500s)</span>
+                  <span>
+                    <strong className="text-slate-100">AI Agent Failures</strong> — LLM execution errors, agent runtime failures, and Jira poll/sync errors
+                  </span>
                 </label>
               </div>
+
+              <p className="text-[11px] text-slate-500 pt-1 border-t border-slate-800/70">
+                Project/Skill edits, file uploads, chat turns, and non-Jira agent runs stay in the internal Audit Log without external spam.
+              </p>
             </div>
           </div>
         </div>
@@ -1107,7 +1135,7 @@ export default function SettingsForm() {
         <button
           type="submit"
           disabled={loading}
-          className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition-all shadow-lg shadow-cyan-900/30"
+          className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition-all shadow-lg shadow-cyan-900/30 disabled:opacity-50"
         >
           <Save className="w-4 h-4" />
           <span>{loading ? 'Saving Settings...' : 'Save Configuration'}</span>

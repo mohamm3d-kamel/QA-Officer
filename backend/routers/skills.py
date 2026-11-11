@@ -1,4 +1,7 @@
 """Skills Router - Stores and manages requirements, business docs, and report formats."""
+import io
+import zipfile
+import xml.etree.ElementTree as ET
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -11,6 +14,37 @@ from models.project import Project
 from services.watcher_bus import record_system_event
 
 router = APIRouter(tags=["skills"])
+
+MAX_SKILL_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _extract_upload_text(filename: str, content_bytes: bytes) -> str:
+    """Extract readable UTF-8 text or .docx paragraphs from an uploaded skill document."""
+    name_lower = (filename or "").lower()
+    if name_lower.endswith(".docx") or (content_bytes[:2] == b"PK"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(content_bytes)) as zf:
+                if "word/document.xml" in zf.namelist():
+                    info = zf.getinfo("word/document.xml")
+                    if info.file_size <= 10 * 1024 * 1024:
+                        xml_bytes = zf.read("word/document.xml")
+                        root = ET.fromstring(xml_bytes)
+                        paragraphs = []
+                        for p in root.iter():
+                            if p.tag.endswith("}p"):
+                                texts = [t.text for t in p.iter() if t.tag.endswith("}t") and t.text]
+                                if texts:
+                                    paragraphs.append("".join(texts))
+                        extracted = "\n".join(paragraphs).strip()
+                        if extracted:
+                            return extracted
+        except Exception:
+            pass
+
+    try:
+        return content_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return f"[Binary Document uploaded: {filename}, size {len(content_bytes)} bytes]"
 
 
 class SkillCreate(BaseModel):
@@ -55,9 +89,11 @@ async def add_project_skill(project_id: int, data: SkillCreate, db: AsyncSession
         category="system_change",
         status="success",
         level="change",
-        agent_name="Watcher",
+        agent_name="System",
         project_id=project_id,
         output_data={"id": skill.id, "type": skill.type, "title": skill.title},
+        notify=False,
+        notify_ui_bell=False,
     )
     return skill.to_dict()
 
@@ -75,11 +111,11 @@ async def upload_skill_file(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    content_bytes = await file.read()
-    try:
-        content_text = content_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        content_text = f"[Binary Document uploaded: {file.filename}, size {len(content_bytes)} bytes]"
+    content_bytes = await file.read(MAX_SKILL_UPLOAD_BYTES + 1)
+    if len(content_bytes) > MAX_SKILL_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Uploaded document exceeds 5 MB limit")
+
+    content_text = _extract_upload_text(file.filename or "document", content_bytes)
 
     skill = Skill(
         project_id=project_id,
@@ -100,9 +136,11 @@ async def upload_skill_file(
         category="system_change",
         status="success",
         level="change",
-        agent_name="Watcher",
+        agent_name="System",
         project_id=project_id,
         output_data={"id": skill.id, "filename": file.filename, "type": skill.type, "title": skill.title},
+        notify=False,
+        notify_ui_bell=False,
     )
     return skill.to_dict()
 
@@ -127,8 +165,10 @@ async def delete_skill(skill_id: int, db: AsyncSession = Depends(get_db)):
         category="system_change",
         status="success",
         level="change",
-        agent_name="Watcher",
+        agent_name="System",
         project_id=proj_id,
         output_data={"id": skill_id, "title": skill_title, "deleted": True},
+        notify=False,
+        notify_ui_bell=False,
     )
     return {"message": "Skill deleted", "id": skill_id}

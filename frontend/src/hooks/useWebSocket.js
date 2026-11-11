@@ -4,7 +4,9 @@ import toast from 'react-hot-toast';
 
 let sharedWs = null;
 let reconnectTimer = null;
+let idleCloseTimer = null;
 let subscriberCount = 0;
+let activeProjectId = null;
 const listeners = new Set();
 
 function handleIncomingPayload(data) {
@@ -18,23 +20,35 @@ function handleIncomingPayload(data) {
     }
   });
 
+  const targetProjectId = data.project_id ?? activeProjectId ?? store.selectedProject?.id;
+
   switch (data.type) {
     case 'agent_status':
-      store.setAgentStatus(data.agent, data.status, data.message, data.data?.bug_id ?? data.bug_id);
+      store.setAgentStatus(
+        data.agent,
+        data.status,
+        data.message,
+        data.data?.bug_id ?? data.bug_id,
+        targetProjectId
+      );
       if (data.status === 'running' && data.agent !== 'desk_officer') {
-        store.addMessage({
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          role: 'agent',
-          agent: data.agent,
-          content: data.message || `${data.agent} is working...`,
-          timestamp: new Date().toISOString(),
-          isStatus: true,
-        });
+        store.addMessage(
+          {
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            sender: 'agent',
+            role: 'agent',
+            agent: data.agent,
+            content: data.message || `${data.agent} is working...`,
+            timestamp: new Date().toISOString(),
+            isStatus: true,
+          },
+          targetProjectId
+        );
       }
       break;
 
     case 'desk_stream':
-      store.upsertStreamChunk(data.stream_id, data.delta);
+      store.upsertStreamChunk(data.stream_id, data.delta, targetProjectId);
       break;
 
     case 'desk_stream_end':
@@ -45,7 +59,7 @@ function handleIncomingPayload(data) {
       if (data.done) {
         store.setChatLoading(false);
       } else {
-        store.appendToLastMessage(data.content);
+        store.appendToLastMessage(data.content, targetProjectId);
       }
       break;
 
@@ -81,6 +95,10 @@ function handleIncomingPayload(data) {
 }
 
 function ensureConnected() {
+  if (idleCloseTimer) {
+    clearTimeout(idleCloseTimer);
+    idleCloseTimer = null;
+  }
   if (
     sharedWs &&
     (sharedWs.readyState === WebSocket.OPEN || sharedWs.readyState === WebSocket.CONNECTING)
@@ -91,9 +109,14 @@ function ensureConnected() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${window.location.host}/ws`;
   const ws = new WebSocket(wsUrl);
+  ws._cancelled = false;
   sharedWs = ws;
 
   ws.onopen = () => {
+    if (ws._cancelled || subscriberCount === 0 || sharedWs !== ws) {
+      ws.close();
+      return;
+    }
     console.log('[WS] Connected');
     useAppStore.getState().setWsConnected(true);
     if (reconnectTimer) {
@@ -103,6 +126,7 @@ function ensureConnected() {
   };
 
   ws.onmessage = (event) => {
+    if (ws._cancelled || sharedWs !== ws) return;
     try {
       const data = JSON.parse(event.data);
       handleIncomingPayload(data);
@@ -112,6 +136,7 @@ function ensureConnected() {
   };
 
   ws.onclose = () => {
+    if (ws._cancelled) return;
     console.log('[WS] Disconnected');
     useAppStore.getState().setWsConnected(false);
     if (sharedWs === ws) {
@@ -126,16 +151,25 @@ function ensureConnected() {
   };
 
   ws.onerror = (err) => {
+    if (ws._cancelled) return;
     console.error('[WS] Error:', err);
     useAppStore.getState().setWsConnected(false);
-    ws.close();
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.close();
+    }
   };
 }
 
-export default function useWebSocket(onMessage) {
+export default function useWebSocket(onMessage, projectId = null) {
   const isConnected = useAppStore((s) => s.wsConnected);
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
+
+  useEffect(() => {
+    if (projectId !== undefined && projectId !== null) {
+      activeProjectId = projectId;
+    }
+  }, [projectId]);
 
   useEffect(() => {
     subscriberCount += 1;
@@ -153,8 +187,18 @@ export default function useWebSocket(onMessage) {
           clearTimeout(reconnectTimer);
           reconnectTimer = null;
         }
-        sharedWs?.close();
-        sharedWs = null;
+        // Delay closing slightly so React StrictMode double-mount reuses the socket cleanly
+        idleCloseTimer = setTimeout(() => {
+          idleCloseTimer = null;
+          if (subscriberCount === 0 && sharedWs) {
+            const wsToClose = sharedWs;
+            sharedWs = null;
+            wsToClose._cancelled = true;
+            if (wsToClose.readyState === WebSocket.OPEN) {
+              wsToClose.close();
+            }
+          }
+        }, 150);
       }
     };
   }, []);

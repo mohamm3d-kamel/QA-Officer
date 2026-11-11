@@ -1,11 +1,11 @@
 """Coroner Agent - Captures visual evidence (screenshots, videos) during Detective second pass."""
+import asyncio
 import logging
 import os
 import uuid
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-from PIL import Image, ImageDraw, ImageFont
+from typing import Dict, Any, List, Optional, Tuple
+from PIL import Image, ImageDraw
 
 from agents.base import BaseAgent
 from services.browser_engine import BrowserEngine
@@ -24,69 +24,98 @@ class CoronerAgent(BaseAgent):
             name="Coroner",
             role="Evidence Collector & Recorder",
             color="#f59e0b",
-            icon="📸"
+            icon="📸",
         )
 
-    async def capture_evidence(
+    async def capture_with_telemetry(
         self,
         bug_data: Dict[str, Any],
         project_info: Dict[str, Any],
         stage: str = "detection",
         bug_report_id: Optional[int] = None,
         project_id: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """Capture screenshots and/or video for the bug during reproduction."""
+        browsers: Optional[List[str]] = None,
+        headless: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Capture screenshots/video across enabled browsers and collect runtime telemetry."""
         start_time = datetime.utcnow()
-        captured_evidence = []
+        captured_evidence: List[Dict[str, Any]] = []
+        runtime_telemetry: List[Dict[str, Any]] = []
         app_url = project_info.get("app_url")
         browser_actions = bug_data.get("browser_actions", [])
+        target_browsers = browsers or ["chromium"]
 
-        # Try live browser capture first if URL is available
+        # Try live browser capture across enabled engines
         captured_live = False
         live_capture_note: Optional[str] = None
-        if app_url:
-            try:
-                engine = BrowserEngine(headless=True)
-                session = await engine.start(record_video=True)
-                await session.navigate(app_url)
+        if app_url and str(app_url).strip().lower() not in ("", "none"):
+            for idx, browser_name in enumerate(target_browsers):
+                engine = BrowserEngine(headless=headless, browsers=[browser_name])
+                session = None
+                try:
+                    record_vid = (idx == 0)
+                    session = await engine.start(record_video=record_vid, browser_name=browser_name)
+                    nav_status = await session.navigate(app_url)
 
-                # Execute reproduction steps
-                if browser_actions:
-                    await session.execute_steps(browser_actions)
+                    step_results = []
+                    if browser_actions:
+                        step_results = await session.execute_steps(browser_actions)
 
-                # Capture key screenshot
-                screenshot_path = await session.take_screenshot(
-                    description=f"Evidence for bug: {bug_data.get('title', 'Bug')}"
-                )
-                video_path = await session.close()
-
-                # Add screenshot evidence
-                captured_evidence.append({
-                    "type": "screenshot",
-                    "file_path": screenshot_path,
-                    "file_name": os.path.basename(screenshot_path),
-                    "stage": stage,
-                    "description": f"Screenshot of reproduction: {bug_data.get('title')}",
-                })
-
-                if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-                    captured_evidence.append({
-                        "type": "video",
-                        "file_path": video_path,
-                        "file_name": os.path.basename(video_path),
-                        "stage": stage,
-                        "description": f"Video recording of bug reproduction for: {bug_data.get('title')}",
+                    screenshot_path = await session.take_screenshot(
+                        description=f"[{browser_name}] Evidence for bug: {bug_data.get('title', 'Bug')}"
+                    )
+                    telemetry = await session.inspect_page(max_elements=15)
+                    runtime_telemetry.append({
+                        "browser": browser_name,
+                        "http_status": nav_status,
+                        "step_results": step_results,
+                        "console_errors": telemetry.get("console_errors", []),
+                        "page_errors": telemetry.get("page_errors", []),
+                        "network_errors": telemetry.get("network_errors", []),
                     })
-                captured_live = True
-            except Exception as e:
-                live_capture_note = str(e)
-                logger.warning(f"Live browser capture failed: {e}. Generating high-fidelity evidence snapshot.")
 
-        # If live browser is unavailable or didn't run, create visual proof snapshot image
+                    video_path = await session.close()
+                    session = None
+
+                    captured_evidence.append({
+                        "type": "screenshot",
+                        "file_path": screenshot_path,
+                        "file_name": os.path.basename(screenshot_path),
+                        "stage": stage,
+                        "description": f"[{browser_name}] Screenshot of reproduction: {bug_data.get('title')}",
+                    })
+
+                    if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+                        captured_evidence.append({
+                            "type": "video",
+                            "file_path": video_path,
+                            "file_name": os.path.basename(video_path),
+                            "stage": stage,
+                            "description": f"[{browser_name}] Video recording of bug reproduction for: {bug_data.get('title')}",
+                        })
+                    captured_live = True
+                except Exception as e:
+                    live_capture_note = str(e)
+                    logger.warning(f"Live browser capture ({browser_name}) failed: {e}")
+                finally:
+                    try:
+                        if session is not None:
+                            await session.close()
+                        else:
+                            await engine.stop()
+                    except Exception:
+                        pass
+
+        # If live browser didn't succeed, generate high-fidelity diagnostic snapshot
         fallback_capture_error: Optional[str] = None
         if not captured_live:
             try:
-                snapshot_path = await self._generate_visual_proof(bug_data, project_info, stage)
+                snapshot_path = await asyncio.to_thread(
+                    self._generate_visual_proof_sync,
+                    bug_data,
+                    project_info,
+                    stage,
+                )
                 captured_evidence.append({
                     "type": "screenshot",
                     "file_path": snapshot_path,
@@ -98,9 +127,10 @@ class CoronerAgent(BaseAgent):
                 fallback_capture_error = str(snap_err)
                 logger.error(f"Coroner fallback snapshot generation failed: {snap_err}")
 
-        # Save to database
+        # Save to database and populate DB IDs on returned items
         if bug_report_id and captured_evidence:
             async with async_session() as session:
+                db_records = []
                 for ev in captured_evidence:
                     db_ev = Evidence(
                         bug_report_id=bug_report_id,
@@ -111,33 +141,67 @@ class CoronerAgent(BaseAgent):
                         description=ev["description"],
                     )
                     session.add(db_ev)
+                    db_records.append((ev, db_ev))
                 await session.commit()
+                for ev, db_ev in db_records:
+                    ev["id"] = db_ev.id
 
         capture_failed = not captured_evidence or bool(fallback_capture_error)
         out_payload: Dict[str, Any] = {
             "evidence_count": len(captured_evidence),
             "files": [e["file_name"] for e in captured_evidence],
             "captured_live": captured_live,
+            "telemetry": runtime_telemetry,
         }
         if live_capture_note:
             out_payload["live_browser_fallback_reason"] = live_capture_note[:240]
         if fallback_capture_error:
             out_payload["error"] = fallback_capture_error[:240]
 
+        log_status = "failed" if capture_failed else ("success" if captured_live else "degraded")
+        log_level = "error" if capture_failed else ("warning" if not captured_live else "success")
+
         await self.log_action(
             action="capture_bug_evidence",
-            input_data={"bug_title": bug_data.get("title"), "stage": stage, "module": bug_data.get("module")},
+            input_data={
+                "bug_title": bug_data.get("title"),
+                "stage": stage,
+                "module": bug_data.get("module"),
+                "browsers": target_browsers,
+            },
             output_data=out_payload,
-            status="failed" if capture_failed else "success",
+            status=log_status,
             bug_report_id=bug_report_id,
             project_id=project_id,
             module=bug_data.get("module") or "Evidence & Browser",
-            level="error" if capture_failed else "success",
+            level=log_level,
             started_at=start_time,
         )
-        return captured_evidence
+        return captured_evidence, runtime_telemetry
 
-    async def _generate_visual_proof(self, bug_data: Dict[str, Any], project_info: Dict[str, Any], stage: str) -> str:
+    async def capture_evidence(
+        self,
+        bug_data: Dict[str, Any],
+        project_info: Dict[str, Any],
+        stage: str = "detection",
+        bug_report_id: Optional[int] = None,
+        project_id: Optional[int] = None,
+        browsers: Optional[List[str]] = None,
+        headless: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Capture screenshots and/or video for the bug during reproduction."""
+        evidence, _ = await self.capture_with_telemetry(
+            bug_data=bug_data,
+            project_info=project_info,
+            stage=stage,
+            bug_report_id=bug_report_id,
+            project_id=project_id,
+            browsers=browsers,
+            headless=headless,
+        )
+        return evidence
+
+    def _generate_visual_proof_sync(self, bug_data: Dict[str, Any], project_info: Dict[str, Any], stage: str) -> str:
         """Create a visual evidence image showing reproduction proof & diagnostics."""
         width, height = 1280, 720
         img = Image.new("RGB", (width, height), color=(15, 23, 42))  # slate-900
@@ -173,13 +237,14 @@ class CoronerAgent(BaseAgent):
         if isinstance(steps, str):
             steps = [steps]
         for step in steps[:6]:
-            draw.text((60, y), f"• {step[:120]}", fill=(226, 232, 240))
+            draw.text((60, y), f"• {str(step)[:120]}", fill=(226, 232, 240))
             y += 26
 
-        draw.text((50, 640), "[STATUS: CORONER VERIFIED CAPTURE]", fill=(34, 197, 94))
+        draw.text((50, 640), "[STATUS: DIAGNOSTIC SNAPSHOT CAPTURE (NO LIVE BROWSER)]", fill=(245, 158, 11))
 
         filename = f"coroner_evidence_{uuid.uuid4().hex[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         filepath = config.EVIDENCE_DIR / filename
+        filepath.parent.mkdir(parents=True, exist_ok=True)
         img.save(str(filepath))
         return str(filepath)
 

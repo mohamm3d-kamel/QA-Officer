@@ -91,6 +91,13 @@ def _format_dispatch_reply(desk_reply: str, target_agent: str, result: Dict[str,
     bug_id = result.get("bug_id")
     if target_agent == "detective":
         d = result.get("result", {})
+        report = result.get("formatted_report", "")
+        if result.get("mode") == "report":
+            return (
+                f"{desk_reply}\n\n"
+                f"### 🔍 Detective & Reporter Bug Report Draft (Bug #{bug_id})\n\n{report}"
+            )
+        report_preview = f"\n\n**Formatted Bug Report Draft (via Reporter):**\n{report[:1200]}" if report else ""
         return (
             f"{desk_reply}\n\n"
             f"### 🔍 Detective Investigation (Bug #{bug_id})\n"
@@ -98,6 +105,7 @@ def _format_dispatch_reply(desk_reply: str, target_agent: str, result: Dict[str,
             f"**Root Cause:** {d.get('root_cause')}\n"
             f"**Severity:** `{d.get('severity', 'medium')}` | **Label:** `{d.get('label', 'Front-End')}` | **Module:** `{d.get('module', 'General')}`\n"
             f"**Summary:** {d.get('trace_summary', '')}"
+            f"{report_preview}"
         )
 
     if target_agent == "coroner":
@@ -121,10 +129,10 @@ def _format_dispatch_reply(desk_reply: str, target_agent: str, result: Dict[str,
         )
 
     if target_agent == "reporter":
-        report = result.get("formatted_report", "")
+        rep = result.get("formatted_report", "")
         return (
             f"{desk_reply}\n\n"
-            f"### 📝 Reporter Draft (Bug #{bug_id})\n\n{report}"
+            f"### 📝 Reporter Formatted Bug Report (Bug #{bug_id})\n\n{rep}"
         )
 
     if target_agent == "sheriff":
@@ -339,8 +347,11 @@ async def upload_chat_files(
                 category="error",
                 status="failed",
                 level="error",
+                agent_name="System",
                 project_id=project_id,
                 output_data={"filename": upload.filename, "reason": "File is empty"},
+                notify=False,
+                notify_ui_bell=False,
             )
             raise HTTPException(status_code=400, detail=f"Uploaded file '{upload.filename or 'file'}' is empty.")
         if len(raw_bytes) > MAX_UPLOAD_BYTES:
@@ -351,8 +362,11 @@ async def upload_chat_files(
                 category="error",
                 status="failed",
                 level="error",
+                agent_name="System",
                 project_id=project_id,
                 output_data={"filename": upload.filename, "size_bytes": len(raw_bytes), "reason": "Exceeds 20 MB"},
+                notify=False,
+                notify_ui_bell=False,
             )
             raise HTTPException(
                 status_code=400,
@@ -373,8 +387,11 @@ async def upload_chat_files(
                 category="error",
                 status="failed",
                 level="error",
+                agent_name="System",
                 project_id=project_id,
                 output_data={"filename": upload.filename, "error": str(ve)},
+                notify=False,
+                notify_ui_bell=False,
             )
             raise HTTPException(status_code=400, detail=str(ve))
         processed.append(sanitize_attachment_for_db(meta))
@@ -386,6 +403,7 @@ async def upload_chat_files(
         category="system_change",
         status="success",
         level="info",
+        agent_name="System",
         project_id=project_id,
         output_data={
             "files": [
@@ -393,6 +411,8 @@ async def upload_chat_files(
                 for f in processed
             ]
         },
+        notify=False,
+        notify_ui_bell=False,
     )
 
     return {"files": processed}
@@ -468,8 +488,11 @@ async def clear_chat_history(project_id: int, db: AsyncSession = Depends(get_db)
         category="system_change",
         status="success",
         level="change",
+        agent_name="System",
         project_id=project_id,
         output_data={"project_id": project_id, "project_name": project.name},
+        notify=False,
+        notify_ui_bell=False,
     )
     return {"message": "Chat history cleared"}
 
@@ -525,10 +548,11 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
     )
 
     async def broadcast_ws(payload: Dict[str, Any]):
-        await manager.broadcast(payload)
+        await manager.broadcast({**payload, "project_id": payload.get("project_id") or data.project_id})
 
     await broadcast_ws({
         "type": "agent_status",
+        "project_id": data.project_id,
         "agent": "desk_officer",
         "status": "running",
         "message": "Desk Officer is thinking...",
@@ -572,12 +596,14 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
 
         action = decision.get("action", "chat")
         suggested_actions = decision.get("suggested_actions") or []
-        llm_meta = {
+        decision_degraded = bool(decision.get("llm_degraded") or decision.get("llm_mode") == "fallback")
+        llm_meta: Dict[str, Any] = {
             "llm_mode": decision.get("llm_mode", "fallback"),
             "llm_notice": decision.get("llm_notice"),
             "llm_provider": orchestrator.llm.provider,
             "llm_model": orchestrator.llm.model,
             "suggested_actions": suggested_actions,
+            "llm_degraded": decision_degraded,
         }
         if decision.get("executed_asset_ops"):
             llm_meta["asset_ops"] = decision["executed_asset_ops"]
@@ -606,6 +632,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             await db.refresh(skill)
             await broadcast_ws({
                 "type": "agent_status",
+                "project_id": data.project_id,
                 "agent": "desk_officer",
                 "status": "success",
                 "message": f"Saved {skill_type.replace('_', ' ')} skill.",
@@ -620,12 +647,14 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 agent_name="Desk Officer",
                 project_id=data.project_id,
                 output_data={"skill_id": skill.id, "type": skill.type, "title": skill.title},
+                notify=False,
+                notify_ui_bell=False,
             )
             if skill_type == "report_format":
                 msg = (
                     "✅ I have updated **Project Configuration → Report Format** with your template:\n\n"
                     f"```\n{cleaned_content}\n```\n\n"
-                    "Detective, Judge, and Reporter will follow this format as-is for all bug reports in this project."
+                    "Detective, Judge, and Reporter will strictly follow this format as-is for all bug reports in this project."
                 )
             else:
                 msg = f"📋 Requirement stored as a project skill: **{skill.title}**. All agents will now use this context."
@@ -644,6 +673,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             include_sheriff = bool(decision.get("also_raise_jira", False))
             await broadcast_ws({
                 "type": "agent_status",
+                "project_id": data.project_id,
                 "agent": "desk_officer",
                 "status": "success",
                 "message": "Dispatched main workflow (Detective → Coroner → Judge → Reporter).",
@@ -657,6 +687,8 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 bug_report_id=decision.get("bug_report_id"),
                 attachments=decision.get("attachments"),
             )
+            llm_degraded = bool(pipeline_result.get("llm_degraded") or decision_degraded)
+            llm_meta["llm_degraded"] = llm_degraded
 
             if pipeline_result.get("status") == "needs_clarification":
                 jv = pipeline_result.get("judge_verdict") or {}
@@ -676,6 +708,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                     "agent": "Desk Officer",
                     "response": clarify_response,
                     "pipeline_result": pipeline_result,
+                    "evidence": pipeline_result.get("evidence", []),
                     **llm_meta,
                 }
 
@@ -718,14 +751,21 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                     "Show me all built-in agents",
                 ]
 
+            degraded_note = (
+                "\n\n> ⚠️ *Fallback mode active: configure a valid LLM API key in Settings for full AI analysis.*"
+                if llm_degraded
+                else ""
+            )
+
             summary_response = (
                 f"### 🎯 Bug Report #{pipeline_result['bug_id']} Created!\n\n"
                 f"**Title:** {pipeline_result.get('title')}\n"
                 f"**Judge Confirmed Root Cause:** {pipeline_result.get('root_cause')}\n"
                 f"{jira_line}"
                 f"**Evidence:** {len(pipeline_result.get('evidence', []))} file(s) captured by Coroner.\n\n"
-                f"**Formatted Bug Report:**\n\n{pipeline_result.get('formatted_report', '')}\n"
+                f"**Formatted Bug Report (Reporter):**\n\n{pipeline_result.get('formatted_report', '')}\n"
                 + (f"\n{tail_line}" if tail_line else "")
+                + degraded_note
             )
 
             llm_meta["suggested_actions"] = workflow_actions
@@ -736,6 +776,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 "agent": "Desk Officer",
                 "response": summary_response,
                 "pipeline_result": pipeline_result,
+                "evidence": pipeline_result.get("evidence", []),
                 **llm_meta,
             }
 
@@ -745,6 +786,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             allow_sheriff = bool(decision.get("also_raise_jira", False))
             await broadcast_ws({
                 "type": "agent_status",
+                "project_id": data.project_id,
                 "agent": "desk_officer",
                 "status": "running",
                 "message": f"Organizing coordinated {len(plan_steps)}-step agent workflow...",
@@ -761,7 +803,11 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 broadcast_callback=broadcast_ws,
                 attachments=decision.get("attachments"),
             )
+            llm_degraded = bool(org_result.get("llm_degraded") or decision_degraded)
+            llm_meta["llm_degraded"] = llm_degraded
             reply_text = _format_organized_plan_reply(decision.get("reply", ""), org_result)
+            if llm_degraded and "Fallback mode active" not in reply_text:
+                reply_text += "\n\n> ⚠️ *Fallback mode active: configure a valid LLM API key in Settings for full AI analysis.*"
             llm_meta["organized_plan"] = org_result
             if org_result.get("sheriff_invoked"):
                 llm_meta["suggested_actions"] = ["Ask Watcher to retest this bug", "Show me all built-in agents"]
@@ -784,6 +830,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
             target_agent = decision.get("target_agent", "detective")
             await broadcast_ws({
                 "type": "agent_status",
+                "project_id": data.project_id,
                 "agent": "desk_officer",
                 "status": "success",
                 "message": f"Assigned {target_agent.replace('_', ' ').title()} to handle request.",
@@ -799,7 +846,17 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 broadcast_callback=broadcast_ws,
                 attachments=decision.get("attachments"),
             )
+            llm_degraded = bool(
+                decision_degraded
+                or dispatch_result.get("llm_degraded")
+                or (dispatch_result.get("result") or {}).get("llm_degraded")
+                or (dispatch_result.get("verdict") or {}).get("llm_degraded")
+                or (dispatch_result.get("sanity") or {}).get("llm_degraded")
+            )
+            llm_meta["llm_degraded"] = llm_degraded
             reply_text = _format_dispatch_reply(decision.get("reply", ""), target_agent, dispatch_result)
+            if llm_degraded and "Fallback mode active" not in reply_text:
+                reply_text += "\n\n> ⚠️ *Fallback mode active: configure a valid LLM API key in Settings for full AI analysis.*"
             llm_meta["assigned_agent"] = target_agent
             await _persist_chat_message(db, data.project_id, "agent", reply_text, agent="Desk Officer", metadata=llm_meta)
             return {
@@ -808,17 +865,21 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 "assigned_agent": target_agent,
                 "response": reply_text,
                 "data": dispatch_result,
+                "evidence": dispatch_result.get("evidence", []),
                 **llm_meta,
             }
 
         # 5. Pre-workflow Conversational Triage Chat
         await broadcast_ws({
             "type": "agent_status",
+            "project_id": data.project_id,
             "agent": "desk_officer",
             "status": "success",
             "message": "Desk Officer replied in chat.",
         })
         reply_text = decision.get("reply") or ""
+        if decision_degraded and "Fallback mode active" not in reply_text and "Settings" not in reply_text:
+            reply_text += "\n\n> ⚠️ *Fallback mode active: configure a valid LLM API key in Settings for full AI analysis.*"
         await _persist_chat_message(db, data.project_id, "agent", reply_text, agent="Desk Officer", metadata=llm_meta)
         return {
             "type": "chat",
@@ -831,6 +892,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
     except Exception as exc:
         await broadcast_ws({
             "type": "agent_status",
+            "project_id": data.project_id,
             "agent": "desk_officer",
             "status": "failed",
             "message": f"Desk Officer encountered an error: {str(exc)[:160]}",

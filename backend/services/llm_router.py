@@ -1,8 +1,10 @@
 """LLM Router - Provider-agnostic LLM abstraction.
 
 Supports OpenAI, Google Gemini, Anthropic, Ollama (local), and OpenRouter.
-Includes native httpx REST fallbacks for Gemini and Anthropic when SDKs are not installed.
+Includes native httpx REST fallbacks (with Vertex AI Express AQ. key support),
+multimodal image/PDF support, streaming, pooled clients, and transient retries.
 """
+import asyncio
 import json
 import logging
 import os
@@ -60,6 +62,7 @@ class LLMRouter:
         self.model = self._sanitize_model(model)
         self.base_url = (base_url or "").strip()
         self.api_key = self._resolve_api_key()
+        self._openai_client = None
 
     def _sanitize_model(self, raw_model: str) -> str:
         """Normalize user-entered model names and guard against pasted labels or wrong-provider defaults."""
@@ -71,7 +74,6 @@ class LLMRouter:
         if self.provider == "gemini" and model.startswith("models/"):
             model = model[len("models/"):].strip()
 
-        # Catch UI mistakes like pasting an API key nickname ("Default Gemini API Key")
         if any(ch.isspace() for ch in model):
             logger.warning(f"Ignoring invalid model name with whitespace ({model!r}); using {default_model}")
             return default_model
@@ -122,7 +124,7 @@ class LLMRouter:
         return RuntimeError(f"HTTP {resp.status_code} ({resp.reason_phrase}): {detail}")
 
     def _resolve_api_key(self) -> str:
-        if self.raw_api_key and self.raw_api_key.lower() != "mock":
+        if self.raw_api_key and self.raw_api_key.lower() not in {"mock", "test-key"}:
             return self.raw_api_key
         for env_name in self.ENV_KEY_MAP.get(self.provider, ()):
             val = (os.environ.get(env_name) or "").strip()
@@ -141,7 +143,7 @@ class LLMRouter:
             return None
         if not self.api_key:
             return f"No API key configured for '{self.provider}'."
-        if self.api_key.lower() == "mock":
+        if self.api_key.lower() in {"mock", "test-key"}:
             return "Placeholder 'mock' API key configured."
         return None
 
@@ -153,17 +155,44 @@ class LLMRouter:
             )
 
     def _get_openai_client(self):
-        from openai import AsyncOpenAI
+        if self._openai_client is None:
+            from openai import AsyncOpenAI
 
-        if self.provider == "ollama":
-            url = self.base_url or os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
-            return AsyncOpenAI(base_url=url, api_key="ollama", timeout=60.0)
-        if self.provider == "openrouter":
-            url = self.base_url or "https://openrouter.ai/api/v1"
-            return AsyncOpenAI(base_url=url, api_key=self.api_key, timeout=60.0)
-        if self.base_url:
-            return AsyncOpenAI(base_url=self.base_url, api_key=self.api_key, timeout=60.0)
-        return AsyncOpenAI(api_key=self.api_key, timeout=60.0)
+            if self.provider == "ollama":
+                url = self.base_url or os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
+                self._openai_client = AsyncOpenAI(base_url=url, api_key="ollama", timeout=60.0)
+            elif self.provider == "openrouter":
+                url = self.base_url or "https://openrouter.ai/api/v1"
+                self._openai_client = AsyncOpenAI(base_url=url, api_key=self.api_key, timeout=60.0)
+            elif self.base_url:
+                self._openai_client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key, timeout=60.0)
+            else:
+                self._openai_client = AsyncOpenAI(api_key=self.api_key, timeout=60.0)
+        return self._openai_client
+
+    @staticmethod
+    def _is_non_retryable(err: Exception) -> bool:
+        if isinstance(err, ValueError):
+            return True
+        status_code = getattr(err, "status_code", None)
+        if status_code is None and isinstance(err, httpx.HTTPStatusError) and err.response is not None:
+            status_code = err.response.status_code
+        if status_code in (400, 401, 403, 404, 422):
+            return True
+        msg = str(err).lower()
+        return any(
+            token in msg
+            for token in (
+                "incorrect api key",
+                "invalid api key",
+                "missing credentials",
+                "not configured",
+                "401",
+                "403",
+                "authentication",
+                "permission",
+            )
+        )
 
     @staticmethod
     def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -252,33 +281,55 @@ class LLMRouter:
         system_prompt: str = "",
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        json_mode: bool = False,
     ) -> LLMResponse:
         """Send a chat completion request to the configured LLM provider."""
         self._ensure_credentials()
         norm_messages = self._normalize_messages(messages)
-        try:
-            if self.provider in ("openai", "ollama", "openrouter"):
-                return await self._chat_openai(norm_messages, system_prompt, temperature, max_tokens)
-            elif self.provider == "gemini":
-                return await self._chat_gemini(norm_messages, system_prompt, temperature, max_tokens)
-            elif self.provider == "anthropic":
-                return await self._chat_anthropic(norm_messages, system_prompt, temperature, max_tokens)
-            else:
-                raise ValueError(f"Unsupported LLM provider: {self.provider}")
-        except Exception as e:
-            logger.error(f"LLM call failed ({self.provider}/{self.model}): {self._redact_secrets(str(e))}")
-            raise
 
-    async def _chat_openai(self, messages, system_prompt, temperature, max_tokens) -> LLMResponse:
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                if self.provider in ("openai", "ollama", "openrouter"):
+                    return await self._chat_openai(norm_messages, system_prompt, temperature, max_tokens, json_mode=json_mode)
+                elif self.provider == "gemini":
+                    return await self._chat_gemini(norm_messages, system_prompt, temperature, max_tokens, json_mode=json_mode)
+                elif self.provider == "anthropic":
+                    return await self._chat_anthropic(norm_messages, system_prompt, temperature, max_tokens)
+                else:
+                    raise ValueError(f"Unsupported LLM provider: {self.provider}")
+            except Exception as e:
+                last_err = e
+                if attempt == 0 and not self._is_non_retryable(e):
+                    logger.warning(f"Transient LLM error ({self.provider}/{self.model}), retrying once: {self._redact_secrets(str(e))}")
+                    await asyncio.sleep(1.0)
+                    continue
+                logger.error(f"LLM call failed ({self.provider}/{self.model}): {self._redact_secrets(str(e))}")
+                raise
+        raise last_err  # pragma: no cover
+
+    async def _chat_openai(self, messages, system_prompt, temperature, max_tokens, json_mode: bool = False) -> LLMResponse:
         client = self._get_openai_client()
         all_messages = self._format_openai_messages(messages, system_prompt)
 
-        response = await client.chat.completions.create(
-            model=self.model,
-            messages=all_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": all_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if json_mode and not self._has_binary_media(messages):
+            kwargs["response_format"] = {"type": "json_object"}
+
+        try:
+            response = await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if json_mode and "response_format" in str(e).lower():
+                kwargs.pop("response_format", None)
+                response = await client.chat.completions.create(**kwargs)
+            else:
+                raise
+
         return LLMResponse(
             content=response.choices[0].message.content or "",
             model=self.model,
@@ -296,15 +347,19 @@ class LLMRouter:
                 models.append(fallback_model)
         return models
 
-    def _gemini_endpoint(self, model_name: str, action: str) -> str:
+    def _gemini_endpoint(self, model_name: str, action: str, vertex: bool = False) -> str:
         clean = model_name[len("models/"):] if model_name.startswith("models/") else model_name
+        if vertex:
+            return f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean}:{action}"
         base = (self.base_url or "https://generativelanguage.googleapis.com").rstrip("/")
         if "/v1beta" in base or "/v1alpha" in base or base.endswith("/v1"):
             return f"{base}/models/{clean}:{action}"
         return f"{base}/v1beta/models/{clean}:{action}"
 
     @staticmethod
-    def _build_gemini_payload(messages, system_prompt: str, temperature: float, max_tokens: int) -> dict:
+    def _build_gemini_payload(
+        messages, system_prompt: str, temperature: float, max_tokens: int, json_mode: bool = False
+    ) -> dict:
         contents = []
         for msg in messages:
             parts: List[Dict[str, Any]] = []
@@ -326,20 +381,27 @@ class LLMRouter:
                 "role": "user" if msg["role"] == "user" else "model",
                 "parts": parts,
             })
+
+        gen_config: dict[str, Any] = {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        }
+        if json_mode:
+            gen_config["responseMimeType"] = "application/json"
+
         payload: dict = {
             "contents": contents,
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-            },
+            "generationConfig": gen_config,
         }
         if system_prompt:
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
         return payload
 
-    async def _chat_gemini(self, messages, system_prompt, temperature, max_tokens) -> LLMResponse:
-        # Direct Gemini REST API v1beta via httpx using x-goog-api-key header (never expose key in URLs/logs)
-        payload = self._build_gemini_payload(messages, system_prompt, temperature, max_tokens)
+    async def _chat_gemini(
+        self, messages, system_prompt, temperature, max_tokens, json_mode: bool = False
+    ) -> LLMResponse:
+        # Direct Gemini REST API via httpx using x-goog-api-key header (supports Vertex AI Express AQ. keys)
+        payload = self._build_gemini_payload(messages, system_prompt, temperature, max_tokens, json_mode=json_mode)
         headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
         has_media = self._has_binary_media(messages)
         timeout = httpx.Timeout(
@@ -353,10 +415,15 @@ class LLMRouter:
         candidates = self._gemini_candidates()
         async with httpx.AsyncClient(timeout=timeout) as client:
             for idx, model_name in enumerate(candidates):
-                url = self._gemini_endpoint(model_name, "generateContent")
+                url = self._gemini_endpoint(model_name, "generateContent", vertex=False)
                 has_next = idx + 1 < len(candidates)
                 try:
                     resp = await client.post(url, headers=headers, json=payload)
+                    if resp.status_code in (400, 401, 403) and self.api_key.startswith("AQ."):
+                        vertex_url = self._gemini_endpoint(model_name, "generateContent", vertex=True)
+                        vertex_resp = await client.post(vertex_url, headers=headers, json=payload)
+                        if vertex_resp.is_success:
+                            resp = vertex_resp
                 except httpx.TimeoutException as exc:
                     last_error = RuntimeError(f"Gemini request timed out on '{model_name}': {exc}")
                     if has_next:
@@ -375,14 +442,25 @@ class LLMRouter:
                 data = resp.json()
                 res_candidates = data.get("candidates") or []
                 parts = (((res_candidates[0].get("content") or {}).get("parts")) or []) if res_candidates else []
-                text = "".join(p.get("text", "") for p in parts if not p.get("thought") and p.get("text"))
+                text_chunks = [p["text"] for p in parts if isinstance(p, dict) and p.get("text") and not p.get("thought")]
+                if not text_chunks:
+                    text_chunks = [p["text"] for p in parts if isinstance(p, dict) and p.get("text")]
+                text = "".join(text_chunks)
+                usage_meta = data.get("usageMetadata") or {}
                 self.model = model_name
-                return LLMResponse(content=text, model=model_name, provider=self.provider)
+                return LLMResponse(
+                    content=text,
+                    model=model_name,
+                    provider=self.provider,
+                    usage={
+                        "prompt_tokens": usage_meta.get("promptTokenCount", 0),
+                        "completion_tokens": usage_meta.get("candidatesTokenCount", 0),
+                    },
+                )
 
         raise last_error or RuntimeError("Gemini request failed on all candidate models")
 
     async def _chat_anthropic(self, messages, system_prompt, temperature, max_tokens) -> LLMResponse:
-        # Anthropic requires user-first alternating messages
         anth_messages = self._format_anthropic_messages(messages)
 
         try:
@@ -408,7 +486,6 @@ class LLMRouter:
         except ImportError:
             pass
 
-        # Direct Anthropic Messages REST API via httpx
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -432,9 +509,18 @@ class LLMRouter:
         text = "".join(
             block.get("text", "")
             for block in (data.get("content") or [])
-            if block.get("type") == "text"
+            if isinstance(block, dict) and block.get("type") == "text"
         )
-        return LLMResponse(content=text, model=self.model, provider=self.provider)
+        usage = data.get("usage") or {}
+        return LLMResponse(
+            content=text,
+            model=self.model,
+            provider=self.provider,
+            usage={
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+            },
+        )
 
     async def chat_stream(
         self,
@@ -494,44 +580,51 @@ class LLMRouter:
         candidates = self._gemini_candidates()
         async with httpx.AsyncClient(timeout=timeout) as client:
             for idx, model_name in enumerate(candidates):
-                url = self._gemini_endpoint(model_name, "streamGenerateContent")
+                urls = [self._gemini_endpoint(model_name, "streamGenerateContent", vertex=False)]
+                if self.api_key.startswith("AQ."):
+                    urls.append(self._gemini_endpoint(model_name, "streamGenerateContent", vertex=True))
                 has_next = idx + 1 < len(candidates)
                 emitted_any = False
-                try:
-                    async with client.stream("POST", url, headers=headers, params={"alt": "sse"}, json=payload) as resp:
-                        if not resp.is_success:
-                            err_bytes = await resp.aread()
-                            err = self._build_http_error(resp, err_bytes)
-                            if resp.status_code in (404, 503) and has_next:
-                                logger.warning(f"Gemini stream {resp.status_code} on {model_name}; failing over: {err}")
-                                last_error = err
-                                continue
-                            raise err
 
-                        self.model = model_name
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].strip()
-                            if not data_str or data_str == "[DONE]":
-                                continue
-                            try:
-                                chunk_data = json.loads(data_str)
-                                res_candidates = chunk_data.get("candidates") or []
-                                parts = (((res_candidates[0].get("content") or {}).get("parts")) or []) if res_candidates else []
-                                for p in parts:
-                                    if not p.get("thought") and p.get("text"):
-                                        emitted_any = True
-                                        yield p["text"]
-                            except json.JSONDecodeError:
-                                continue
-                        return
-                except httpx.TimeoutException as exc:
-                    if emitted_any or not has_next:
-                        raise RuntimeError(f"Gemini stream timed out on '{model_name}': {exc}") from exc
-                    logger.warning(f"Gemini stream timeout on {model_name}; failing over to next model")
-                    last_error = exc
-                    continue
+                for url in urls:
+                    try:
+                        async with client.stream("POST", url, headers=headers, params={"alt": "sse"}, json=payload) as resp:
+                            if not resp.is_success:
+                                err_bytes = await resp.aread()
+                                err = self._build_http_error(resp, err_bytes)
+                                if resp.status_code in (400, 401, 403) and len(urls) > 1 and url == urls[0]:
+                                    last_error = err
+                                    continue
+                                if resp.status_code in (404, 503) and has_next:
+                                    logger.warning(f"Gemini stream {resp.status_code} on {model_name}; failing over: {err}")
+                                    last_error = err
+                                    break
+                                raise err
+
+                            self.model = model_name
+                            async for line in resp.aiter_lines():
+                                if not line.startswith("data:"):
+                                    continue
+                                data_str = line[5:].strip()
+                                if not data_str or data_str == "[DONE]":
+                                    continue
+                                try:
+                                    chunk_data = json.loads(data_str)
+                                    res_candidates = chunk_data.get("candidates") or []
+                                    parts = (((res_candidates[0].get("content") or {}).get("parts")) or []) if res_candidates else []
+                                    for p in parts:
+                                        if not p.get("thought") and p.get("text"):
+                                            emitted_any = True
+                                            yield p["text"]
+                                except json.JSONDecodeError:
+                                    continue
+                            return
+                    except httpx.TimeoutException as exc:
+                        if emitted_any or not has_next:
+                            raise RuntimeError(f"Gemini stream timed out on '{model_name}': {exc}") from exc
+                        logger.warning(f"Gemini stream timeout on {model_name}; failing over to next model")
+                        last_error = exc
+                        break
 
         if last_error:
             raise last_error

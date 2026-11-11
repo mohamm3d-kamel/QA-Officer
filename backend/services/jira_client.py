@@ -3,6 +3,7 @@
 Handles ticket creation, status updates, comments, project/issue search (API v3 search/jql),
 backlog placement, and attachment uploads.
 """
+import asyncio
 import logging
 import mimetypes
 import re
@@ -191,7 +192,7 @@ def markdown_to_adf(markdown_text: str) -> Dict[str, Any]:
                 content.append({"type": "orderedList", "content": items})
             continue
 
-        # 7. Paragraph (consume consecutive non-block text lines separated cleanly)
+        # 7. Paragraph
         para_lines: List[str] = []
         while i < n:
             s = lines[i].strip()
@@ -221,6 +222,15 @@ def markdown_to_adf(markdown_text: str) -> Dict[str, Any]:
         content.append({"type": "paragraph", "content": [{"type": "text", "text": text[:1000]}]})
 
     return {"version": 1, "type": "doc", "content": content}
+
+
+def _escape_jql(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _text_to_adf(text: str) -> dict:
+    """Compatibility wrapper converting Markdown/text into structured Jira ADF."""
+    return markdown_to_adf(text)
 
 
 class JiraClient:
@@ -287,6 +297,19 @@ class JiraClient:
             return sep.join(p for p in parts if p).strip()
         return str(node)
 
+    async def _lookup_account_id(self, client: httpx.AsyncClient, query: str) -> Optional[str]:
+        if not query:
+            return None
+        try:
+            resp = await client.get(f"{self.api_url}/user/search", params={"query": query, "maxResults": 1})
+            if resp.status_code == 200:
+                users = resp.json()
+                if isinstance(users, list) and users:
+                    return users[0].get("accountId")
+        except Exception as e:
+            logger.debug(f"Jira reporter lookup failed for '{query}': {e}")
+        return None
+
     async def create_issue(
         self,
         project_key: str,
@@ -297,7 +320,7 @@ class JiraClient:
         labels: list[str] = None,
         reporter_name: str = None,
     ) -> dict:
-        """Create a Jira issue, sanitizing summary/fields and surfacing API error bodies clearly."""
+        """Create a Jira issue with Markdown ADF description, optional reporter lookup, and safe field fallback."""
         clean_project = (project_key or "").strip().upper()
         clean_summary = sanitize_jira_summary(summary)
         clean_desc = (description or "").strip() or clean_summary
@@ -317,22 +340,32 @@ class JiraClient:
                 fields["labels"] = clean_labels
 
         async with self._get_client() as client:
+            if reporter_name:
+                account_id = await self._lookup_account_id(client, reporter_name)
+                if account_id:
+                    fields["reporter"] = {"accountId": account_id}
+
             response = await client.post(f"{self.api_url}/issue", json={"fields": fields})
 
-            # Graceful retry if project screen restricts optional fields like priority or labels
+            # Graceful retry if project screen restricts optional fields (reporter, priority, or labels)
             if response.status_code == 400:
                 try:
                     err_fields = (response.json().get("errors") or {}) if isinstance(response.json(), dict) else {}
                 except Exception:
                     err_fields = {}
                 retried_fields = dict(fields)
-                removed_optional = False
+                removed_optional = []
+                if "reporter" in retried_fields and ("reporter" in err_fields or not err_fields):
+                    retried_fields.pop("reporter", None)
+                    removed_optional.append("reporter")
                 for opt_key in ("priority", "labels"):
                     if opt_key in err_fields and opt_key in retried_fields:
                         retried_fields.pop(opt_key, None)
-                        removed_optional = True
+                        removed_optional.append(opt_key)
                 if removed_optional:
-                    logger.warning(f"Retrying Jira issue creation in {clean_project} without rejected optional field(s): {list(err_fields.keys())}")
+                    logger.warning(
+                        f"Retrying Jira issue creation in {clean_project} without rejected optional field(s): {removed_optional}"
+                    )
                     response = await client.post(f"{self.api_url}/issue", json={"fields": retried_fields})
 
             if not response.is_success:
@@ -366,7 +399,7 @@ class JiraClient:
             return False
 
     async def add_comment(self, issue_key: str, comment: str) -> dict:
-        """Add a comment to a Jira issue."""
+        """Add a Markdown-formatted ADF comment to a Jira issue."""
         adf_comment = markdown_to_adf(comment)
         payload = {"body": adf_comment}
 
@@ -420,24 +453,28 @@ class JiraClient:
         file_path: str,
         file_name: Optional[str] = None,
     ) -> list[dict] | dict:
-        """Upload an attachment to a Jira issue using multipart/form-data (without JSON Content-Type)."""
+        """Upload an attachment to a Jira issue without blocking the event loop or leaking JSON Content-Type."""
         path_obj = Path(file_path)
         effective_name = (file_name or path_obj.name or "evidence.bin").strip()
         mime_type = self._guess_mime_type(effective_name)
 
-        # IMPORTANT: Do NOT reuse self._headers ("Content-Type": "application/json") for multipart uploads,
-        # otherwise httpx sends Content-Type: application/json and Jira rejects or corrupts the attachment.
+        def _read_bytes(p: Path) -> bytes:
+            with open(p, "rb") as f:
+                return f.read()
+
+        file_bytes = await asyncio.to_thread(_read_bytes, path_obj)
+
+        # IMPORTANT: Omit "Content-Type": "application/json" for multipart uploads.
         upload_headers = {
             "Accept": "application/json",
             "X-Atlassian-Token": "no-check",
         }
         async with httpx.AsyncClient(auth=self.auth, headers=upload_headers, timeout=60.0) as client:
-            with open(path_obj, "rb") as f:
-                files = {"file": (effective_name, f, mime_type)}
-                response = await client.post(
-                    f"{self.api_url}/issue/{issue_key}/attachments",
-                    files=files,
-                )
+            files = {"file": (effective_name, file_bytes, mime_type)}
+            response = await client.post(
+                f"{self.api_url}/issue/{issue_key}/attachments",
+                files=files,
+            )
             if not response.is_success:
                 raise RuntimeError(self._format_http_error(response))
             logger.info(f"Uploaded Jira attachment '{effective_name}' ({mime_type}) to {issue_key}")
@@ -598,7 +635,7 @@ class JiraClient:
             return None
         if clean.lower() == "backlog":
             return '(status = "Backlog" OR (sprint is EMPTY AND status = "To Do"))'
-        return f'status = "{clean}"'
+        return f'status = "{_escape_jql(clean)}"'
 
     async def search_issues(
         self, project_key: Optional[str] = None, status: str = None, max_results: int = 50
@@ -606,7 +643,7 @@ class JiraClient:
         """Search for issues in Jira, optionally filtered by project key and/or status."""
         clauses = []
         if project_key:
-            clauses.append(f'project = "{project_key}"')
+            clauses.append(f'project = "{_escape_jql(project_key)}"')
         status_clause = self.build_status_clause(status)
         if status_clause:
             clauses.append(status_clause)
@@ -615,9 +652,8 @@ class JiraClient:
         try:
             return await self.search_jql(jql=jql, max_results=max_results)
         except Exception as e:
-            # Fallback if a Jira Core/Work Management project lacks the Agile 'sprint' JQL field
             if status and status.strip().lower() == "backlog" and "sprint" in str(e).lower():
-                fallback_clauses = [f'project = "{project_key}"'] if project_key else []
+                fallback_clauses = [f'project = "{_escape_jql(project_key)}"'] if project_key else []
                 fallback_clauses.append('(status = "Backlog" OR status = "To Do")')
                 return await self.search_jql(
                     jql=" AND ".join(fallback_clauses) + " ORDER BY updated DESC",

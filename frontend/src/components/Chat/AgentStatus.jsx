@@ -1,6 +1,20 @@
 import React from 'react';
-import { Headset, Search, Camera, Scale, FileText, Tag, Eye, FlaskConical, CheckCircle, Clock, AlertTriangle } from 'lucide-react';
+import {
+  Headset,
+  Search,
+  Camera,
+  Scale,
+  FileText,
+  Tag,
+  Eye,
+  FlaskConical,
+  CheckCircle,
+  Clock,
+  AlertTriangle,
+} from 'lucide-react';
 import useAppStore from '../../store/appStore';
+
+const EMPTY_STATUSES = {};
 
 const AGENTS = [
   { key: 'desk_officer', name: 'Desk Officer', role: 'Chat Triage & Agent Dispatcher', icon: Headset, color: 'text-cyan-400', border: 'border-cyan-500', bg: 'bg-cyan-900/30' },
@@ -9,12 +23,13 @@ const AGENTS = [
   { key: 'judge', name: 'Judge', role: 'Independent Verifier', icon: Scale, color: 'text-red-400', border: 'border-red-500', bg: 'bg-red-900/30' },
   { key: 'reporter', name: 'Reporter', role: 'Bug Report Author', icon: FileText, color: 'text-emerald-400', border: 'border-emerald-500', bg: 'bg-emerald-900/30' },
   { key: 'sheriff', name: 'Sheriff', role: 'Jira Commander (Backlog, on request)', icon: Tag, color: 'text-blue-400', border: 'border-blue-500', bg: 'bg-blue-900/30' },
-  { key: 'watcher', name: 'Watcher', role: 'System Sentinel & Slack/Email Alerter', icon: Eye, color: 'text-indigo-400', border: 'border-indigo-500', bg: 'bg-indigo-900/30' },
+  { key: 'watcher', name: 'Watcher', role: 'Jira Update & AI Failure Sentinel', icon: Eye, color: 'text-indigo-400', border: 'border-indigo-500', bg: 'bg-indigo-900/30' },
   { key: 'sanity', name: 'Sanity Testers', role: 'Regression Verifier', icon: FlaskConical, color: 'text-teal-400', border: 'border-teal-500', bg: 'bg-teal-900/30' },
 ];
 
-export default function AgentStatus() {
-  const agentStatuses = useAppStore((s) => s.agentStatuses);
+export default function AgentStatus({ projectId }) {
+  const pid = String(projectId || 'default');
+  const agentStatuses = useAppStore((s) => s.agentStatusesByProject[pid] || EMPTY_STATUSES);
 
   return (
     <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 shadow-lg backdrop-blur">
@@ -31,6 +46,7 @@ export default function AgentStatus() {
           const isRunning = statusObj.status === 'running';
           const isSuccess = statusObj.status === 'success';
           const isFailed = statusObj.status === 'failed';
+          const isDegraded = statusObj.status === 'degraded';
           const Icon = agent.icon;
 
           return (
@@ -42,6 +58,8 @@ export default function AgentStatus() {
                     ? 'border-cyan-400 bg-cyan-950 animate-pulse ring-4 ring-cyan-500/20'
                     : isSuccess
                     ? 'border-emerald-400 bg-emerald-950'
+                    : isDegraded
+                    ? 'border-amber-400 bg-amber-950'
                     : isFailed
                     ? 'border-red-400 bg-red-950'
                     : 'border-slate-700 bg-slate-900'
@@ -49,8 +67,8 @@ export default function AgentStatus() {
               >
                 {isSuccess ? (
                   <CheckCircle className="w-3 h-3 text-emerald-400" />
-                ) : isFailed ? (
-                  <AlertTriangle className="w-3 h-3 text-red-400" />
+                ) : isFailed || isDegraded ? (
+                  <AlertTriangle className={`w-3 h-3 ${isDegraded ? 'text-amber-400' : 'text-red-400'}`} />
                 ) : isRunning ? (
                   <div className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
                 ) : (
@@ -77,6 +95,8 @@ export default function AgentStatus() {
                         ? 'bg-cyan-500/20 text-cyan-300 animate-pulse'
                         : isSuccess
                         ? 'bg-emerald-500/20 text-emerald-300'
+                        : isDegraded
+                        ? 'bg-amber-500/20 text-amber-300'
                         : isFailed
                         ? 'bg-red-500/20 text-red-300'
                         : 'text-slate-500'

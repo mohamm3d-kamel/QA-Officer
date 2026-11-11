@@ -2,7 +2,7 @@
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List, Optional
 
 from agents.base import BaseAgent
 from agents.reporter import strip_report_format_preamble
@@ -32,6 +32,7 @@ class JudgeAgent(BaseAgent):
         bug_report_id: Optional[int] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
         report_format_template: Optional[str] = None,
+        runtime_telemetry: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Independently analyze and confirm whether Detective's root cause and details are accurate."""
         start_time = datetime.utcnow()
@@ -63,6 +64,12 @@ class JudgeAgent(BaseAgent):
         if bug_data.get("evidence_summary"):
             evidence_block = f"Coroner Evidence Captured:\n{bug_data.get('evidence_summary')}\n\n"
 
+        telemetry_block = (
+            f"\nCoroner Runtime & Browser Telemetry:\n{json.dumps(runtime_telemetry)}\n"
+            if runtime_telemetry
+            else ""
+        )
+
         user_content = (
             f"Project: {project_info.get('name')}\n"
             f"App URL: {project_info.get('app_url') or 'Not set'}\n"
@@ -78,9 +85,13 @@ class JudgeAgent(BaseAgent):
             f"{evidence_block}"
             f"Detective Severity: {bug_data.get('severity')}\n"
             f"Detective Label: {bug_data.get('label')}\n"
+            f"{telemetry_block}"
         )
 
-        vision_atts = [a for a in (attachments or []) if isinstance(a, dict) and a.get("data_base64")]
+        vision_atts = [
+            a for a in (attachments or [])
+            if isinstance(a, dict) and a.get("data_base64") and (a.get("is_image") or a.get("mime_type") == "application/pdf")
+        ]
         user_msg: Dict[str, Any] = {"role": "user", "content": user_content}
         if vision_atts:
             user_msg["attachments"] = vision_atts
@@ -91,19 +102,24 @@ class JudgeAgent(BaseAgent):
                 messages=[user_msg],
                 system_prompt=system_prompt,
                 temperature=0.1,
+                json_mode=True,
             )
-            content = response.content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            decision = json.loads(content.strip())
+            decision = self.parse_json_response(response.content)
+            if not isinstance(decision, dict):
+                raise ValueError("Judge expected JSON object response")
+            decision["llm_degraded"] = False
+            log_status = "success"
+            log_level = "success" if decision.get("confirmed", True) else "warning"
         except Exception as e:
             if self.llm.is_configured():
                 llm_failure_err = self.llm._redact_secrets(str(e))
-            logger.warning(f"Judge JSON parsing fallback: {e}")
+                logger.warning(f"Judge LLM failure fallback: {llm_failure_err}")
+                log_status = "failed"
+                log_level = "error"
+            else:
+                logger.warning(f"Judge fell back to offline heuristic verification: {e}")
+                log_status = "degraded"
+                log_level = "warning"
             decision = {
                 "confirmed": True,
                 "final_root_cause": bug_data.get("root_cause", "Verified defect logic."),
@@ -113,20 +129,24 @@ class JudgeAgent(BaseAgent):
                 "verdict": "CONFIRMED",
                 "severity_adjustment": bug_data.get("severity", "medium"),
                 "confidence": 0.95,
+                "llm_degraded": True,
+                "llm_error": llm_failure_err or str(e),
             }
-            if llm_failure_err:
-                decision["llm_error"] = llm_failure_err
 
-        final_status = "failed" if (llm_failure_err or not decision.get("confirmed")) else "success"
         await self.log_action(
             action="judge_root_cause_verification",
-            input_data={"bug_title": bug_data.get("title"), "detective_root_cause": bug_data.get("root_cause")},
+            input_data={
+                "bug_title": bug_data.get("title"),
+                "detective_root_cause": bug_data.get("root_cause"),
+                "has_runtime_telemetry": bool(runtime_telemetry),
+            },
             output_data=decision,
-            status=final_status,
+            status=log_status,
             bug_report_id=bug_report_id,
             project_id=project_id,
             module=bug_data.get("module") or "Root Cause Verification",
-            level="error" if final_status == "failed" else "success",
+            level=log_level,
+            notify=bool(llm_failure_err),
             started_at=start_time,
         )
         return decision

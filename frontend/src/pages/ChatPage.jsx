@@ -24,17 +24,18 @@ import AgentStatus from '../components/Chat/AgentStatus';
 import SkillPanel from '../components/Chat/SkillPanel';
 import AutoTestModal from '../components/Chat/AutoTestModal';
 import ProjectForm from '../components/Projects/ProjectForm';
+import BugDetailModal from '../components/Chat/BugDetailModal';
 
-function buildWelcomeMessage(projectName) {
+function buildWelcomeMessage(projectName, reporterName) {
   return {
-    id: 'init-1',
+    id: `init-${Date.now()}`,
     sender: 'agent',
     agent: 'Desk Officer',
     content:
-      `👋 Hello **Mohamed Kamel**! I am your **Desk Officer** AI assistant for **${projectName}**.\n\n` +
-      `- I have live access to all project assets: **Jira Cloud boards & issues, stored skills, bug reports, visual evidence, agent logs, and target app inspection**.\n` +
+      `👋 Hello **${reporterName || 'Mohamed Kamel'}**! I am your **Desk Officer** AI assistant for **${projectName}**.\n\n` +
+      `- I have live access to all project assets: **Jira Cloud boards & issues, stored skills & Report Format templates, bug reports, visual evidence, agent logs, and target app inspection**.\n` +
       `- You can **attach, drag-and-drop, or paste (\`Ctrl+V\`) screenshots, images, PDFs, Word/Excel/PowerPoint docs, HAR network traces, logs, JSON, CSV, or code files** — I will analyze them visually & structurally.\n` +
-      `- I know all built-in agents (**Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers**) and can assign any individual agent or **organize a custom multi-agent sequence** whenever you ask.\n` +
+      `- I know all 7 built-in agents (**Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers**) and can assign any individual agent or **organize a custom multi-agent sequence** whenever you ask.\n` +
       `- Say **"Create a bug report"** when you're ready for the main workflow (**Detective → Coroner → Judge → Reporter**).\n` +
       `- **Sheriff** stays on standby until you explicitly ask to raise the ticket — and when raised, it always lands in Jira **Backlog**.`,
     suggested_actions: [
@@ -53,12 +54,17 @@ export default function ChatPage() {
 
   const selectedProject = useAppStore((s) => s.selectedProject);
   const setSelectedProject = useAppStore((s) => s.setSelectedProject);
+  const reporterName = useAppStore((s) => s.reporterName);
+  const setReporterName = useAppStore((s) => s.setReporterName);
   const setSkills = useAppStore((s) => s.setSkills);
   const setBugs = useAppStore((s) => s.setBugs);
+  const removeBug = useAppStore((s) => s.removeBug);
   const bugs = useAppStore((s) => s.bugs);
   const setMessages = useAppStore((s) => s.setMessages);
   const addMessage = useAppStore((s) => s.addMessage);
   const finalizeStreamMessage = useAppStore((s) => s.finalizeStreamMessage);
+  const clearProjectMessages = useAppStore((s) => s.clearProjectMessages);
+  const clearAgentStatuses = useAppStore((s) => s.clearAgentStatuses);
   const setChatLoading = useAppStore((s) => s.setChatLoading);
 
   const [isAutoTestOpen, setIsAutoTestOpen] = useState(false);
@@ -68,8 +74,9 @@ export default function ChatPage() {
   const [llmStatus, setLlmStatus] = useState(null);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [droppedFiles, setDroppedFiles] = useState([]);
+  const [selectedBug, setSelectedBug] = useState(null);
 
-  const { isConnected } = useWebSocket();
+  const { isConnected } = useWebSocket(undefined, projectId);
 
   const refreshLlmStatus = useCallback(async () => {
     try {
@@ -80,43 +87,67 @@ export default function ChatPage() {
     }
   }, []);
 
-  // Load project details, skills, bugs, persisted chat history, and AI status
   useEffect(() => {
+    let cancelled = false;
     async function loadProjectContext() {
       try {
-        const [proj, projectSkills, projectBugs, history, aiStatus] = await Promise.all([
-          api.getProject(projectId),
-          api.getSkills(projectId),
-          api.getBugs(projectId),
-          api.getChatHistory(projectId),
-          api.getLlmStatus().catch(() => null),
-        ]);
+        const [proj, projectSkills, projectBugs, history, aiStatus, settingsList] =
+          await Promise.all([
+            api.getProject(projectId),
+            api.getSkills(projectId),
+            api.getBugs(projectId),
+            api.getChatHistory(projectId).catch(() => null),
+            api.getLlmStatus().catch(() => null),
+            api.getSettings().catch(() => []),
+          ]);
+        if (cancelled) return;
 
         setSelectedProject(proj);
         setSkills(projectSkills);
         setBugs(projectBugs);
         if (aiStatus) setLlmStatus(aiStatus);
 
+        let activeReporter = useAppStore.getState().reporterName;
+        if (Array.isArray(settingsList)) {
+          const repSetting = settingsList.find((item) => item.key === 'default_reporter');
+          if (repSetting?.value) {
+            activeReporter = repSetting.value;
+            setReporterName(repSetting.value);
+          }
+        }
+
         if (Array.isArray(history) && history.length > 0) {
-          setMessages(history);
+          setMessages(history, projectId);
         } else {
-          setMessages([buildWelcomeMessage(proj.name)]);
+          const existingMsgs = useAppStore.getState().messagesByProject[String(projectId)] || [];
+          if (existingMsgs.length === 0 || history !== null) {
+            setMessages([buildWelcomeMessage(proj.name, activeReporter)], projectId);
+          }
         }
       } catch (err) {
-        console.error('Failed to load project context:', err);
+        if (!cancelled) {
+          toast.error(err.message || 'Failed to load project context');
+        }
       }
     }
     if (projectId) loadProjectContext();
-  }, [projectId, setSelectedProject, setSkills, setBugs, setMessages]);
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, setSelectedProject, setSkills, setBugs, setMessages, setReporterName]);
 
   const handleSendMessage = async (text, attachments = []) => {
     const cleanText = (text || '').trim();
     if (!cleanText && attachments.length === 0) return;
 
-    const historyPayload = useAppStore
-      .getState()
-      .messages.filter(
-        (m) => !m.isStatus && !m.isStreaming && (m.content || (Array.isArray(m.attachments) && m.attachments.length > 0))
+    const pid = String(projectId);
+    const currentMsgs = useAppStore.getState().messagesByProject[pid] || [];
+    const historyPayload = currentMsgs
+      .filter(
+        (m) =>
+          !m.isStatus &&
+          !m.isStreaming &&
+          (m.content || (Array.isArray(m.attachments) && m.attachments.length > 0))
       )
       .slice(-16)
       .map((m) => ({
@@ -152,32 +183,38 @@ export default function ChatPage() {
       attachments,
       timestamp: new Date().toISOString(),
     };
-    addMessage(userMsg);
+    addMessage(userMsg, projectId);
     setChatLoading(true);
 
     const streamId = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
     try {
       const res = await api.sendMessage({
-        project_id: parseInt(projectId),
+        project_id: parseInt(projectId, 10),
         message: cleanText,
         attachments,
         history: historyPayload,
         stream_id: streamId,
       });
 
-      finalizeStreamMessage(streamId, {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      finalizeStreamMessage(
         streamId,
-        sender: 'agent',
-        agent: res.agent || 'Desk Officer',
-        content: res.response,
-        pipeline_result: res.pipeline_result,
-        suggested_actions: res.suggested_actions,
-        llm_mode: res.llm_mode,
-        llm_notice: res.llm_notice,
-        timestamp: new Date().toISOString(),
-      });
+        {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          streamId,
+          sender: 'agent',
+          agent: res.agent || 'Desk Officer',
+          content: res.response,
+          pipeline_result: res.pipeline_result,
+          evidence: res.evidence || res.pipeline_result?.evidence,
+          suggested_actions: res.suggested_actions,
+          llm_mode: res.llm_mode,
+          llm_notice: res.llm_notice,
+          llmDegraded: Boolean(res.llm_degraded),
+          timestamp: new Date().toISOString(),
+        },
+        projectId
+      );
 
       const [updatedProject, updatedBugs, updatedSkills] = await Promise.all([
         api.getProject(projectId),
@@ -189,14 +226,18 @@ export default function ChatPage() {
       setSkills(updatedSkills);
       refreshLlmStatus();
     } catch (err) {
-      console.error('Failed to send message:', err);
-      finalizeStreamMessage(streamId, {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        sender: 'agent',
-        agent: 'Desk Officer',
-        content: `❌ Error processing request: ${err.message}`,
-        timestamp: new Date().toISOString(),
-      });
+      toast.error(err.message || 'Failed to process message');
+      finalizeStreamMessage(
+        streamId,
+        {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          sender: 'agent',
+          agent: 'Desk Officer',
+          content: `❌ Error processing request: ${err.message}`,
+          timestamp: new Date().toISOString(),
+        },
+        projectId
+      );
     } finally {
       setChatLoading(false);
     }
@@ -205,9 +246,14 @@ export default function ChatPage() {
   const handleClearChat = async () => {
     try {
       await api.clearChatHistory(projectId);
-      setMessages([buildWelcomeMessage(selectedProject?.name || 'this project')]);
+      clearProjectMessages(projectId);
+      clearAgentStatuses(projectId);
+      setMessages(
+        [buildWelcomeMessage(selectedProject?.name || 'this project', reporterName)],
+        projectId
+      );
       toast.success('Started a fresh Desk Officer chat');
-    } catch (err) {
+    } catch {
       toast.error('Could not clear chat history');
     }
   };
@@ -228,20 +274,21 @@ export default function ChatPage() {
       const syncDetail = ticket?.newly_attached?.length
         ? ` — synced ${ticket.newly_attached.length} missing file(s)`
         : '';
-      const warnDetail = ticket?.attachment_warning
-        ? `\n⚠️ ${ticket.attachment_warning}`
-        : '';
+      const warnDetail = ticket?.attachment_warning ? `\n⚠️ ${ticket.attachment_warning}` : '';
       toast.success(`Raised Bug #${bugId} -> ${ticket?.key}${evSummary}`);
       if (ticket?.attachment_warning) {
         toast.error(ticket.attachment_warning);
       }
-      addMessage({
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        sender: 'agent',
-        agent: 'Sheriff',
-        content: `🏷️ Raised Bug #${bugId} to Jira **${ticket?.status || 'Backlog'}**: [${ticket?.key}](${ticket?.url})${evSummary}${syncDetail}${warnDetail}`,
-        timestamp: new Date().toISOString(),
-      });
+      addMessage(
+        {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          sender: 'agent',
+          agent: 'Sheriff',
+          content: `🏷️ Raised Bug #${bugId} to Jira **${ticket?.status || 'Backlog'}**: [${ticket?.key}](${ticket?.url})${evSummary}${syncDetail}${warnDetail}`,
+          timestamp: new Date().toISOString(),
+        },
+        projectId
+      );
     } catch (err) {
       console.error('Raise to Jira error:', err);
       toast.error(err?.message || `Failed to raise Bug #${bugId} to Jira`);
@@ -252,11 +299,23 @@ export default function ChatPage() {
 
   const handleRetestBug = async (bugId) => {
     try {
-      await api.retestBug(bugId);
+      const res = await api.retestBug(bugId);
       const updatedBugs = await api.getBugs(projectId);
       setBugs(updatedBugs);
+      const newStatus = res?.retest?.new_status || 'Updated';
+      toast.success(`Bug #${bugId} retest finished: ${newStatus}`);
     } catch (err) {
-      console.error('Retest error:', err);
+      toast.error(err.message || 'Retest failed');
+    }
+  };
+
+  const handleDeleteBug = async (bugId) => {
+    try {
+      await api.deleteBug(bugId);
+      removeBug(bugId);
+      toast.success(`Deleted Bug Report #${bugId}`);
+    } catch (err) {
+      toast.error(err.message || 'Failed to delete bug report');
     }
   };
 
@@ -273,9 +332,9 @@ export default function ChatPage() {
             <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-cyan-950 text-cyan-400 border border-cyan-800">
               {selectedProject?.jira_project_key || 'QA'}
             </span>
-            <div className="flex items-center gap-1.5 text-xs text-slate-500">
+            <div className="hidden sm:flex items-center gap-1.5 text-xs text-slate-500">
               <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-red-500'}`} />
-              <span>{isConnected ? 'Live' : 'Connecting...'}</span>
+              <span>{isConnected ? 'Live WebSocket' : 'Reconnecting...'}</span>
             </div>
             {llmStatus && (
               <button
@@ -332,7 +391,7 @@ export default function ChatPage() {
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-cyan-600/20 hover:bg-cyan-600 text-cyan-400 hover:text-white border border-cyan-800/50 text-xs font-semibold transition-all shadow"
             >
               <Bot className="w-4 h-4" />
-              <span>🤖 Auto-Test</span>
+              <span>Auto-Test</span>
             </button>
 
             <button
@@ -340,7 +399,7 @@ export default function ChatPage() {
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-all border border-slate-700"
             >
               <PieChart className="w-4 h-4 text-cyan-400" />
-              <span>Summary Report</span>
+              <span className="hidden sm:inline">Summary Report</span>
             </button>
 
             <button
@@ -403,7 +462,10 @@ export default function ChatPage() {
               </div>
             </div>
           )}
-          <ChatWindow onSuggestionClick={(suggested) => handleSendMessage(suggested)} />
+          <ChatWindow
+            projectId={projectId}
+            onSuggestionClick={(suggested) => handleSendMessage(suggested, [])}
+          />
           <InputArea
             projectId={projectId}
             onSendMessage={handleSendMessage}
@@ -418,19 +480,22 @@ export default function ChatPage() {
       {/* Right Sidebar: Pipeline + Stored Skills + Tracked Bugs */}
       {rightSidebarOpen && (
         <div className="w-96 border-l border-slate-800 bg-slate-900/90 overflow-y-auto p-4 space-y-5 animate-in slide-in-from-right duration-200">
-          <AgentStatus />
+          {/* Agent Pipeline Stepper */}
+          <AgentStatus projectId={projectId} />
+
+          {/* Stored Skills (Requirements & Report Format) */}
           <SkillPanel projectId={projectId} />
 
           <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 shadow-lg backdrop-blur">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold text-slate-200">Tracked Defects ({bugs.length})</h3>
-              <span className="text-[10px] text-slate-500 uppercase font-semibold">Reports & Jira</span>
+              <span className="text-[10px] text-slate-500 uppercase font-semibold">Click to Inspect</span>
             </div>
 
-            <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+            <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
               {bugs.length === 0 ? (
                 <div className="text-center py-4 text-xs text-slate-500 border border-dashed border-slate-800 rounded-lg">
-                  No defects logged yet. Chat with Desk Officer or say "Create a bug report".
+                  No defects logged yet. Chat with Desk Officer or say &quot;Create a bug report&quot;.
                 </div>
               ) : (
                 bugs.map((bug) => {
@@ -439,68 +504,79 @@ export default function ChatPage() {
                     Boolean(bug.jira_ticket_id) &&
                     new RegExp(`^${targetProjKey}-[1-9]\\d*$`).test(String(bug.jira_ticket_id).toUpperCase());
                   return (
-                  <div
-                    key={bug.id}
-                    className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800 text-xs space-y-1.5 hover:border-slate-700 transition-colors"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono font-bold text-cyan-400">
-                        {bug.jira_ticket_id || `Report #${bug.id}`}
-                        {bug.jira_ticket_id && !hasRealTargetTicket && (
-                          <span className="ml-1.5 text-[9px] font-normal text-amber-400">(unraised in {targetProjKey})</span>
-                        )}
-                      </span>
-                      <span
-                        className={`text-[9px] uppercase font-semibold px-1.5 py-0.5 rounded ${
-                          bug.status === 'resolved'
-                            ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
-                            : bug.status === 'failed'
-                            ? 'bg-red-950 text-red-400 border border-red-800'
-                            : bug.status === 'in_qa'
-                            ? 'bg-amber-950 text-amber-400 border border-amber-800'
-                            : 'bg-blue-950 text-blue-400 border border-blue-800'
-                        }`}
-                      >
-                        {bug.status}
-                      </span>
-                    </div>
-                    <p className="font-medium text-slate-200 line-clamp-1">{bug.title}</p>
-                    <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/60 text-[10px] text-slate-500">
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <span className="truncate">{bug.label || 'Front-End'}</span>
-                        {(bug.evidence?.length || 0) > 0 && (
-                          <span
-                            title={`${bug.evidence.length} Coroner evidence file(s) collected`}
-                            className="px-1.5 py-0.5 rounded bg-purple-950/70 text-purple-300 border border-purple-800/60 font-mono whitespace-nowrap"
-                          >
-                            📸 {bug.evidence.length}
-                          </span>
-                        )}
+                    <div
+                      key={bug.id}
+                      onClick={() => setSelectedBug(bug)}
+                      className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800 text-xs space-y-1.5 hover:border-cyan-500/40 cursor-pointer transition-colors"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono font-bold text-cyan-400">
+                          {bug.jira_ticket_id || `Report #${bug.id}`}
+                          {bug.jira_ticket_id && !hasRealTargetTicket && (
+                            <span className="ml-1.5 text-[9px] font-normal text-amber-400">
+                              (unraised in {targetProjKey})
+                            </span>
+                          )}
+                        </span>
+                        <span
+                          className={`text-[9px] uppercase font-semibold px-1.5 py-0.5 rounded ${
+                            bug.status === 'resolved'
+                              ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
+                              : bug.status === 'failed'
+                              ? 'bg-red-950 text-red-400 border border-red-800'
+                              : bug.status === 'in_qa'
+                              ? 'bg-amber-950 text-amber-400 border border-amber-800'
+                              : 'bg-blue-950 text-blue-400 border border-blue-800'
+                          }`}
+                        >
+                          {bug.status}
+                        </span>
                       </div>
-                      <div className="flex items-center gap-2">
-                        {!hasRealTargetTicket && bug.status !== 'resolved' && (
-                          <button
-                            onClick={() => handleRaiseToJira(bug.id)}
-                            disabled={raisingBugId === bug.id}
-                            className="text-blue-400 hover:underline font-semibold flex items-center gap-0.5 disabled:opacity-50"
-                          >
-                            <ArrowUpRight className="w-2.5 h-2.5" />
-                            <span>{raisingBugId === bug.id ? 'Raising...' : `Raise to ${targetProjKey} Backlog`}</span>
-                          </button>
-                        )}
-                        {bug.status !== 'resolved' && (
-                          <button
-                            onClick={() => handleRetestBug(bug.id)}
-                            className="text-cyan-400 hover:underline font-semibold flex items-center gap-1"
-                          >
-                            <RefreshCw className="w-2.5 h-2.5" />
-                            <span>Retest in QA</span>
-                          </button>
-                        )}
+                      <p className="font-medium text-slate-200 line-clamp-1">{bug.title}</p>
+                      <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/60 text-[10px] text-slate-500">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="truncate">{bug.label || 'Front-End'}</span>
+                          {(bug.evidence?.length || 0) > 0 && (
+                            <span
+                              title={`${bug.evidence.length} Coroner evidence file(s) collected`}
+                              className="px-1.5 py-0.5 rounded bg-purple-950/70 text-purple-300 border border-purple-800/60 font-mono whitespace-nowrap"
+                            >
+                              📸 {bug.evidence.length}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {!hasRealTargetTicket && bug.status !== 'resolved' && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRaiseToJira(bug.id);
+                              }}
+                              disabled={raisingBugId === bug.id}
+                              className="text-blue-400 hover:underline font-semibold flex items-center gap-0.5 disabled:opacity-50"
+                            >
+                              <ArrowUpRight className="w-2.5 h-2.5" />
+                              <span>{raisingBugId === bug.id ? 'Raising...' : `Raise to ${targetProjKey} Backlog`}</span>
+                            </button>
+                          )}
+                          {bug.status !== 'resolved' && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRetestBug(bug.id);
+                              }}
+                              className="text-cyan-400 hover:underline font-semibold flex items-center gap-1"
+                            >
+                              <RefreshCw className="w-2.5 h-2.5" />
+                              <span>Retest in QA</span>
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                );
+                  );
                 })
               )}
             </div>
@@ -522,6 +598,16 @@ export default function ChatPage() {
         isOpen={isProjectConfigOpen}
         onClose={() => setIsProjectConfigOpen(false)}
         initialData={selectedProject}
+      />
+
+      {/* Bug Report & Coroner Evidence Inspector */}
+      <BugDetailModal
+        bug={selectedBug}
+        isOpen={Boolean(selectedBug)}
+        onClose={() => setSelectedBug(null)}
+        onRaiseToJira={handleRaiseToJira}
+        onRetest={handleRetestBug}
+        onDelete={handleDeleteBug}
       />
     </div>
   );

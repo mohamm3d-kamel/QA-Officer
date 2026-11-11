@@ -69,6 +69,8 @@ def infer_level(status: str = "success", category: str = "agent_action", explici
         return explicit_level
     st = (status or "").lower()
     cat = (category or "").lower()
+    if st == "degraded":
+        return "warning"
     if st == "failed":
         return "error"
     if cat in ("system_change", "status_change", "jira_sync"):
