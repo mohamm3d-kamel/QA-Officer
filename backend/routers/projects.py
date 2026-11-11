@@ -6,13 +6,13 @@ from pydantic import BaseModel
 from typing import Optional
 
 from agents.desk_officer import AGENT_ROSTER
-from agents.reporter import strip_report_format_preamble
 from database import get_db
 from models.agent_log import AgentLog
 from models.chat_message import ChatMessage
 from models.project import Project
 from models.settings import Settings
 from services.project_assets import ProjectAssetHub
+from services.report_formatter import strip_report_format_preamble
 from services.watcher_bus import record_system_event
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])

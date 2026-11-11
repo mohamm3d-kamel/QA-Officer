@@ -360,7 +360,6 @@ export default function LogsPage() {
           <option value="Detective">Detective</option>
           <option value="Coroner">Coroner</option>
           <option value="Judge">Judge</option>
-          <option value="Reporter">Reporter</option>
           <option value="Sheriff">Sheriff</option>
           <option value="Watcher">Watcher</option>
           <option value="Sanity Testers">Sanity Testers</option>

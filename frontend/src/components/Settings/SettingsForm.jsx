@@ -673,7 +673,7 @@ export default function SettingsForm() {
             <div>
               <div className="font-semibold text-slate-100">Every AI Agent</div>
               <div className="text-[11px] text-slate-400 mt-0.5">
-                Desk Officer, Detective, Coroner, Judge, Reporter, Sheriff, Sanity Testers
+                Desk Officer, Detective, Coroner, Judge, Sheriff, Sanity Testers
               </div>
             </div>
           </label>

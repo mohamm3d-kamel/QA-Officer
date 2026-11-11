@@ -275,7 +275,7 @@ export default function ProjectForm({ isOpen, onClose, initialData = null }) {
               className="w-full bg-slate-950 border border-slate-800 rounded-lg text-xs font-mono text-slate-200 px-3 py-2.5 leading-relaxed focus:border-emerald-500 focus:outline-none"
             />
             <p className="text-[11px] text-slate-400">
-              Detective, Judge, and Reporter will strictly preserve these exact section names, order, and style during bug report creation — with no unrequested sections or formatting changes.
+              Detective and Judge will strictly preserve these exact section names, order, and style during bug report creation — with no unrequested sections or formatting changes.
             </p>
           </div>
 

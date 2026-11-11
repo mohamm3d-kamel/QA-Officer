@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import config
 from agents.base import BaseAgent
-from agents.reporter import ensure_evidence_in_report
+from services.report_formatter import ensure_evidence_in_report
 from database import async_session
 from models.bug_report import BugReport
 from services.jira_client import JiraClient

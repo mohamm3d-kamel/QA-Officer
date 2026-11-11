@@ -33,7 +33,6 @@ const agentConfig = {
   detective: { icon: Search, color: 'text-purple-400', bg: 'bg-purple-500/10', border: 'border-purple-500/20', label: 'Detective' },
   coroner: { icon: Camera, color: 'text-amber-400', bg: 'bg-amber-500/10', border: 'border-amber-500/20', label: 'Coroner' },
   judge: { icon: Scale, color: 'text-red-400', bg: 'bg-red-500/10', border: 'border-red-500/20', label: 'Judge' },
-  reporter: { icon: FileText, color: 'text-emerald-400', bg: 'bg-emerald-500/10', border: 'border-emerald-500/20', label: 'Reporter' },
   sheriff: { icon: Tag, color: 'text-blue-400', bg: 'bg-blue-500/10', border: 'border-blue-500/20', label: 'Sheriff' },
   watcher: { icon: Eye, color: 'text-indigo-400', bg: 'bg-indigo-500/10', border: 'border-indigo-500/20', label: 'Watcher' },
   sanity: { icon: FlaskConical, color: 'text-teal-400', bg: 'bg-teal-500/10', border: 'border-teal-500/20', label: 'Sanity Testers' },

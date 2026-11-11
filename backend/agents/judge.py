@@ -5,8 +5,8 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 from agents.base import BaseAgent
-from agents.reporter import strip_report_format_preamble
 from services.llm_router import LLMRouter
+from services.report_formatter import strip_report_format_preamble
 
 logger = logging.getLogger(__name__)
 

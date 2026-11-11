@@ -9,7 +9,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.orchestrator import AgentOrchestrator
-from agents.reporter import strip_report_format_preamble
+from services.report_formatter import strip_report_format_preamble
 from database import get_db
 from models.bug_report import BugReport
 from models.chat_message import ChatMessage
@@ -95,9 +95,9 @@ def _format_dispatch_reply(desk_reply: str, target_agent: str, result: Dict[str,
         if result.get("mode") == "report":
             return (
                 f"{desk_reply}\n\n"
-                f"### 🔍 Detective & Reporter Bug Report Draft (Bug #{bug_id})\n\n{report}"
+                f"### 🔍 Detective Formatted Bug Report (Bug #{bug_id})\n\n{report}"
             )
-        report_preview = f"\n\n**Formatted Bug Report Draft (via Reporter):**\n{report[:1200]}" if report else ""
+        report_preview = f"\n\n**Formatted Bug Report Draft (via Detective):**\n{report[:1200]}" if report else ""
         return (
             f"{desk_reply}\n\n"
             f"### 🔍 Detective Investigation (Bug #{bug_id})\n"
@@ -126,13 +126,6 @@ def _format_dispatch_reply(desk_reply: str, target_agent: str, result: Dict[str,
             f"**Verdict:** `{v.get('verdict', 'CONFIRMED')}`\n"
             f"**Root Cause Assessment:** {v.get('final_root_cause')}\n"
             f"**Notes:** {v.get('judge_notes', '')}"
-        )
-
-    if target_agent == "reporter":
-        rep = result.get("formatted_report", "")
-        return (
-            f"{desk_reply}\n\n"
-            f"### 📝 Reporter Formatted Bug Report (Bug #{bug_id})\n\n{rep}"
         )
 
     if target_agent == "sheriff":
@@ -236,7 +229,6 @@ def _format_organized_plan_reply(desk_reply: str, org_result: Dict[str, Any]) ->
         "detective": "🔍",
         "coroner": "📸",
         "judge": "⚖️",
-        "reporter": "📝",
         "sheriff": "🏷️",
         "watcher": "👁️",
         "sanity": "🧪",
@@ -255,10 +247,16 @@ def _format_organized_plan_reply(desk_reply: str, org_result: Dict[str, Any]) ->
             continue
 
         if akey == "detective":
-            d = data.get("result") or {}
-            lines.append(
-                f"{step['step']}. {icon} **{aname}**: Traced **{d.get('title')}** — Root Cause: {d.get('root_cause')}"
-            )
+            if data.get("mode") == "report":
+                rep = (data.get("formatted_report") or "").strip()
+                lines.append(f"{step['step']}. {icon} **{aname}**: Authored formatted bug report for Bug #{step.get('bug_id')}.")
+                if rep:
+                    lines.append(f"\n{rep}")
+            else:
+                d = data.get("result") or {}
+                lines.append(
+                    f"{step['step']}. {icon} **{aname}**: Traced **{d.get('title')}** — Root Cause: {d.get('root_cause')}"
+                )
         elif akey == "coroner":
             ev = data.get("evidence") or []
             files = ", ".join(e.get("file_name", "file") for e in ev) or "none"
@@ -268,11 +266,6 @@ def _format_organized_plan_reply(desk_reply: str, org_result: Dict[str, Any]) ->
             lines.append(
                 f"{step['step']}. {icon} **{aname}**: Verdict `{v.get('verdict', 'CONFIRMED')}` — {v.get('final_root_cause')}"
             )
-        elif akey == "reporter":
-            rep = (data.get("formatted_report") or "").strip()
-            lines.append(f"{step['step']}. {icon} **{aname}**: Authored formatted bug report for Bug #{step.get('bug_id')}.")
-            if rep:
-                lines.append(f"\n{rep}")
         elif akey == "sheriff":
             ticket = data.get("jira_ticket") or {}
             if st == "failed" or ticket.get("error") or not ticket.get("key"):
@@ -654,7 +647,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 msg = (
                     "✅ I have updated **Project Configuration → Report Format** with your template:\n\n"
                     f"```\n{cleaned_content}\n```\n\n"
-                    "Detective, Judge, and Reporter will strictly follow this format as-is for all bug reports in this project."
+                    "Detective and Judge will strictly follow this format as-is for all bug reports in this project."
                 )
             else:
                 msg = f"📋 Requirement stored as a project skill: **{skill.title}**. All agents will now use this context."
@@ -676,7 +669,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 "project_id": data.project_id,
                 "agent": "desk_officer",
                 "status": "success",
-                "message": "Dispatched main workflow (Detective → Coroner → Judge → Reporter).",
+                "message": "Dispatched main workflow (Detective → Coroner → Judge).",
             })
 
             pipeline_result = await orchestrator.process_bug_pipeline(
@@ -763,7 +756,7 @@ async def send_chat_message(data: ChatMessageRequest, db: AsyncSession = Depends
                 f"**Judge Confirmed Root Cause:** {pipeline_result.get('root_cause')}\n"
                 f"{jira_line}"
                 f"**Evidence:** {len(pipeline_result.get('evidence', []))} file(s) captured by Coroner.\n\n"
-                f"**Formatted Bug Report (Reporter):**\n\n{pipeline_result.get('formatted_report', '')}\n"
+                f"**Formatted Bug Report (Detective):**\n\n{pipeline_result.get('formatted_report', '')}\n"
                 + (f"\n{tail_line}" if tail_line else "")
                 + degraded_note
             )

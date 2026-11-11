@@ -35,13 +35,13 @@ function buildWelcomeMessage(projectName, reporterName) {
       `👋 Hello **${reporterName || 'Mohamed Kamel'}**! I am your **Desk Officer** AI assistant for **${projectName}**.\n\n` +
       `- I have live access to all project assets: **Jira Cloud boards & issues, stored skills & Report Format templates, bug reports, visual evidence, agent logs, and target app inspection**.\n` +
       `- You can **attach, drag-and-drop, or paste (\`Ctrl+V\`) screenshots, images, PDFs, Word/Excel/PowerPoint docs, HAR network traces, logs, JSON, CSV, or code files** — I will analyze them visually & structurally.\n` +
-      `- I know all 7 built-in agents (**Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers**) and can assign any individual agent or **organize a custom multi-agent sequence** whenever you ask.\n` +
-      `- Say **"Create a bug report"** when you're ready for the main workflow (**Detective → Coroner → Judge → Reporter**).\n` +
+      `- I know all 6 built-in agents (**Detective, Coroner, Judge, Sheriff, Watcher, Sanity Testers**) and can assign any individual agent or **organize a custom multi-agent sequence** whenever you ask.\n` +
+      `- Say **"Create a bug report"** when you're ready for the main workflow (**Detective → Coroner → Judge**).\n` +
       `- **Sheriff** stays on standby until you explicitly ask to raise the ticket — and when raised, it always lands in Jira **Backlog**.`,
     suggested_actions: [
       'Check my Jira In QA list',
       'Show all project assets and built-in agents',
-      'Organize Detective, Coroner, and Reporter for a bug',
+      'Organize Detective, Coroner, and Judge for a bug',
       'Run Auto-Test discovery',
     ],
     timestamp: new Date().toISOString(),

@@ -115,7 +115,7 @@ def infer_module(
         return "Sanity & Regression"
     if "judge" in act or ag == "judge":
         return "Root Cause Verification"
-    if "report" in act or ag == "reporter":
+    if "report" in act:
         return "Bug Reporting"
     if "discover" in act or "retest" in act or "trace" in act or ag == "detective":
         return "Defect Investigation"

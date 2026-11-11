@@ -98,7 +98,7 @@ export default function DashboardPage() {
             Welcome, <span className="text-cyan-400">{reporterName}</span>
           </h1>
           <p className="text-sm text-slate-400 leading-relaxed">
-            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand, Detective traces root cause, Coroner captures live proof, Judge independently confirms, Reporter drafts formatted reports matching your template, Sheriff raises tickets to Jira Backlog when requested, and Watcher alerts Slack &amp; Email on Jira updates and AI agent failures.
+            Multi-Agent QA pipeline is active: Desk Officer triages bugs in chat and dispatches agents on demand, Detective traces root cause and drafts formatted reports matching your template, Coroner captures live proof, Judge independently confirms, Sheriff raises tickets to Jira Backlog when requested, and Watcher alerts Slack &amp; Email on Jira updates and AI agent failures.
           </p>
 
           <div className="flex items-center gap-3 pt-2">

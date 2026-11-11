@@ -178,7 +178,7 @@ export default function AutoTestModal({ isOpen, onClose, projectId, onComplete }
             <div>• Detective investigates root cause & reproduces defect</div>
             <div>• Coroner captures screenshot & video evidence</div>
             <div>• Judge confirms findings independently</div>
-            <div>• Reporter writes clean report matching your Project Report Format</div>
+            <div>• Detective writes clean report matching your Project Report Format</div>
             <div>• Sheriff stands by until asked, then logs to Jira &apos;Backlog&apos;</div>
           </div>
         </div>

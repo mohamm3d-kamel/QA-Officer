@@ -103,12 +103,13 @@ async def run_e2e_tests():
             project_id=1,
         )
         assert triage_roster["action"] == "chat"
-        for expected_agent in ["Detective", "Coroner", "Judge", "Reporter", "Sheriff", "Watcher", "Sanity Testers"]:
+        for expected_agent in ["Detective", "Coroner", "Judge", "Sheriff", "Watcher", "Sanity Testers"]:
             assert expected_agent in triage_roster["reply"], f"Roster reply missing {expected_agent}"
-        print("✅ Desk Officer knows and explains all 7 specialized built-in agents (including separate Reporter).")
+        assert "- **Reporter**" not in triage_roster["reply"], "Standalone Reporter agent should be merged into Detective"
+        print("✅ Desk Officer knows and explains all 6 specialized built-in agents (with Report authoring merged into Detective).")
 
-        # 4. Test Individual Agent Assignments by Desk Officer (Detective + Separate Reporter)
-        print("\n[Step 3] Testing Desk Officer Assigning Individual Agents (Detective -> Reporter)...")
+        # 4. Test Individual Agent Assignments by Desk Officer (Detective investigate -> Detective report format)
+        print("\n[Step 3] Testing Desk Officer Assigning Detective (Investigation -> Report Authoring)...")
         triage_detective = await orchestrator.desk_officer.triage_and_route(
             message="Assign Detective to investigate this bug",
             project_info=project_info,
@@ -127,28 +128,29 @@ async def run_e2e_tests():
         assert detective_dispatch["status"] == "success"
         assert detective_dispatch.get("result", {}).get("root_cause")
 
-        triage_reporter = await orchestrator.desk_officer.triage_and_route(
-            message=f"Ask Reporter to format the report for bug #{detective_dispatch['bug_id']}",
+        triage_det_report = await orchestrator.desk_officer.triage_and_route(
+            message=f"Ask Detective to format the report for bug #{detective_dispatch['bug_id']}",
             project_info=project_info,
             skills_context=skills_context,
             recent_bugs=[],
             conversation_history=chat_history,
             project_id=1,
         )
-        assert triage_reporter["action"] == "assign_agent"
-        assert triage_reporter["target_agent"] == "reporter"
+        assert triage_det_report["action"] == "assign_agent"
+        assert triage_det_report["target_agent"] == "detective"
         report_dispatch = await orchestrator.dispatch_agent(
-            target_agent=triage_reporter["target_agent"],
+            target_agent=triage_det_report["target_agent"],
             project_id=1,
-            bug_input=triage_reporter["bug_summary"],
-            bug_report_id=triage_reporter["bug_report_id"],
+            bug_input=triage_det_report["bug_summary"],
+            bug_report_id=triage_det_report["bug_report_id"],
         )
         assert report_dispatch["status"] == "success"
-        assert report_dispatch["agent"] == "Reporter"
+        assert report_dispatch["agent"] == "Detective"
+        assert report_dispatch.get("mode") == "report"
         assert report_dispatch.get("formatted_report")
         print(
-            f"✅ Desk Officer assigned Detective (Draft Bug #{detective_dispatch['bug_id']}) "
-            "and separate Reporter authored the formatted report."
+            f"✅ Desk Officer assigned Detective to investigate (Draft Bug #{detective_dispatch['bug_id']}) "
+            "and author the formatted bug report."
         )
 
         # 5. Test Main Workflow Trigger ('Create a bug report') WITHOUT Sheriff raising Jira
@@ -180,7 +182,7 @@ async def run_e2e_tests():
         bug_id = pipeline_result["bug_id"]
         assert pipeline_result["jira_ticket"] is None, "Sheriff should NOT raise ticket until asked!"
         assert pipeline_result["status"] == "confirmed"
-        assert pipeline_result["formatted_report"], "Reporter output should include a formatted bug report"
+        assert pipeline_result["formatted_report"], "Detective output should include a formatted bug report"
         assert pipeline_result.get("llm_degraded") is True, "Offline/test LLM key should flag llm_degraded=True"
         assert len(pipeline_result.get("evidence", [])) >= 1, "Coroner should produce evidence"
         ev_first = pipeline_result["evidence"][0]
@@ -237,7 +239,7 @@ async def run_e2e_tests():
             print(f"   • Total Tickets Added: {summary['tickets_added']}")
             print(f"   • Resolved: {summary['tickets_resolved']}")
 
-        # 9. Verify Agent Logs include Desk Officer, separate Reporter, all pipeline agents, and honest degraded status
+        # 9. Verify Agent Logs include Desk Officer, Detective (both investigation & report), and honest degraded status
         print("\n[Step 8] Checking Agent Activity Audit Trail...")
         async with async_session() as session:
             res = await session.execute(select(AgentLog).where(AgentLog.project_id == 1))
@@ -247,11 +249,11 @@ async def run_e2e_tests():
             print(f"✅ Total Agent Actions Logged: {len(logs)} | Agents: {sorted(logged_agents)} | Statuses: {sorted(logged_statuses)}")
             assert "Desk Officer" in logged_agents, "Desk Officer actions should be logged"
             assert "Detective" in logged_agents, "Detective actions should be logged"
-            assert "Reporter" in logged_agents, "Separate Reporter actions should be logged"
+            assert "Reporter" not in logged_agents, "Standalone Reporter agent should not appear in logs"
             assert "degraded" in logged_statuses, "Offline/invalid-key fallbacks must log status='degraded'"
             assert any(
-                l.agent_name == "Reporter" and l.action == "generate_bug_report" for l in logs
-            ), "Reporter should log generate_bug_report actions"
+                l.agent_name == "Detective" and l.action == "generate_bug_report" for l in logs
+            ), "Detective should log generate_bug_report actions"
     finally:
         await engine.dispose()
         # Cleanup evidence artifacts generated only by this E2E run

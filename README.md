@@ -12,10 +12,9 @@ An AI-powered software testing platform built for modern QA teams. It coordinate
 
 2. **Multi-Agent Defect Pipeline (Coordinated by Desk Officer)**
    - **🎖️ Desk Officer (Chat Coordinator & Dispatcher)**: Chats with you interactively (supporting screenshots, PDFs, Office docs, logs, and HAR captures), asks clarifying questions when critical bug details are missing, assigns individual agents or multi-agent collaboration plans on demand, and launches the full pipeline when requested.
-   - **🔍 Detective (Root Cause Investigator)**: Traces bug symptoms, runtime telemetry, logs, code context, and requirements to identify root cause, reproduction steps, severity, label, and affected module — plus retests fixes and runs autonomous discovery.
+   - **🔍 Detective (Root Cause Investigator & Bug Report Author)**: Traces bug symptoms, runtime telemetry, logs, code context, and requirements to identify root cause, reproduction steps, severity, label, and affected module; authors clean, verified Markdown bug reports adhering strictly to your project's configured **Report Format** template as-is; and retests fixes or runs autonomous discovery.
    - **📸 Coroner (Evidence Collector)**: Runs automated Playwright browser sessions (Chromium / Firefox / WebKit) to capture screenshots, video recordings, console/network errors, and diagnostic snapshots during bug reproduction and failed QA retests.
-   - **⚖️ Judge (Senior Verifier)**: Independently verifies Detective's root cause, Coroner's runtime telemetry/evidence, and attached files before approving the bug report.
-   - **📝 Reporter (Bug Report Author)**: Authors clean, verified Markdown bug reports incorporating Detective findings, Judge verdicts, and Coroner evidence while strictly following your project's configured **Report Format** template as-is.
+   - **⚖️ Judge (Senior Verifier)**: Independently verifies Detective's root cause, Coroner's runtime telemetry/evidence, and attached files before Detective finalizes the bug report.
    - **🏷️ Sheriff (Jira Commander)**: Creates Jira Cloud tickets in the `Backlog` (never `To Do`) **only when explicitly requested**, attaching Coroner evidence directly to Jira, formatting ADF bodies, selecting priority & label (`Back-End`, `Front-End`, `Mobile`), and assigning the configured reporter.
    - **👁️ Watcher (Jira Update & Agent Failure Sentinel)**: Monitors Jira ticket transitions/updates (`In QA` triggers Detective retest -> `Ready To Deploy` or `Failed QA` with Coroner evidence) and watches all AI agents. External **Slack** and **Email (SMTP)** alerts fire strictly for **Jira updates** and **AI agent failures**, while internal module/log telemetry stays visible in the UI Audit Logs & Timeline.
    - **🧪 Sanity Testers (Regression Checker)**: Evaluates adjacent and affected modules of resolved bugs to verify fixes introduce zero regressions.
@@ -46,7 +45,7 @@ Open the **Settings** tab (or jump directly to **Email Alerts (SMTP)** via `/set
 ```
 QA-Officer/
 ├── backend/
-│   ├── agents/               # Desk Officer, Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers
+│   ├── agents/               # Desk Officer, Detective, Coroner, Judge, Sheriff, Watcher, Sanity Testers
 │   ├── models/               # SQLAlchemy Async SQLite Models (Project, Skill, BugReport, Evidence, ChatMessage, AgentLog, Settings)
 │   ├── routers/              # FastAPI Routers (Projects, Skills, Bugs, Chat, Logs, Settings, Reports, WebSocket)
 │   ├── services/             # LLMRouter, JiraClient, BrowserEngine, AttachmentProcessor, ProjectAssetHub, NotificationService, WatcherBus

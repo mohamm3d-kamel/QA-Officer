@@ -423,7 +423,7 @@ class ProjectAssetHub:
             return {"tool": tool, "ok": True, "count": len(snapshot["skills"]), "skills": snapshot["skills"]}
 
         if tool == "save_skill":
-            from agents.reporter import strip_report_format_preamble
+            from services.report_formatter import strip_report_format_preamble
             from services.watcher_bus import record_system_event
 
             stype = (params.get("type") or "requirement").strip().lower()
@@ -491,7 +491,7 @@ class ProjectAssetHub:
             return {"tool": tool, "ok": True, "deleted_skill_id": int(skill_id)}
 
         if tool == "update_project_config":
-            from agents.reporter import strip_report_format_preamble
+            from services.report_formatter import strip_report_format_preamble
             from services.watcher_bus import record_system_event
 
             updates = {}
@@ -688,7 +688,7 @@ class ProjectAssetHub:
         lines.append(f"- Configured Jira Project Key: {proj.get('jira_project_key') or 'QA'} | Jira URL: {proj.get('jira_base_url') or integ['jira'].get('base_url') or 'Not set'}")
         if proj.get("description"):
             lines.append(f"- Domain / Business Description:\n{proj['description'][:2200]}")
-        from agents.reporter import strip_report_format_preamble
+        from services.report_formatter import strip_report_format_preamble
 
         active_rf = strip_report_format_preamble(proj.get("report_format")) or ""
         if not active_rf:

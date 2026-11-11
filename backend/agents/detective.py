@@ -1,4 +1,4 @@
-"""Detective Agent - Traces bugs, tracks root cause, verifies reproduction, and retests."""
+"""Detective Agent - Traces bugs, tracks root cause, verifies reproduction, retests, and authors formatted bug reports."""
 import asyncio
 import json
 import logging
@@ -7,24 +7,36 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List
 
 from agents.base import BaseAgent
-from agents.reporter import clean_bug_description, clean_bug_title, strip_report_format_preamble
 from services.browser_engine import BrowserEngine
 from services.llm_router import LLMRouter
+from services.report_formatter import (
+    _build_evidence_lines,
+    _matches_template_strictly,
+    _populate_section_values,
+    _render_deterministic_template,
+    _strip_llm_wrapper_chatter,
+    clean_bug_description,
+    clean_bug_title,
+    ensure_evidence_in_report,
+    parse_template_sections,
+    strip_report_format_preamble,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class DetectiveAgent(BaseAgent):
-    """Bug investigation, retesting, and autonomous discovery agent."""
+    """Bug investigation, retesting, autonomous discovery, and report authoring agent."""
 
     def __init__(self, llm_router: LLMRouter):
         super().__init__(
             name="Detective",
-            role="Root Cause Investigator",
+            role="Root Cause Investigator & Bug Report Author",
             color="#8b5cf6",
             icon="🔍",
         )
         self.llm = llm_router
+        self.last_llm_degraded = False
 
     @staticmethod
     def _build_offline_findings(
@@ -459,6 +471,199 @@ class DetectiveAgent(BaseAgent):
             started_at=start_time,
         )
         return bugs
+
+    async def generate_report(
+        self,
+        bug_data: Dict[str, Any],
+        judge_verdict: Dict[str, Any],
+        report_format_template: Optional[str],
+        project_info: Dict[str, Any],
+        project_id: int,
+        bug_report_id: Optional[int] = None,
+        evidence_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Compose the bug report adhering strictly to the Project's Report Format template as-is."""
+        start_time = datetime.utcnow()
+        cleaned_template = strip_report_format_preamble(report_format_template)
+        parsed_sections = parse_template_sections(cleaned_template) if cleaned_template else []
+
+        values = _populate_section_values(
+            bug_data=bug_data,
+            judge_verdict=judge_verdict,
+            project_info=project_info,
+            evidence_list=evidence_list,
+            bug_report_id=bug_report_id,
+        )
+
+        if cleaned_template:
+            section_list_str = (
+                "\n".join(f"  {i+1}. {s['label']}" for i, s in enumerate(parsed_sections))
+                if parsed_sections
+                else "(Follow exact structure shown in template below)"
+            )
+            system_prompt = (
+                "You are the Detective AI Agent in QA Officer acting in Bug Report Authoring mode.\n"
+                "YOUR #1 RULE: Follow the Project's Report Format template AS IT IS.\n\n"
+                "STRICT FORMATTING RULES WHEN A REPORT FORMAT TEMPLATE IS PROVIDED:\n"
+                "1. Preserve the EXACT section names, exact wording/spelling, exact casing, and exact order from the template.\n"
+                "2. Do NOT add extra sections, standalone metadata headings, summaries, root cause sections, dividers (`---`), or emojis unless they are explicitly present in the template.\n"
+                "   - If the template does NOT have a separate Root Cause section, weave the Judge-confirmed root cause concisely into the `Description` or `Actual Behavior` prose without adding a separate Root Cause heading.\n"
+                "3. Replace any template placeholders (`[...]`, `{{...}}`, `<...>`) with clear, accurate content from the investigation.\n"
+                "4. If the template uses plain bare section labels (e.g., `Title`, `Environment`, `Description`), format each section header using `### <Exact Template Label>` followed cleanly by its content (numbered `1. ` list for steps, concise `- ` bullets for environment and evidence). If the template already specifies `#`, `##`, `###`, `**Label:**`, or `Label:`, preserve that exact header style.\n"
+                "5. Ground EVERY claim, number, URL, and filename strictly in the investigation facts below. List exact captured evidence filenames when an Evidence/Attachments section exists.\n"
+                "6. Output ONLY the final bug report itself — no conversational greeting, no explanation, and NO outer ```markdown fences."
+            )
+            template_block = (
+                f"=== AUTHORITATIVE PROJECT REPORT FORMAT (FOLLOW AS-IS) ===\n"
+                f"{cleaned_template}\n\n"
+                f"Expected Sections in Exact Order:\n{section_list_str}"
+            )
+        else:
+            system_prompt = (
+                "You are the Detective AI Agent in QA Officer acting in Bug Report Authoring mode. "
+                "Generate a crisp, structured, Jira-ready bug report in clean Markdown covering: "
+                "Title, Environment, Description, Steps to Reproduce, Expected Behavior, Actual Behavior, Root Cause, and Evidence.\n"
+                "Be concise, factual, and grounded in the investigation findings and captured evidence filenames. "
+                "Output ONLY the bug report itself without conversational intro/outro or outer ```markdown fences."
+            )
+            template_block = "No custom Project Report Format configured; use clean Standard QA Markdown sections."
+
+        evidence_lines = _build_evidence_lines(evidence_list, bug_data)
+        user_content = (
+            f"Project: {values['project']}\n"
+            f"Target URL (App URL): {project_info.get('app_url') or 'Not configured'}\n"
+            f"Target Repo: {project_info.get('repo_url') or 'Not configured'}\n"
+            f"Module: {values['module']} | Label: {values['label']} | Severity: {values['severity']}\n\n"
+            f"Clean Bug Title: {values['title']}\n"
+            f"Symptom / Description:\n{values['raw_description']}\n\n"
+            f"Judge Confirmed Root Cause:\n{values['root_cause']}\n\n"
+            f"Judge Notes:\n{values['notes']}\n\n"
+            f"Steps To Reproduce:\n{values['steps']}\n\n"
+            f"Expected Behavior:\n{values['expected']}\n\n"
+            f"Actual Behavior:\n{values['actual']}\n\n"
+            f"Captured Evidence Assets:\n" + "\n".join(evidence_lines) + "\n\n"
+            f"{template_block}"
+        )
+
+        llm_failure_err: Optional[str] = None
+        llm_degraded = False
+        fallback_reason: Optional[str] = None
+        report_text = ""
+
+        try:
+            response = await self.llm.chat(
+                messages=[{"role": "user", "content": user_content}],
+                system_prompt=system_prompt,
+                temperature=0.1,
+            )
+            candidate = _strip_llm_wrapper_chatter(
+                response.content,
+                section_labels=[s["clean_label"] for s in parsed_sections],
+            )
+            if cleaned_template and parsed_sections:
+                ok, reason = _matches_template_strictly(candidate, parsed_sections)
+                if ok:
+                    report_text = candidate
+                else:
+                    fallback_reason = reason
+                    logger.warning(f"Detective report LLM output drifted from Project Report Format ({reason}); enforcing strict template rendering.")
+                    report_text = self._fallback_report(
+                        bug_data=bug_data,
+                        judge_verdict=judge_verdict,
+                        project_info=project_info,
+                        report_format_template=cleaned_template,
+                        evidence_list=evidence_list,
+                        bug_report_id=bug_report_id,
+                    )
+            elif candidate:
+                report_text = candidate
+        except Exception as e:
+            llm_degraded = True
+            if self.llm.is_configured():
+                llm_failure_err = self.llm._redact_secrets(str(e))
+                logger.error(f"Detective bug report generation LLM error: {e}")
+
+        if not report_text:
+            report_text = self._fallback_report(
+                bug_data=bug_data,
+                judge_verdict=judge_verdict,
+                project_info=project_info,
+                report_format_template=cleaned_template,
+                evidence_list=evidence_list,
+                bug_report_id=bug_report_id,
+            )
+
+        report_text = ensure_evidence_in_report(report_text, evidence_list, bug_data)
+        self.last_llm_degraded = llm_degraded
+
+        out_payload: Dict[str, Any] = {
+            "report_preview": report_text[:200] + ("..." if len(report_text) > 200 else ""),
+            "custom_template_used": bool(cleaned_template),
+            "llm_degraded": llm_degraded,
+        }
+        if fallback_reason:
+            out_payload["template_enforced_deterministically"] = fallback_reason
+        if llm_failure_err:
+            out_payload["llm_error"] = llm_failure_err
+
+        await self.log_action(
+            action="generate_bug_report",
+            input_data={
+                "bug_title": values["title"],
+                "module": values["module"],
+                "has_custom_format": bool(cleaned_template),
+            },
+            output_data=out_payload,
+            status="failed" if llm_failure_err else ("degraded" if llm_degraded else "success"),
+            bug_report_id=bug_report_id,
+            project_id=project_id,
+            module=values["module"] or "Bug Reporting",
+            level="error" if llm_failure_err else ("warning" if llm_degraded else "success"),
+            notify=bool(llm_failure_err),
+            started_at=start_time,
+        )
+        return report_text
+
+    def _fallback_report(
+        self,
+        bug_data: Dict[str, Any],
+        judge_verdict: Dict[str, Any],
+        project_info: Dict[str, Any],
+        report_format_template: Optional[str] = None,
+        evidence_list: Optional[List[Dict[str, Any]]] = None,
+        bug_report_id: Optional[int] = None,
+    ) -> str:
+        """Render clean deterministic bug report honoring report_format_template when provided."""
+        cleaned_template = strip_report_format_preamble(report_format_template)
+        if cleaned_template:
+            rendered = _render_deterministic_template(
+                template=cleaned_template,
+                bug_data=bug_data,
+                judge_verdict=judge_verdict,
+                project_info=project_info,
+                evidence_list=evidence_list,
+                bug_report_id=bug_report_id,
+            )
+            if rendered:
+                return rendered
+
+        values = _populate_section_values(
+            bug_data=bug_data,
+            judge_verdict=judge_verdict,
+            project_info=project_info,
+            evidence_list=evidence_list,
+            bug_report_id=bug_report_id,
+        )
+        return (
+            f"### Title\n{values['title']}\n\n"
+            f"### Environment\n{values['environment']}\n\n"
+            f"### Description\n{values['raw_description']}\n\n"
+            f"### Steps to Reproduce\n{values['steps']}\n\n"
+            f"### Expected Behavior\n{values['expected']}\n\n"
+            f"### Actual Behavior\n{values['actual']}\n\n"
+            f"### Root Cause\n{values['root_cause']}\n\n"
+            f"### Evidence\n{values['evidence']}"
+        )
 
     async def run(self, *args, **kwargs) -> Any:
         return await self.trace_bug(*args, **kwargs)

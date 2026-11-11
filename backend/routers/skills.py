@@ -7,10 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 
-from agents.reporter import strip_report_format_preamble
 from database import get_db
 from models.skill import Skill
 from models.project import Project
+from services.report_formatter import strip_report_format_preamble
 from services.watcher_bus import record_system_event
 
 router = APIRouter(tags=["skills"])

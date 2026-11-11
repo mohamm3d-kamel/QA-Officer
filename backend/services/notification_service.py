@@ -20,7 +20,6 @@ AI_AGENT_NAMES = frozenset({
     "Detective",
     "Coroner",
     "Judge",
-    "Reporter",
     "Sheriff",
     "Watcher",
     "Sanity Testers",

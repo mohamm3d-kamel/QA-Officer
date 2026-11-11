@@ -30,7 +30,7 @@ export default function ChatWindow({ projectId, onSuggestionClick }) {
           {[
             'Check my Jira In QA list',
             'Show all project assets and built-in agents',
-            'Organize Detective, Coroner, and Reporter for a bug',
+            'Organize Detective, Coroner, and Judge for a bug',
             'Create a bug report',
           ].map((suggestion) => (
             <button

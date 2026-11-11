@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from agents.base import BaseAgent
-from agents.reporter import strip_report_format_preamble
+from services.report_formatter import strip_report_format_preamble
 from services.attachment_processor import (
     format_attachment_text_block,
     hydrate_history_attachments,
@@ -30,8 +30,8 @@ AGENT_ROSTER: List[Dict[str, str]] = [
     {
         "key": "detective",
         "name": "Detective",
-        "role": "Root Cause Investigator",
-        "description": "Traces bug symptoms, live browser telemetry, runtime errors, logs, and business requirements to identify root cause, reproduction steps, severity, label, and affected module; and retests fixes or runs autonomous discovery.",
+        "role": "Root Cause Investigator & Bug Report Author",
+        "description": "Traces bug symptoms, live browser telemetry, runtime errors, logs, and business requirements to identify root cause, reproduction steps, severity, label, and affected module; authors clean, verified Markdown bug reports adhering strictly to the project's configured Report Format template as-is; and retests fixes or runs autonomous discovery.",
     },
     {
         "key": "coroner",
@@ -43,13 +43,7 @@ AGENT_ROSTER: List[Dict[str, str]] = [
         "key": "judge",
         "name": "Judge",
         "role": "Independent Root Cause Verifier",
-        "description": "Independently reviews and confirms, revises, or rejects the Detective's identified root cause and severity before a bug report is finalized.",
-    },
-    {
-        "key": "reporter",
-        "name": "Reporter",
-        "role": "Bug Report Author",
-        "description": "Authors clean, verified Markdown bug reports incorporating Detective findings, Coroner visual evidence, and Judge verdicts while adhering strictly to the project's configured Report Format template as-is.",
+        "description": "Independently reviews and confirms, revises, or rejects the Detective's identified root cause and severity before Detective finalizes the bug report.",
     },
     {
         "key": "sheriff",
@@ -72,7 +66,7 @@ AGENT_ROSTER: List[Dict[str, str]] = [
 ]
 
 VALID_ACTIONS = {"chat", "run_main_workflow", "assign_agent", "organize_agents", "save_skill"}
-VALID_AGENTS = {"none", "detective", "coroner", "judge", "reporter", "sheriff", "watcher", "sanity", "auto_test"}
+VALID_AGENTS = {"none", "detective", "coroner", "judge", "sheriff", "watcher", "sanity", "auto_test"}
 
 _ACTION_MARKER = "<!-- DESK_ACTION"
 _TOOL_MARKER = "<!-- DESK_TOOL"
@@ -406,7 +400,6 @@ class DeskOfficerAgent(BaseAgent):
             ("detective", r"\bdetective\b"),
             ("coroner", r"\bcoroner\b"),
             ("judge", r"\bjudge\b"),
-            ("reporter", r"\breporter\b"),
             ("sheriff", r"\bsheriff\b"),
             ("watcher", r"\bwatcher\b"),
             ("sanity", r"\bsanity(\s+testers?)?\b"),
@@ -417,11 +410,6 @@ class DeskOfficerAgent(BaseAgent):
 
         for agent_key, pat in agent_patterns:
             for m in re.finditer(pat, text, re.IGNORECASE):
-                if agent_key == "reporter":
-                    pre = lower[max(0, m.start() - 16) : m.start()]
-                    post = lower[m.end() : min(len(lower), m.end() + 12)]
-                    if re.search(r"\b(jira|default)\s+$", pre) or re.match(r"^\s+field\b", post):
-                        continue
                 win_start = max(0, m.start() - 60)
                 win_end = min(len(text), m.end() + 60)
                 snippet = text[win_start:win_end]
@@ -455,7 +443,6 @@ class DeskOfficerAgent(BaseAgent):
             ("detective", r"\bdetective\b"),
             ("coroner", r"\bcoroner\b"),
             ("judge", r"\bjudge\b"),
-            ("reporter", r"(?<!default\s)(?<!jira\s)\breporter\b"),
             ("watcher", r"\bwatcher\b"),
             ("sanity", r"\bsanity(\s+testers?)?\b"),
         ]
@@ -466,15 +453,6 @@ class DeskOfficerAgent(BaseAgent):
 
         for agent_key, pat in agent_patterns:
             if re.search(pat, lower) and not cls._has_negation_near(lower, pat, check_suffix=True):
-                if agent_key == "reporter":
-                    for m in re.finditer(pat, lower):
-                        pre = lower[max(0, m.start() - 16) : m.start()]
-                        post = lower[m.end() : min(len(lower), m.end() + 12)]
-                        if re.search(r"\b(jira|default)\s+$", pre) or re.match(r"^\s+field\b", post):
-                            continue
-                        if dispatch_verb.search(lower):
-                            return agent_key
-                    continue
                 if agent_key == "auto_test" or dispatch_verb.search(lower):
                     return agent_key
 
@@ -486,6 +464,13 @@ class DeskOfficerAgent(BaseAgent):
                 return "sanity"
             if re.search(r"\b(capture\s+(?:visual\s+)?evidence|take\s+(?:a\s+)?screenshot)\b", lower) and not cls._user_requested_main_workflow(lower):
                 return "coroner"
+            if (
+                re.search(r"\b(?:format|rewrite|redraft)\s+(?:the\s+)?(?:bug\s+)?report\b(?!\s+(?:format|template)\b)", lower)
+                and (cls._extract_bug_report_id(text) or cls._extract_jira_key(text))
+                and not cls._user_requested_main_workflow(lower)
+                and not cls._has_negation_near(lower, r"\b(?:format|rewrite|redraft)\s+(?:the\s+)?(?:bug\s+)?report\b", check_suffix=True)
+            ):
+                return "detective"
         return None
 
     @classmethod
@@ -763,13 +748,13 @@ class DeskOfficerAgent(BaseAgent):
         if unraised and has_bug_context:
             return [
                 "Create a bug report",
-                "Organize Detective, Coroner, and Reporter for this bug",
+                "Organize Detective, Coroner, and Judge for this bug",
                 f"Tell Sheriff to raise bug #{unraised['id']} to Backlog",
             ]
         if has_bug_context:
             return [
                 "Assign Detective to investigate",
-                "Organize Detective, Coroner, and Reporter for this bug",
+                "Organize Detective, Coroner, and Judge for this bug",
                 "Create a bug report",
             ]
         return [
@@ -841,7 +826,7 @@ class DeskOfficerAgent(BaseAgent):
             r"\b(?:create|generate|make|build|prepare|start|run)\s+(?:a\s+|the\s+|this\s+)?bug\s*report\b",
             r"\b(?:start|run|execute|trigger|launch)\s+(?:the\s+)?(?:main|full|qa)?\s*(?:workflow|pipeline)\b",
             r"\b(?:investigate|trace|debug|reproduce|look\s+into|find\s+(?:the\s+|out\s+)?(?:root\s*cause|why))\b(?:\s+(?:this|the|that|it))?(?:\s+(?:bug|issue|error|problem|defect))?",
-            r"\b(?:assign|dispatch|tell|ask|have|let|use|call|send|organize|coordinate)\s+(?:the\s+)?(?:detective|coroner|judge|reporter|sheriff|watcher|sanity(?:\s+testers?)?)\b(?:\s+(?:to|for))?",
+            r"\b(?:assign|dispatch|tell|ask|have|let|use|call|send|organize|coordinate)\s+(?:the\s+)?(?:detective|coroner|judge|sheriff|watcher|sanity(?:\s+testers?)?)\b(?:\s+(?:to|for))?",
             r"\b(?:raise|push|submit|log|file|open)\s+(?:a\s+|the\s+|this\s+|that\s+|new\s+|fresh\s+)?(?:bug\s*)?(?:report|ticket|issue|it)\b(?:\s+(?:to|in|into)\s+(?:jira|backlog|scrum(?:\s+backlog)?))?",
             r"\b(?:to\s+(?:analyze|investigate|capture|verify|check|retest))\b(?:\s+(?:this|the)\s+(?:bug|issue))?",
         )
@@ -1065,7 +1050,7 @@ class DeskOfficerAgent(BaseAgent):
                 f"Hey! I'm your **Desk Officer** for **{proj_name}**.\n\n"
                 f"{bug_line}\n\n"
                 "I have live access to all project assets (Jira Cloud tickets, skills, bug reports, visual evidence, and agent logs) "
-                "plus our full agent team (**Detective, Coroner, Judge, Reporter, Sheriff, Watcher, Sanity Testers**). "
+                "plus our full agent team (**Detective, Coroner, Judge, Sheriff, Watcher, Sanity Testers**). "
                 "Describe a bug, inspect Jira, organize any sequence of agents, or say **\"Create a bug report\"** when ready."
             )
             return reply, [
@@ -1117,7 +1102,7 @@ class DeskOfficerAgent(BaseAgent):
                 return (
                     f"Yes — **Project Configuration -> Report Format** for **{proj_name}** is currently set to:\n\n"
                     f"```\n{active_rf}\n```\n\n"
-                    "Detective, Judge, and Reporter follow this exact structure as-is during bug report creation."
+                    "Detective and Judge follow this exact structure as-is during bug report creation."
                 ), ["Create a bug report", "Show all project assets and built-in agents"]
             return (
                 f"No custom **Report Format** is set in **{proj_name}** Project Configuration yet (currently using Standard QA Markdown format). "
@@ -1139,7 +1124,7 @@ class DeskOfficerAgent(BaseAgent):
             )
             return "\n\n".join(parts), [
                 "Check my Jira In QA list",
-                "Organize Detective, Coroner, and Reporter for a bug",
+                "Organize Detective, Coroner, and Judge for a bug",
                 "Create a bug report",
             ]
 
@@ -1249,7 +1234,7 @@ class DeskOfficerAgent(BaseAgent):
 
         if len(user_turns) == 0:
             parts.append(
-                "When ready, say **\"Create a bug report\"** (`Detective → Coroner → Judge → Reporter`, with **Sheriff** standing by) or ask me to assign/organize specific agents."
+                "When ready, say **\"Create a bug report\"** (`Detective → Coroner → Judge`, with **Detective** authoring the formatted report and **Sheriff** standing by) or ask me to assign/organize specific agents."
             )
 
         actions = self._extract_suggested_actions("chat", "none", recent_bugs, has_bug_context=True)
@@ -1307,9 +1292,14 @@ class DeskOfficerAgent(BaseAgent):
         plan_agents = {s.get("agent") for s in (agent_plan or [])}
         uses_unsliced_history = bool(
             wants_jira
-            or explicit_agent in ("sheriff", "watcher", "sanity", "judge", "reporter")
-            or plan_agents.intersection({"sheriff", "watcher", "sanity", "judge", "reporter"})
+            or explicit_agent in ("sheriff", "watcher", "sanity", "judge")
+            or plan_agents.intersection({"sheriff", "watcher", "sanity", "judge"})
             or (explicit_agent == "coroner" and not wants_investigation)
+            or (
+                explicit_agent == "detective"
+                and not wants_investigation
+                and bool(re.search(r"\b(?:format|write|draft|author|compile|generate|prepare)\s+(?:the\s+|a\s+)?(?:bug\s+)?reports?\b", message, re.IGNORECASE))
+            )
         )
         active_history = self._slice_history_since_last_completed_report(conversation_history)
         history_for_bug_id = (
@@ -1416,7 +1406,7 @@ class DeskOfficerAgent(BaseAgent):
         if wants_workflow:
             return {
                 "reply": (
-                    "Understood! Starting the main QA workflow now (**Detective → Coroner → Judge → Reporter**). "
+                    "Understood! Starting the main QA workflow now (**Detective → Coroner → Judge**, with **Detective** authoring the formatted report). "
                     + (
                         "Since you also asked to raise it, **Sheriff** will log the ticket to Jira **Backlog** afterward."
                         if wants_jira
@@ -1620,9 +1610,14 @@ class DeskOfficerAgent(BaseAgent):
         uses_unsliced_history = bool(
             wants_jira
             or also_raise_jira
-            or target_agent in ("sheriff", "watcher", "sanity", "judge", "reporter")
-            or plan_agents.intersection({"sheriff", "watcher", "sanity", "judge", "reporter"})
+            or target_agent in ("sheriff", "watcher", "sanity", "judge")
+            or plan_agents.intersection({"sheriff", "watcher", "sanity", "judge"})
             or (target_agent == "coroner" and not wants_investigation)
+            or (
+                target_agent == "detective"
+                and not wants_investigation
+                and bool(re.search(r"\b(?:format|write|draft|author|compile|generate|prepare)\s+(?:the\s+|a\s+)?(?:bug\s+)?reports?\b", message, re.IGNORECASE))
+            )
         )
         active_history = self._slice_history_since_last_completed_report(conversation_history)
         if action == "chat":
@@ -1899,7 +1894,7 @@ class DeskOfficerAgent(BaseAgent):
             "4. Keep action='chat' during bug triage discussions, greetings, asset/Jira inspection queries (like 'check my Jira In QA list'), and questions about agents or how you organize them.\n"
             "5. CRITICAL EXECUTION RULE: Writing prose like 'I am triggering Sheriff/Detective' while setting action='chat' DOES NOT run any agent! To actually execute agents, you MUST set action='assign_agent' (single agent), action='organize_agents' (agent sequence), or action='run_main_workflow'.\n"
             "6. INVESTIGATION ASSIGNMENT: When details are clear and the user asks to investigate/debug/trace/reproduce a bug (without limiting to just one named agent), set action='organize_agents' with agent_plan=[{\"agent\":\"detective\",\"goal\":\"Investigate root cause and steps\"},{\"agent\":\"coroner\",\"goal\":\"Capture screenshot/video evidence\"}]. If they explicitly ask for just one agent (e.g. 'Assign Detective'), set action='assign_agent'.\n"
-            "7. REPORT COLLABORATION ('create a bug report'): Once details are clear (or a draft investigation already exists), set action='run_main_workflow' so Detective -> Coroner -> Judge -> Reporter collaborate end-to-end (leaving Sheriff on standby). Reporter will strictly follow the project's configured Report Format as-is. If the user explicitly asks to set or update the project's report format, call update_project_config with `report_format` (or let save_skill handle it).\n"
+            "7. REPORT COLLABORATION ('create a bug report'): Once details are clear (or a draft investigation already exists), set action='run_main_workflow' so Detective -> Coroner -> Judge collaborate end-to-end and Detective authors the final formatted report strictly following the project's configured Report Format as-is (leaving Sheriff on standby). If the user explicitly asks to set or update the project's report format, call update_project_config with `report_format` (or let save_skill handle it).\n"
             "8. RAISING THE REPORT ('raise the report', 'raise bug #...', 'create ticket in SCRUM', 'tell Sheriff...'): Set action='assign_agent', target_agent='sheriff', bug_report_id=<target bug ID>, also_raise_jira=true, jira_project_key='SCRUM' (plus force_new_ticket=true when replacing a simulated/wrong-project key).\n"
             "9. STRICT SHERIFF RULE: NEVER include 'sheriff' in target_agent/agent_plan or set also_raise_jira=true unless the user EXPLICITLY asks to raise/push/submit/create the ticket in Jira/Backlog. Sheriff always creates a brand-new Jira ticket in 'Backlog' (never 'To Do') and never modifies old existing Jira tickets.\n"
             "10. Backlog note: `jira_search` with `status: \"Backlog\"` searches both 'Backlog' workflow status and Scrum Board Backlog items (sprint EMPTY, status 'To Do'). Treat SIMULATED_OR_WRONG_PROJECT keys like QA-D715 as unraised on SCRUM.\n"
@@ -1907,7 +1902,7 @@ class DeskOfficerAgent(BaseAgent):
             "OUTPUT FORMAT:\n"
             "- If you need additional live asset data BEFORE answering, emit `<!-- DESK_TOOL {\"tool\":\"...\",\"params\":{...}} -->` and wait for tool results.\n"
             "- Otherwise write your clear conversational Markdown reply directly first, and at the VERY END on its own line append exactly one hidden metadata comment (never mention DESK_ACTION or DESK_TOOL to the user):\n"
-            '<!-- DESK_ACTION {"action":"chat|run_main_workflow|assign_agent|organize_agents","target_agent":"none|detective|coroner|judge|reporter|sheriff|watcher|sanity|auto_test","agent_plan":[],"bug_report_id":null,"jira_key":null,"jira_project_key":null,"force_new_ticket":false,"also_raise_jira":false,"bug_summary":"concise synthesis if bug discussed","suggested_actions":["short reply 1","short reply 2"]} -->'
+            '<!-- DESK_ACTION {"action":"chat|run_main_workflow|assign_agent|organize_agents","target_agent":"none|detective|coroner|judge|sheriff|watcher|sanity|auto_test","agent_plan":[],"bug_report_id":null,"jira_key":null,"jira_project_key":null,"force_new_ticket":false,"also_raise_jira":false,"bug_summary":"concise synthesis if bug discussed","suggested_actions":["short reply 1","short reply 2"]} -->'
         )
 
         llm_messages = self._build_llm_messages(message, conversation_history, attachments)
